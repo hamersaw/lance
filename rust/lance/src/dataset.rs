@@ -334,7 +334,6 @@ impl ProjectionRequest {
             .map(|s| s.as_ref().to_string())
             .collect::<Vec<_>>();
 
-        // TODO @hamersaw - capture error and return Result
         let schema = dataset_schema
             .project_preserve_system_columns(&columns)
             .unwrap();
