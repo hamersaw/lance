@@ -334,47 +334,10 @@ impl ProjectionRequest {
             .map(|s| s.as_ref().to_string())
             .collect::<Vec<_>>();
 
-        // Separate data columns from system columns
-        // System columns need to be added to the schema manually since Schema::project
-        // doesn't include them (they're virtual columns)
-        let mut data_columns = Vec::new();
-        let mut system_fields = Vec::new();
-
-        for col in &columns {
-            if lance_core::is_system_column(col) {
-                // For now we only support _rowid and _rowaddr in projections
-                if col == ROW_ID {
-                    system_fields.push(Field::try_from(ROW_ID_FIELD.clone()).unwrap());
-                } else if col == ROW_ADDR {
-                    system_fields.push(Field::try_from(ROW_ADDR_FIELD.clone()).unwrap());
-                }
-                // Note: Other system columns like _rowoffset are handled differently
-            } else {
-                data_columns.push(col.as_str());
-            }
-        }
-
-        // Project only the data columns
-        let mut schema = dataset_schema.project(&data_columns).unwrap();
-
-        // Add system fields in the order they appeared in the original columns list
-        // We need to reconstruct the proper order
-        let mut final_fields = Vec::new();
-        for col in &columns {
-            if lance_core::is_system_column(col) {
-                // Find and add the system field
-                if let Some(field) = system_fields.iter().find(|f| &f.name == col) {
-                    final_fields.push(field.clone());
-                }
-            } else {
-                // Find and add the data field
-                if let Some(field) = schema.fields.iter().find(|f| &f.name == col) {
-                    final_fields.push(field.clone());
-                }
-            }
-        }
-
-        schema.fields = final_fields;
+        // TODO @hamersaw - capture error and return Result
+        let schema = dataset_schema
+            .project_preserve_system_columns(&columns)
+            .unwrap();
         Self::Schema(Arc::new(schema))
     }
 
@@ -1446,7 +1409,7 @@ impl Dataset {
         row_indices: &[u64],
         projection: impl Into<ProjectionRequest>,
     ) -> Result<RecordBatch> {
-        take::take(self, row_indices, projection.into()).await
+        take::take(self, row_indices, projection.info()).await
     }
 
     /// Take Rows by the internal ROW ids.
