@@ -2034,7 +2034,7 @@ class LanceDataset(pa.dataset.Dataset):
 
     def merge_insert(
         self,
-        on: Union[str, Iterable[str]],
+        on: Optional[Union[str, Iterable[str]]] = None,
     ) -> MergeInsertBuilder:
         """
         Returns a builder that can be used to create a "merge insert" operation
@@ -2066,10 +2066,15 @@ class LanceDataset(pa.dataset.Dataset):
         Parameters
         ----------
 
-        on: Union[str, Iterable[str]]
+        on: Optional[Union[str, Iterable[str]]], default None
             A column (or columns) to join on.  This is how records from the
             source table and target table are matched.  Typically this is some
             kind of key or id column.
+
+            If ``on`` is not provided (or is ``None``), the merge insert
+            operation will use the dataset's unenforced primary key as defined
+            in the schema metadata. If no primary key is configured and
+            ``on`` is None, a :class:`ValueError` will be raised.
 
         Examples
         --------
@@ -3309,7 +3314,7 @@ class LanceDataset(pa.dataset.Dataset):
             These paths provide more efficient opening of datasets with many
             versions on object stores. This parameter has no effect if the dataset
             already exists. To migrate an existing dataset, instead use the
-            :meth:`migrate_manifest_paths_v2` method. Default is False. WARNING:
+            :meth:`migrate_manifest_paths_v2` method. Default is True. WARNING:
             turning this on will make the dataset unreadable for older versions
             of Lance (prior to 0.17.0).
         detached : bool, optional
@@ -5494,7 +5499,7 @@ def write_dataset(
         Literal["stable", "2.0", "2.1", "2.2", "next", "legacy", "0.1"]
     ] = None,
     use_legacy_format: Optional[bool] = None,
-    enable_v2_manifest_paths: bool = False,
+    enable_v2_manifest_paths: bool = True,
     enable_stable_row_ids: bool = False,
     auto_cleanup_options: Optional[AutoCleanupConfig] = None,
     commit_message: Optional[str] = None,
@@ -5558,7 +5563,7 @@ def write_dataset(
         These paths provide more efficient opening of datasets with many
         versions on object stores. This parameter has no effect if the dataset
         already exists. To migrate an existing dataset, instead use the
-        :meth:`LanceDataset.migrate_manifest_paths_v2` method. Default is False.
+        :meth:`LanceDataset.migrate_manifest_paths_v2` method. Default is True.
     enable_stable_row_ids : bool, optional
         Experimental parameter: if set to true, the writer will use stable row ids.
         These row ids are stable after compaction operations, but not after updates.

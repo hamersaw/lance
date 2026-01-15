@@ -62,10 +62,7 @@ use super::{
     encoding::compress_posting_list,
     iter::CompressedPostingListIterator,
 };
-use super::{
-    encoding::compress_positions,
-    iter::{PostingListIterator, TokenIterator, TokenSource},
-};
+use super::{encoding::compress_positions, iter::PostingListIterator};
 use super::{wand::*, InvertedIndexBuilder, InvertedIndexParams};
 use crate::frag_reuse::FragReuseIndex;
 use crate::pbold;
@@ -938,13 +935,6 @@ impl TokenSet {
         self.len() == 0
     }
 
-    pub(crate) fn iter(&self) -> TokenIterator<'_> {
-        TokenIterator::new(match &self.tokens {
-            TokenMap::HashMap(map) => TokenSource::HashMap(map.iter()),
-            TokenMap::Fst(map) => TokenSource::Fst(map.stream()),
-        })
-    }
-
     pub fn to_batch(self, format: TokenSetFormat) -> Result<RecordBatch> {
         match format {
             TokenSetFormat::Arrow => self.into_arrow_batch(),
@@ -1148,6 +1138,24 @@ impl TokenSet {
         }
 
         token_id
+    }
+
+    pub(crate) fn get_or_add(&mut self, token: &str) -> u32 {
+        let next_id = self.next_id;
+        match self.tokens {
+            TokenMap::HashMap(ref mut map) => {
+                if let Some(&token_id) = map.get(token) {
+                    return token_id;
+                }
+
+                map.insert(token.to_owned(), next_id);
+            }
+            _ => unreachable!("tokens must be HashMap while indexing"),
+        }
+
+        self.next_id += 1;
+        self.total_length += token.len();
+        next_id
     }
 
     pub fn get(&self, token: &str) -> Option<u32> {
@@ -2184,7 +2192,9 @@ impl DocSet {
     ) -> Vec<f32> {
         let avgdl = self.average_length();
         let length = doc_ids.size_hint().0;
-        let mut block_max_scores = Vec::with_capacity(length);
+        let num_blocks = length.div_ceil(BLOCK_SIZE);
+        let mut block_max_scores = Vec::with_capacity(num_blocks);
+        let idf_scale = idf(length, self.len()) * (K1 + 1.0);
         let mut max_score = f32::MIN;
         for (i, (doc_id, freq)) in doc_ids.zip(freqs).enumerate() {
             let doc_norm = K1 * (1.0 - B + B * self.num_tokens(*doc_id) as f32 / avgdl);
@@ -2194,13 +2204,13 @@ impl DocSet {
                 max_score = score;
             }
             if (i + 1) % BLOCK_SIZE == 0 {
-                max_score *= idf(length, self.len()) * (K1 + 1.0);
+                max_score *= idf_scale;
                 block_max_scores.push(max_score);
                 max_score = f32::MIN;
             }
         }
         if length % BLOCK_SIZE > 0 {
-            max_score *= idf(length, self.len()) * (K1 + 1.0);
+            max_score *= idf_scale;
             block_max_scores.push(max_score);
         }
         block_max_scores
@@ -2762,5 +2772,22 @@ mod tests {
             row_ids.iter().any(|&id| id >= 200),
             "Should contain row_id from partition 1"
         );
+    }
+
+    #[test]
+    fn test_block_max_scores_capacity_matches_block_count() {
+        let mut docs = DocSet::default();
+        let num_docs = BLOCK_SIZE * 3 + 7;
+        let doc_ids = (0..num_docs as u32).collect::<Vec<_>>();
+        for doc_id in &doc_ids {
+            docs.append(*doc_id as u64, 1);
+        }
+
+        let freqs = vec![1_u32; doc_ids.len()];
+        let block_max_scores = docs.calculate_block_max_scores(doc_ids.iter(), freqs.iter());
+        let expected_blocks = doc_ids.len().div_ceil(BLOCK_SIZE);
+
+        assert_eq!(block_max_scores.len(), expected_blocks);
+        assert_eq!(block_max_scores.capacity(), expected_blocks);
     }
 }
