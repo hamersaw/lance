@@ -19,16 +19,14 @@ use crate::dataset::transaction::translate_schema_metadata_updates;
 use crate::session::caches::{DSMetadataCache, ManifestKey, TransactionKey};
 use crate::session::index_caches::DSIndexCache;
 use itertools::Itertools;
-use lance_core::datatypes::{
-    BlobVersion, Field, OnMissing, OnTypeMismatch, Projectable, Projection,
-};
+use lance_core::datatypes::{BlobVersion, OnMissing, OnTypeMismatch, Projectable, Projection};
 use lance_core::traits::DatasetTakeRows;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tracing::{
     DATASET_CLEANING_EVENT, DATASET_DELETING_EVENT, DATASET_DROPPING_COLUMN_EVENT,
     TRACE_DATASET_EVENTS,
 };
-use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID_FIELD};
+use lance_core::ROW_ADDR;
 use lance_datafusion::projection::ProjectionPlan;
 use lance_file::datatypes::populate_schema_dictionary;
 use lance_file::reader::FileReaderOptions;
@@ -1408,7 +1406,7 @@ impl Dataset {
         row_indices: &[u64],
         projection: impl Into<ProjectionRequest>,
     ) -> Result<RecordBatch> {
-        take::take(self, row_indices, projection.info()).await
+        take::take(self, row_indices, projection.into()).await
     }
 
     /// Take Rows by the internal ROW ids.
