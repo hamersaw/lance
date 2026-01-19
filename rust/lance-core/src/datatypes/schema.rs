@@ -16,7 +16,11 @@ use lance_arrow::*;
 use snafu::location;
 
 use super::field::{BlobVersion, Field, OnTypeMismatch, SchemaCompareOptions};
-use crate::{Error, Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD, WILDCARD};
+use crate::{
+    Error, Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_CREATED_AT_VERSION, ROW_CREATED_AT_VERSION_FIELD,
+    ROW_ID, ROW_ID_FIELD, ROW_LAST_UPDATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION_FIELD,
+    ROW_OFFSET, ROW_OFFSET_FIELD, WILDCARD,
+};
 
 /// Lance Schema.
 #[derive(Default, Debug, Clone, DeepSizeOf)]
@@ -239,14 +243,27 @@ impl Schema {
                 } else {
                     candidates.push(projected_field)
                 }
-            } else if first == ROW_ID || first == ROW_ADDR {
-                // Note: Other system columns like _rowoffset are handled differently
+            } else if crate::is_system_column(first) {
                 if preserve_system_columns {
-                    // For now we only support _rowid and _rowaddr in projections
                     if first == ROW_ID {
                         candidates.push(Field::try_from(ROW_ID_FIELD.clone())?);
                     } else if first == ROW_ADDR {
                         candidates.push(Field::try_from(ROW_ADDR_FIELD.clone())?);
+                    } else if first == ROW_OFFSET {
+                        candidates.push(Field::try_from(ROW_OFFSET_FIELD.clone())?);
+                    } else if first == ROW_CREATED_AT_VERSION {
+                        candidates.push(Field::try_from(ROW_CREATED_AT_VERSION_FIELD.clone())?);
+                    } else if first == ROW_LAST_UPDATED_AT_VERSION {
+                        candidates
+                            .push(Field::try_from(ROW_LAST_UPDATED_AT_VERSION_FIELD.clone())?);
+                    } else {
+                        return Err(Error::Schema {
+                            message: format!(
+                                "System column {} is currently not supported in projection",
+                                first
+                            ),
+                            location: location!(),
+                        });
                     }
                 }
             } else if err_on_missing {

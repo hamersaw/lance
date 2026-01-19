@@ -131,6 +131,11 @@ async fn do_take_rows(
 ) -> Result<RecordBatch> {
     let with_row_id_in_projection = projection.physical_projection.with_row_id;
     let with_row_addr_in_projection = projection.physical_projection.with_row_addr;
+    let with_row_created_at_version_in_projection =
+        projection.physical_projection.with_row_created_at_version;
+    let with_row_last_updated_at_version_in_projection = projection
+        .physical_projection
+        .with_row_last_updated_at_version;
 
     let row_addrs = builder.get_row_addrs().await?.clone();
 
@@ -160,6 +165,8 @@ async fn do_take_rows(
         projection: Arc<Schema>,
         with_row_id: bool,
         with_row_addresses: bool,
+        with_row_created_at_version: bool,
+        with_row_last_updated_at_version: bool,
     ) -> impl Future<Output = Result<RecordBatch>> + Send {
         async move {
             fragment
@@ -168,13 +175,14 @@ async fn do_take_rows(
                     projection.as_ref(),
                     with_row_id,
                     with_row_addresses,
+                    with_row_created_at_version,
+                    with_row_last_updated_at_version,
                 )
                 .await
         }
     }
 
     let physical_schema = Arc::new(projection.physical_projection.to_bare_schema());
-
     let batch = if row_addr_stats.contiguous {
         // Fastest path: Can use `read_range` directly
         let start = row_addrs.first().expect("empty range passed to take_rows");
@@ -195,7 +203,9 @@ async fn do_take_rows(
 
         let read_config = FragReadConfig::default()
             .with_row_id(with_row_id_in_projection)
-            .with_row_address(with_row_addr_in_projection);
+            .with_row_address(with_row_addr_in_projection)
+            .with_row_created_at_version(with_row_created_at_version_in_projection)
+            .with_row_last_updated_at_version(with_row_last_updated_at_version_in_projection);
         let reader = fragment.open(&physical_schema, read_config).await?;
         reader.legacy_read_range_as_batch(range).await
     } else if row_addr_stats.sorted {
@@ -243,6 +253,8 @@ async fn do_take_rows(
                 physical_schema.clone(),
                 with_row_id_in_projection,
                 with_row_addr_in_projection,
+                with_row_created_at_version_in_projection,
+                with_row_last_updated_at_version_in_projection,
             );
             batches.push(batch_fut);
         }
@@ -283,6 +295,8 @@ async fn do_take_rows(
                     physical_schema.clone(),
                     with_row_id_in_projection,
                     true,
+                    with_row_created_at_version_in_projection,
+                    with_row_last_updated_at_version_in_projection,
                 )
             })
             .buffered(builder.dataset.object_store.io_parallelism())

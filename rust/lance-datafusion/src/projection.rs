@@ -264,6 +264,8 @@ impl ProjectionPlan {
         let mut with_row_id = false;
         let mut with_row_addr = false;
         let mut must_add_row_offset = false;
+        let mut with_row_last_updated_at_version = false;
+        let mut with_row_created_at_version = false;
 
         for field in projection.fields.iter() {
             if lance_core::is_system_column(&field.name) {
@@ -273,10 +275,14 @@ impl ProjectionPlan {
                     must_add_row_offset = true;
                 } else if field.name == ROW_ADDR {
                     with_row_addr = true;
+                } else if field.name == ROW_OFFSET {
+                    with_row_addr = true;
                     must_add_row_offset = true;
+                } else if field.name == ROW_LAST_UPDATED_AT_VERSION {
+                    with_row_last_updated_at_version = true;
+                } else if field.name == ROW_CREATED_AT_VERSION {
+                    with_row_created_at_version = true;
                 }
-                // Note: Other system columns like _rowoffset are computed differently
-                // and shouldn't appear in the schema at this point
             } else {
                 // Regular data column - validate it exists in base schema
                 if base.schema().field(&field.name).is_none() {
@@ -301,6 +307,8 @@ impl ProjectionPlan {
             .with_blob_version(blob_version);
         physical_projection.with_row_id = with_row_id;
         physical_projection.with_row_addr = with_row_addr;
+        physical_projection.with_row_last_updated_at_version = with_row_last_updated_at_version;
+        physical_projection.with_row_created_at_version = with_row_created_at_version;
 
         // Build output expressions preserving the original order (including system columns)
         let exprs = projection
@@ -431,8 +439,43 @@ impl ProjectionPlan {
     #[instrument(skip_all, level = "debug")]
     pub async fn project_batch(&self, batch: RecordBatch) -> Result<RecordBatch> {
         let src = Arc::new(OneShotExec::from_batch(batch));
-        let physical_exprs = self.to_physical_exprs(&self.physical_projection.to_arrow_schema())?;
+
+        // TODO @hamersaw - need to add "extra columns" here to get filterable schema
+        // rust/lance/src/dataset/scanner.rs 1526-1553
+        let mut extra_columns = vec![ArrowField::new(ROW_OFFSET, DataType::UInt64, true)];
+        /*if self.nearest.as_ref().is_some() {
+            extra_columns.push(ArrowField::new(DIST_COL, DataType::Float32, true));
+        };
+
+        if self.full_text_query.is_some() {
+            extra_columns.push(ArrowField::new(SCORE_COL, DataType::Float32, true));
+        }*/
+
+        let mut filterable_schema = self.physical_projection.to_schema();
+        filterable_schema = filterable_schema.merge(&ArrowSchema::new(extra_columns))?; // TODO @hamersaw - result?
+
+        let physical_exprs = self.to_physical_exprs(&(&filterable_schema).into())?;
+
+        //let physical_exprs = self.to_physical_exprs(&self.physical_projection.to_arrow_schema())?;
         let projection = Arc::new(ProjectionExec::try_new(physical_exprs, src)?);
+
+        /*
+        * do we need to inject the RowOffset field after we have the batch?
+        * then we update the projection for the "current_schema" to have `_rowoffset`
+        * from rust/lance/src/dataset/scanner.rs:2114-2117:
+        *
+        * or do we manually compute and inject row_offset column in batch like in
+        * rust/lance/src/io/exec/rowids.rs:526-553
+        *
+           // Stage 6: Add system columns, if requested
+           if self.projection_plan.must_add_row_offset {
+               plan = Arc::new(AddRowOffsetExec::try_new(plan, self.dataset.clone()).await?);
+           }
+        */
+        /*if self.must_add_row_offset {
+            projection = Arc::new(AddRowOffsetExec::try_new(projection, self.dataset.clone()).await?);
+        }*/
+
         // Run dummy plan to execute projection, do not log the plan run
         let stream = execute_plan(
             projection,

@@ -1376,7 +1376,8 @@ impl FileFragment {
         };
 
         // Then call take rows
-        self.take_rows(&row_ids, projection, false, false).await
+        self.take_rows(&row_ids, projection, false, false, false, false)
+            .await
     }
 
     /// Get the deletion vector for this fragment, using the cache if available.
@@ -1424,13 +1425,17 @@ impl FileFragment {
         projection: &Schema,
         with_row_id: bool,
         with_row_address: bool,
+        with_row_created_at_version: bool,
+        with_row_last_updated_at_version: bool,
     ) -> Result<RecordBatch> {
         let reader = self
             .open(
                 projection,
                 FragReadConfig::default()
                     .with_row_id(with_row_id)
-                    .with_row_address(with_row_address),
+                    .with_row_address(with_row_address)
+                    .with_row_created_at_version(with_row_created_at_version)
+                    .with_row_last_updated_at_version(with_row_last_updated_at_version),
             )
             .await?;
 
