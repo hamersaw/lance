@@ -12,8 +12,8 @@ use std::{
 
 use chrono::{DateTime, Utc};
 
-use arrow_array::RecordBatch;
-use arrow_schema::Schema as ArrowSchema;
+use arrow_array::{cast::AsArray, types::UInt64Type, ArrayRef, RecordBatch, UInt64Array};
+use arrow_schema::{Schema, Schema as ArrowSchema};
 use datafusion::physical_plan::metrics::MetricType;
 use datafusion::{
     catalog::streaming::StreamingTable,
@@ -35,17 +35,19 @@ use datafusion::{
         DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
     },
 };
-use datafusion_common::{DataFusionError, Statistics};
+use datafusion_common::{DataFusionError, Result, Statistics};
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
 
 use futures::{stream, StreamExt};
 use lance_arrow::SchemaExt;
 use lance_core::{
     utils::{
+        address::RowAddress,
+        deletion::DeletionVector,
         futures::FinallyStreamExt,
         tracing::{StreamTracingExt, EXECUTION_PLAN_RUN, TRACE_EXECUTION},
     },
-    Error, Result,
+    Error as LanceError, Result as LanceResult, ROW_ADDR, ROW_OFFSET, ROW_OFFSET_FIELD,
 };
 use log::{debug, info, warn};
 use snafu::location;
@@ -537,7 +539,7 @@ fn display_plan_one_liner_impl(plan: &dyn ExecutionPlan, output: &mut String) {
 pub fn execute_plan(
     plan: Arc<dyn ExecutionPlan>,
     options: LanceExecutionOptions,
-) -> Result<SendableRecordBatchStream> {
+) -> LanceResult<SendableRecordBatchStream> {
     if !options.skip_logging {
         debug!(
             "Executing plan:\n{}",
@@ -564,7 +566,7 @@ pub fn execute_plan(
 pub async fn analyze_plan(
     plan: Arc<dyn ExecutionPlan>,
     options: LanceExecutionOptions,
-) -> Result<String> {
+) -> LanceResult<String> {
     // This is needed as AnalyzeExec launches a thread task per
     // partition, and we want these to be connected to the parent span
     let plan = Arc::new(TracedExec::new(plan, Span::current()));
@@ -584,7 +586,7 @@ pub async fn analyze_plan(
     let mut stream = analyze
         .execute(0, get_task_context(&session_ctx, &options))
         .map_err(|err| {
-            Error::io(
+            LanceError::io(
                 format!("Failed to execute analyze plan: {}", err),
                 location!(),
             )
@@ -887,5 +889,204 @@ impl ExecutionPlan for StrictBatchSizeExec {
 
     fn supports_limit_pushdown(&self) -> bool {
         true
+    }
+}
+
+#[derive(Debug)]
+pub struct FragInfo {
+    /// The dataset offset of the first row in the fragment
+    pub row_offset: u64,
+    /// The deletion vector for this fragment, if any
+    pub deletion_vector: Option<Arc<DeletionVector>>,
+}
+
+/// Add a `_rowoffset` column to a stream of record batches that have a `_rowaddr` column.
+///
+/// The row offset is the number of rows between the current row and the first row in the dataset.
+#[derive(Clone, Debug)]
+pub struct AddRowOffsetExec {
+    input: Arc<dyn ExecutionPlan>,
+    row_addr_pos: usize,
+    frag_id_to_offset: Arc<HashMap<u32, FragInfo>>,
+    properties: PlanProperties,
+}
+
+impl AddRowOffsetExec {
+    pub fn try_new(
+        input: Arc<dyn ExecutionPlan>,
+        frag_id_to_offset: Arc<HashMap<u32, FragInfo>>,
+    ) -> LanceResult<Self> {
+        let input_schema = input.schema();
+        let row_addr_pos = input_schema
+            .index_of(ROW_ADDR)
+            .map_err(|_| LanceError::Internal {
+                message: format!("Input plan does not have a {} column", ROW_ADDR),
+                location: location!(),
+            })?;
+
+        if input_schema.field_with_name(ROW_OFFSET).is_ok() {
+            return Err(LanceError::Internal {
+                message: format!("Input plan already has a {} column", ROW_OFFSET),
+                location: location!(),
+            });
+        }
+
+        let mut fields = input.schema().fields().iter().cloned().collect::<Vec<_>>();
+        fields.push(Arc::new(ROW_OFFSET_FIELD.clone()));
+        let schema = Arc::new(Schema::new_with_metadata(
+            fields,
+            input.schema().metadata().clone(),
+        ));
+
+        let new_eq_props =
+            EquivalenceProperties::new(schema).extend(input.properties().eq_properties.clone())?;
+        let properties = input.properties().clone().with_eq_properties(new_eq_props);
+
+        Ok(Self {
+            input,
+            row_addr_pos,
+            frag_id_to_offset,
+            properties,
+        })
+    }
+
+    fn compute_row_offsets(
+        row_addr: &ArrayRef,
+        frag_id_to_offset: &HashMap<u32, FragInfo>,
+    ) -> Result<ArrayRef> {
+        let row_addr_values = row_addr.as_primitive::<UInt64Type>().values();
+        let mut row_offsets = Vec::with_capacity(row_addr_values.len());
+
+        let mut last_frag_id = u32::MAX;
+        let mut last_frag_offset = 0;
+        let mut last_frag_delete_count = 0;
+        let mut dv_iter = None;
+
+        for addr in row_addr_values {
+            let addr = RowAddress::new_from_u64(*addr);
+            let frag_id = addr.fragment_id();
+            if frag_id != last_frag_id {
+                last_frag_id = frag_id;
+                let Some(frag_info) = frag_id_to_offset.get(&frag_id) else {
+                    return Err(DataFusionError::External(Box::new(LanceError::Internal { message: format!("A row address referred to a fragment {} that wasn't in the frag_id_to_offset map", frag_id), location: location!() })));
+                };
+                last_frag_offset = frag_info.row_offset;
+                last_frag_delete_count = 0;
+                dv_iter = frag_info
+                    .deletion_vector
+                    .as_ref()
+                    .map(|dv| dv.to_sorted_iter().peekable());
+            }
+
+            let row_offset = addr.row_offset();
+            if let Some(dv_iter) = &mut dv_iter {
+                while dv_iter.peek().is_some() {
+                    if *dv_iter.peek().unwrap() < row_offset {
+                        dv_iter.next();
+                        last_frag_delete_count += 1;
+                    } else {
+                        break;
+                    }
+                }
+                row_offsets
+                    .push(last_frag_offset + row_offset as u64 - last_frag_delete_count as u64);
+            } else {
+                row_offsets.push(last_frag_offset + row_offset as u64);
+            }
+        }
+
+        Ok(Arc::new(UInt64Array::from(row_offsets)))
+    }
+}
+
+impl DisplayAs for AddRowOffsetExec {
+    fn fmt_as(
+        &self,
+        _format_type: DisplayFormatType,
+        f: &mut std::fmt::Formatter,
+    ) -> std::fmt::Result {
+        write!(f, "AddRowOffsetExec")
+    }
+}
+
+impl ExecutionPlan for AddRowOffsetExec {
+    fn name(&self) -> &str {
+        "AddRowOffsetExec"
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn maintains_input_order(&self) -> Vec<bool> {
+        vec![true]
+    }
+
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        vec![false]
+    }
+
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
+        self.input.partition_statistics(partition)
+    }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        true
+    }
+
+    fn cardinality_effect(&self) -> CardinalityEffect {
+        CardinalityEffect::Equal
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        if children.len() != 1 {
+            Err(DataFusionError::Internal(
+                "AddRowOffsetExec: invalid number of children".into(),
+            ))
+        } else {
+            Ok(Arc::new(Self::try_new(
+                children.into_iter().next().unwrap(),
+                self.frag_id_to_offset.clone(),
+            )?))
+        }
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<datafusion::execution::TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        let input_stream = self.input.execute(partition, context)?;
+        let schema = self.schema();
+        let row_addr_pos = self.row_addr_pos;
+        let frag_id_to_offset = self.frag_id_to_offset.clone();
+        let stream = input_stream.then(move |batch| {
+            let schema = schema.clone();
+            let row_addr_pos = row_addr_pos;
+            let frag_id_to_offset = frag_id_to_offset.clone();
+            async move {
+                let batch = batch?;
+                let row_addr = batch.column(row_addr_pos);
+                let row_offsets = Self::compute_row_offsets(row_addr, frag_id_to_offset.as_ref())?;
+                let mut columns = batch.columns().to_vec();
+                columns.push(Arc::new(row_offsets));
+                Ok(RecordBatch::try_new(schema.clone(), columns)?)
+            }
+        });
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            self.schema(),
+            stream,
+        )))
     }
 }

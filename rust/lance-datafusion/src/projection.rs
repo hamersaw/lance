@@ -3,7 +3,10 @@
 
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
-use datafusion::{logical_expr::Expr, physical_plan::projection::ProjectionExec};
+use datafusion::{
+    logical_expr::Expr,
+    physical_plan::{projection::ProjectionExec, ExecutionPlan},
+};
 use datafusion_common::{Column, DFSchema};
 use datafusion_physical_expr::PhysicalExpr;
 use futures::TryStreamExt;
@@ -21,7 +24,7 @@ use lance_core::{
 };
 
 use crate::{
-    exec::{execute_plan, LanceExecutionOptions, OneShotExec},
+    exec::{execute_plan, AddRowOffsetExec, FragInfo, LanceExecutionOptions, OneShotExec},
     planner::Planner,
 };
 
@@ -437,7 +440,11 @@ impl ProjectionPlan {
     }
 
     #[instrument(skip_all, level = "debug")]
-    pub async fn project_batch(&self, batch: RecordBatch) -> Result<RecordBatch> {
+    pub async fn project_batch(
+        &self,
+        batch: RecordBatch,
+        frag_id_to_offset: Arc<HashMap<u32, FragInfo>>,
+    ) -> Result<RecordBatch> {
         let src = Arc::new(OneShotExec::from_batch(batch));
 
         // TODO @hamersaw - need to add "extra columns" here to get filterable schema
@@ -457,7 +464,8 @@ impl ProjectionPlan {
         let physical_exprs = self.to_physical_exprs(&(&filterable_schema).into())?;
 
         //let physical_exprs = self.to_physical_exprs(&self.physical_projection.to_arrow_schema())?;
-        let projection = Arc::new(ProjectionExec::try_new(physical_exprs, src)?);
+        let mut projection: Arc<dyn ExecutionPlan> =
+            Arc::new(ProjectionExec::try_new(physical_exprs, src)?);
 
         /*
         * do we need to inject the RowOffset field after we have the batch?
@@ -472,9 +480,10 @@ impl ProjectionPlan {
                plan = Arc::new(AddRowOffsetExec::try_new(plan, self.dataset.clone()).await?);
            }
         */
-        /*if self.must_add_row_offset {
-            projection = Arc::new(AddRowOffsetExec::try_new(projection, self.dataset.clone()).await?);
-        }*/
+        if self.must_add_row_offset {
+            println!("Adding AddRowOffsetExec to projection");
+            projection = Arc::new(AddRowOffsetExec::try_new(projection, frag_id_to_offset)?);
+        }
 
         // Run dummy plan to execute projection, do not log the plan run
         let stream = execute_plan(

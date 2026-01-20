@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::BTreeMap, ops::Range, pin::Pin, sync::Arc};
+use std::{collections::BTreeMap, collections::HashMap, ops::Range, pin::Pin, sync::Arc};
 
 use crate::dataset::fragment::FragReadConfig;
 use crate::dataset::rowids::get_row_id_index;
@@ -19,7 +19,7 @@ use lance_core::datatypes::Schema;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::deletion::OffsetMapper;
 use lance_core::ROW_ADDR;
-use lance_datafusion::projection::ProjectionPlan;
+use lance_datafusion::{exec::FragInfo, projection::ProjectionPlan};
 use snafu::location;
 
 use super::ProjectionRequest;
@@ -343,7 +343,25 @@ async fn do_take_rows(
         Ok(reordered.into())
     }?;
 
-    let batch = projection.project_batch(batch).await?;
+    // compile `frag_id_to_offset` map - TODO @hamersaw - this needs to be a util function
+    let mut frag_id_to_offset = HashMap::new();
+    let mut row_offset = 0;
+    for frag in builder.dataset.get_fragments() {
+        let deletion_vector = frag.get_deletion_vector().await?;
+        frag_id_to_offset.insert(
+            frag.id() as u32,
+            FragInfo {
+                row_offset,
+                deletion_vector,
+            },
+        );
+        // Should be sync unless the dataset was written by an extremely old lance version
+        row_offset += frag.count_rows(None).await? as u64;
+    }
+
+    let batch = projection
+        .project_batch(batch, Arc::new(frag_id_to_offset))
+        .await?;
     if builder.with_row_address {
         if batch.num_rows() != row_addrs.len() {
             return Err(Error::NotSupported  {
