@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::BTreeMap, collections::HashMap, ops::Range, pin::Pin, sync::Arc};
+use std::{collections::BTreeMap, ops::Range, pin::Pin, sync::Arc};
 
 use crate::dataset::fragment::FragReadConfig;
 use crate::dataset::rowids::get_row_id_index;
@@ -20,7 +20,6 @@ use lance_core::datatypes::Schema;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::deletion::OffsetMapper;
 use lance_core::{ROW_ADDR, ROW_OFFSET};
-//use lance_datafusion::exec::{AddRowOffsetExec, FragInfo};
 use lance_datafusion::projection::ProjectionPlan;
 use snafu::location;
 
@@ -345,23 +344,7 @@ async fn do_take_rows(
         Ok(reordered.into())
     }?;
 
-    // compile `frag_id_to_offset` map - TODO @hamersaw - this needs to be a util function
-    /*let mut frag_id_to_offset = HashMap::new();
-    let mut row_offset = 0;
-    for frag in builder.dataset.get_fragments() {
-        let deletion_vector = frag.get_deletion_vector().await?;
-        frag_id_to_offset.insert(
-            frag.id() as u32,
-            FragInfo {
-                row_offset,
-                deletion_vector,
-            },
-        );
-        // Should be sync unless the dataset was written by an extremely old lance version
-        row_offset += frag.count_rows(None).await? as u64;
-    }*/
-
-    // strip ROW_OFFSET from projection (if necessary)
+    // strip `ROW_OFFSET` from projection (if necessary)
     let mut stripped_projection = projection.as_ref().clone();
     stripped_projection.requested_output_expr = stripped_projection
         .requested_output_expr
@@ -369,11 +352,9 @@ async fn do_take_rows(
         .into_iter()
         .filter(|e| e.name != ROW_OFFSET)
         .collect();
-
     let p = Arc::new(stripped_projection);
 
     let mut batch = p.project_batch(batch).await?;
-    //let mut batch = projection.project_batch(batch, Arc::new(frag_id_to_offset)).await?;
 
     if builder.with_row_address || projection.must_add_row_offset {
         // build row_addr column
@@ -390,6 +371,7 @@ async fn do_take_rows(
 
         let row_addr_col: ArrayRef = Arc::new(UInt64Array::from(row_addrs));
 
+        // build and inject row_offset column (if necessary)
         if projection.must_add_row_offset {
             let row_offset_col =
                 AddRowOffsetExec::compute_row_offset_array(&row_addr_col, builder.dataset).await?;
@@ -398,25 +380,13 @@ async fn do_take_rows(
             batch = batch.try_with_column(row_offset_field, row_offset_col)?;
         }
 
+        // inject row_addr column (if necessary)
         if builder.with_row_address {
             let row_addr_field =
                 ArrowField::new(ROW_ADDR, arrow::datatypes::DataType::UInt64, false);
             batch = batch.try_with_column(row_addr_field, row_addr_col)?;
         }
     }
-
-    /*if projection.must_add_row_offset {
-        let row_addr_col = batch
-            .column_by_name(ROW_ADDR)
-            .ok_or_else(|| Error::Internal {
-                message: format!("Expected {} column to compute row offsets", ROW_ADDR),
-                location: location!(),
-            })?;
-
-        let row_offset_col = AddRowOffsetExec::compute_row_offset_array(&row_addr_col, builder.dataset).await?;
-        let row_offset_field = ArrowField::new(ROW_OFFSET, arrow::datatypes::DataType::UInt64, false);
-        batch = batch.try_with_column(row_offset_field, row_offset_col)?;
-    }*/
 
     Ok(batch)
 }
