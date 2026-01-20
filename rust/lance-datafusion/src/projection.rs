@@ -3,6 +3,7 @@
 
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+use datafusion::{logical_expr::Expr, physical_plan::projection::ProjectionExec};
 use datafusion_common::{Column, DFSchema};
 use datafusion_physical_expr::PhysicalExpr;
 use futures::TryStreamExt;
@@ -439,8 +440,8 @@ impl ProjectionPlan {
     pub async fn project_batch(&self, batch: RecordBatch) -> Result<RecordBatch> {
         let src = Arc::new(OneShotExec::from_batch(batch));
         let physical_exprs = self.to_physical_exprs(&self.physical_projection.to_arrow_schema())?;
-        let mut projection: Arc<dyn ExecutionPlan> =
-            Arc::new(ProjectionExec::try_new(physical_exprs, src)?);
+        let projection = Arc::new(ProjectionExec::try_new(physical_exprs, src)?);
+
         // Run dummy plan to execute projection, do not log the plan run
         let stream = execute_plan(
             projection,

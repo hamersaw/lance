@@ -344,7 +344,7 @@ async fn do_take_rows(
         Ok(reordered.into())
     }?;
 
-    // strip `ROW_OFFSET` from projection (if necessary)
+    // strip `ROW_OFFSET` field from projection (if exists)
     let mut stripped_projection = projection.as_ref().clone();
     stripped_projection.requested_output_expr = stripped_projection
         .requested_output_expr
@@ -352,12 +352,11 @@ async fn do_take_rows(
         .into_iter()
         .filter(|e| e.name != ROW_OFFSET)
         .collect();
-    let p = Arc::new(stripped_projection);
 
-    let mut batch = p.project_batch(batch).await?;
+    let mut batch = (Arc::new(stripped_projection)).project_batch(batch).await?;
 
     if builder.with_row_address || projection.must_add_row_offset {
-        // build row_addr column
+        // compile `ROW_ADDR` column
         if batch.num_rows() != row_addrs.len() {
             return Err(Error::NotSupported  {
             source: format!(
@@ -371,8 +370,8 @@ async fn do_take_rows(
 
         let row_addr_col: ArrayRef = Arc::new(UInt64Array::from(row_addrs));
 
-        // build and inject row_offset column (if necessary)
         if projection.must_add_row_offset {
+            // compile and inject `ROW_OFFSET` column
             let row_offset_col =
                 AddRowOffsetExec::compute_row_offset_array(&row_addr_col, builder.dataset).await?;
             let row_offset_field =
@@ -380,8 +379,8 @@ async fn do_take_rows(
             batch = batch.try_with_column(row_offset_field, row_offset_col)?;
         }
 
-        // inject row_addr column (if necessary)
         if builder.with_row_address {
+            // inject `ROW_ADDR` column
             let row_addr_field =
                 ArrowField::new(ROW_ADDR, arrow::datatypes::DataType::UInt64, false);
             batch = batch.try_with_column(row_addr_field, row_addr_col)?;

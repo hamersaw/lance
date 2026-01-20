@@ -3319,7 +3319,14 @@ mod tests {
 
         // Repeated indices are repeated in result.
         let batch = fragment
-            .take_rows(&[1, 2, 4, 5, 5, 8], dataset.schema(), false, false)
+            .take_rows(
+                &[1, 2, 4, 5, 5, 8],
+                dataset.schema(),
+                false,
+                false,
+                false,
+                false,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -3338,7 +3345,14 @@ mod tests {
             .unwrap();
         assert!(fragment.metadata().deletion_file.is_some());
         let batch = fragment
-            .take_rows(&[1, 2, 4, 5, 8], dataset.schema(), false, false)
+            .take_rows(
+                &[1, 2, 4, 5, 8],
+                dataset.schema(),
+                false,
+                false,
+                false,
+                false,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -3348,7 +3362,7 @@ mod tests {
 
         // Empty indices gives empty result
         let batch = fragment
-            .take_rows(&[], dataset.schema(), false, false)
+            .take_rows(&[], dataset.schema(), false, false, false, false)
             .await
             .unwrap();
         assert_eq!(
@@ -3358,7 +3372,14 @@ mod tests {
 
         // Can get row ids
         let batch = fragment
-            .take_rows(&[1, 2, 4, 5, 8], dataset.schema(), false, true)
+            .take_rows(
+                &[1, 2, 4, 5, 8],
+                dataset.schema(),
+                false,
+                true,
+                false,
+                false,
+            )
             .await
             .unwrap();
         assert_eq!(
