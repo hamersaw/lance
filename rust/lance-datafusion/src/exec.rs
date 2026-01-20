@@ -892,7 +892,7 @@ impl ExecutionPlan for StrictBatchSizeExec {
     }
 }
 
-#[derive(Debug)]
+/*#[derive(Debug)]
 pub struct FragInfo {
     /// The dataset offset of the first row in the fragment
     pub row_offset: u64,
@@ -1089,4 +1089,4 @@ impl ExecutionPlan for AddRowOffsetExec {
             stream,
         )))
     }
-}
+}*/

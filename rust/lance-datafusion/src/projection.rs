@@ -24,7 +24,8 @@ use lance_core::{
 };
 
 use crate::{
-    exec::{execute_plan, AddRowOffsetExec, FragInfo, LanceExecutionOptions, OneShotExec},
+    //exec::{execute_plan, AddRowOffsetExec, FragInfo, LanceExecutionOptions, OneShotExec},
+    exec::{execute_plan, LanceExecutionOptions, OneShotExec},
     planner::Planner,
 };
 
@@ -440,30 +441,18 @@ impl ProjectionPlan {
     }
 
     #[instrument(skip_all, level = "debug")]
-    pub async fn project_batch(
-        &self,
-        batch: RecordBatch,
-        frag_id_to_offset: Arc<HashMap<u32, FragInfo>>,
-    ) -> Result<RecordBatch> {
+    pub async fn project_batch(&self, batch: RecordBatch) -> Result<RecordBatch> {
         let src = Arc::new(OneShotExec::from_batch(batch));
 
-        // TODO @hamersaw - need to add "extra columns" here to get filterable schema
+        /*// TODO @hamersaw - need to add "extra columns" here to get filterable schema
         // rust/lance/src/dataset/scanner.rs 1526-1553
         let mut extra_columns = vec![ArrowField::new(ROW_OFFSET, DataType::UInt64, true)];
-        /*if self.nearest.as_ref().is_some() {
-            extra_columns.push(ArrowField::new(DIST_COL, DataType::Float32, true));
-        };
-
-        if self.full_text_query.is_some() {
-            extra_columns.push(ArrowField::new(SCORE_COL, DataType::Float32, true));
-        }*/
-
         let mut filterable_schema = self.physical_projection.to_schema();
         filterable_schema = filterable_schema.merge(&ArrowSchema::new(extra_columns))?; // TODO @hamersaw - result?
 
-        let physical_exprs = self.to_physical_exprs(&(&filterable_schema).into())?;
+        let physical_exprs = self.to_physical_exprs(&(&filterable_schema).into())?;*/
 
-        //let physical_exprs = self.to_physical_exprs(&self.physical_projection.to_arrow_schema())?;
+        let physical_exprs = self.to_physical_exprs(&self.physical_projection.to_arrow_schema())?;
         let mut projection: Arc<dyn ExecutionPlan> =
             Arc::new(ProjectionExec::try_new(physical_exprs, src)?);
 
@@ -480,10 +469,10 @@ impl ProjectionPlan {
                plan = Arc::new(AddRowOffsetExec::try_new(plan, self.dataset.clone()).await?);
            }
         */
-        if self.must_add_row_offset {
+        /*if self.must_add_row_offset {
             println!("Adding AddRowOffsetExec to projection");
             projection = Arc::new(AddRowOffsetExec::try_new(projection, frag_id_to_offset)?);
-        }
+        }*/
 
         // Run dummy plan to execute projection, do not log the plan run
         let stream = execute_plan(
