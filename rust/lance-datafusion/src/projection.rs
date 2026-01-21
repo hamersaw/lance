@@ -439,7 +439,13 @@ impl ProjectionPlan {
     #[instrument(skip_all, level = "debug")]
     pub async fn project_batch(&self, batch: RecordBatch) -> Result<RecordBatch> {
         let src = Arc::new(OneShotExec::from_batch(batch));
-        let physical_exprs = self.to_physical_exprs(&self.physical_projection.to_arrow_schema())?;
+
+        // Need to add ROW_OFFSET to get filterable schema
+        let extra_columns = vec![ArrowField::new(ROW_OFFSET, DataType::UInt64, true)];
+        let mut filterable_schema = self.physical_projection.to_schema();
+        filterable_schema = filterable_schema.merge(&ArrowSchema::new(extra_columns))?;
+
+        let physical_exprs = self.to_physical_exprs(&(&filterable_schema).into())?;
         let projection = Arc::new(ProjectionExec::try_new(physical_exprs, src)?);
 
         // Run dummy plan to execute projection, do not log the plan run

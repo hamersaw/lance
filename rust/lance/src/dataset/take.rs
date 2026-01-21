@@ -184,7 +184,7 @@ async fn do_take_rows(
     }
 
     let physical_schema = Arc::new(projection.physical_projection.to_bare_schema());
-    let batch = if row_addr_stats.contiguous {
+    let mut batch = if row_addr_stats.contiguous {
         // Fastest path: Can use `read_range` directly
         let start = row_addrs.first().expect("empty range passed to take_rows");
         let fragment_id = (start >> 32) as usize;
@@ -344,17 +344,6 @@ async fn do_take_rows(
         Ok(reordered.into())
     }?;
 
-    // strip `ROW_OFFSET` field from projection (if exists)
-    let mut stripped_projection = projection.as_ref().clone();
-    stripped_projection.requested_output_expr = stripped_projection
-        .requested_output_expr
-        .clone()
-        .into_iter()
-        .filter(|e| e.name != ROW_OFFSET)
-        .collect();
-
-    let mut batch = (Arc::new(stripped_projection)).project_batch(batch).await?;
-
     if builder.with_row_address || projection.must_add_row_offset {
         // compile `ROW_ADDR` column
         if batch.num_rows() != row_addrs.len() {
@@ -387,7 +376,7 @@ async fn do_take_rows(
         }
     }
 
-    Ok(batch)
+    Ok(projection.project_batch(batch).await?)
 }
 
 async fn take_rows(builder: TakeBuilder) -> Result<RecordBatch> {
