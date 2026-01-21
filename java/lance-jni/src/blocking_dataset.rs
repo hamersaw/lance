@@ -4,7 +4,7 @@
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
 use crate::storage_options::JavaStorageOptionsProvider;
-use crate::traits::{export_vec, import_vec, FromJObjectWithEnv, FromJString};
+use crate::traits::{export_vec, import_vec, import_vec_to_rust, FromJObjectWithEnv, FromJString};
 use crate::utils::{
     build_compaction_options, extract_storage_options, extract_write_params,
     get_scalar_index_params, get_vector_index_params, to_rust_map,
@@ -20,7 +20,7 @@ use arrow::record_batch::RecordBatchIterator;
 use arrow_schema::DataType;
 use arrow_schema::Schema as ArrowSchema;
 use chrono::{DateTime, Utc};
-use jni::objects::{JMap, JString, JValue};
+use jni::objects::{JMap, JString, JValue, JValueGen};
 use jni::sys::{jboolean, jint};
 use jni::sys::{jbyteArray, jlong};
 use jni::{objects::JObject, JNIEnv};
@@ -336,6 +336,14 @@ impl BlockingDataset {
 
     pub fn cleanup_with_policy(&mut self, policy: CleanupPolicy) -> Result<RemovalStats> {
         Ok(RT.block_on(self.inner.cleanup_with_policy(policy))?)
+    }
+
+    pub fn compute_splits(&self, filtered_field_names: &[String]) -> Result<Vec<Vec<Fragment>>> {
+        let splits = RT.block_on(self.inner.compute_splits(filtered_field_names, None))?;
+        Ok(splits
+            .into_iter()
+            .map(|split| split.into_fragments())
+            .collect())
     }
 
     pub fn close(&self) {}
@@ -1125,6 +1133,52 @@ fn inner_get_fragments<'local>(
         .map(|f| f.metadata().clone())
         .collect::<Vec<Fragment>>();
     export_vec(env, &fragments)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_Dataset_computeSplitsNative<'a>(
+    mut env: JNIEnv<'a>,
+    jdataset: JObject,
+    filtered_field_names: JObject, // List<String>
+) -> JObject<'a> {
+    ok_or_throw!(
+        env,
+        inner_compute_splits(&mut env, jdataset, filtered_field_names)
+    )
+}
+
+fn inner_compute_splits<'local>(
+    env: &mut JNIEnv<'local>,
+    jdataset: JObject,
+    filtered_field_names: JObject,
+) -> Result<JObject<'local>> {
+    // Extract field names from Java List<String>
+    let field_names: Vec<String> = import_vec_to_rust(env, &filtered_field_names, |env, obj| {
+        let jstring: JString = obj.into();
+        jstring.extract(env)
+    })?;
+
+    let splits = {
+        let dataset =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
+        dataset.compute_splits(&field_names)?
+    };
+
+    // Convert Vec<Vec<Fragment>> to List<List<FragmentMetadata>>
+    let array_list_class = env.find_class("java/util/ArrayList")?;
+    let outer_list = env.new_object(&array_list_class, "()V", &[])?;
+
+    for split_fragments in &splits {
+        let inner_list = export_vec(env, split_fragments)?;
+        env.call_method(
+            &outer_list,
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[JValueGen::Object(&inner_list)],
+        )?;
+    }
+
+    Ok(outer_list)
 }
 
 #[no_mangle]

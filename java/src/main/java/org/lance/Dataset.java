@@ -1007,6 +1007,26 @@ public class Dataset implements Closeable {
   private native List<FragmentMetadata> getFragmentsNative();
 
   /**
+   * Computes splits from the dataset based on index coverage.
+   *
+   * <p>For each index that contains all the specified field names, creates a split containing the
+   * fragments covered by that index. Each fragment is assigned to exactly one split - either to an
+   * index-based split (the first matching index wins) or to its own individual split if not covered
+   * by any matching index.
+   *
+   * @param filteredFieldNames the field names to match against index fields
+   * @return a list of splits, where each split is a list of fragment metadata
+   */
+  public List<List<FragmentMetadata>> computeSplits(List<String> filteredFieldNames) {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return computeSplitsNative(filteredFieldNames);
+    }
+  }
+
+  private native List<List<FragmentMetadata>> computeSplitsNative(List<String> filteredFieldNames);
+
+  /**
    * Gets the arrow schema of the dataset.
    *
    * @return the arrow schema
