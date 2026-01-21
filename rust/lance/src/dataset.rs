@@ -1891,6 +1891,70 @@ impl Dataset {
         &self.manifest.fragments
     }
 
+    /// Compute splits for the dataset based on index coverage.
+    ///
+    /// This method partitions the dataset's fragments into splits based on which
+    /// indices cover which fragments. Fragments covered by matching indices are
+    /// grouped together, while uncovered fragments each become their own split.
+    ///
+    /// # Arguments
+    ///
+    /// * `filtered_field_names` - The field names to match against index fields
+    /// * `options` - Optional configuration for split computation
+    ///
+    /// # Returns
+    ///
+    /// A vector of [`Split`](crate::split::Split) instances. Index-based splits come first,
+    /// followed by individual splits for any fragments not covered by matching indices.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any of the field names cannot be resolved from the schema.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # async fn example(dataset: &Dataset) -> Result<()> {
+    /// let splits = dataset.compute_splits(&["vector_column"], None).await?;
+    /// for split in splits {
+    ///     println!("Split has {} fragments", split.fragments().len());
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn compute_splits(
+        &self,
+        filtered_field_names: &[impl AsRef<str>],
+        options: Option<&crate::split::SplitOptions>,
+    ) -> Result<Vec<crate::split::Split>> {
+        // Convert field names to field IDs
+        let mut filtered_field_ids = Vec::with_capacity(filtered_field_names.len());
+        let schema = self.schema();
+        for name in filtered_field_names {
+            let name_ref = name.as_ref();
+            match schema.field(name_ref) {
+                Some(field) => {
+                    filtered_field_ids.push(field.id);
+                }
+                None => {
+                    return Err(Error::InvalidInput {
+                        source: format!("Field '{}' not found in schema", name_ref).into(),
+                        location: location!(),
+                    });
+                }
+            }
+        }
+
+        let indices = self.load_indices().await?;
+        Ok(crate::split::compute_splits(
+            &filtered_field_ids,
+            &indices,
+            self.fragments(),
+            options,
+        ))
+    }
+
     // Gets a filtered list of fragments from ids in O(N) time instead of using
     // `get_fragment` which would require O(N^2) time.
     pub fn get_frags_from_ordered_ids(&self, ordered_ids: &[u32]) -> Vec<Option<FileFragment>> {
