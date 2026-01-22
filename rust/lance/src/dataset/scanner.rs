@@ -9298,4 +9298,256 @@ mod test {
             runtime.handle().metrics().num_alive_tasks()
         );
     }
+
+    #[test]
+    fn test_bin_pack_empty() {
+        let items: HashMap<u64, usize> = HashMap::new();
+        let bins = Scanner::bin_pack(items, 100);
+        assert!(bins.is_empty());
+    }
+
+    #[test]
+    fn test_bin_pack_single_item_fits() {
+        let items = HashMap::from([(1, 50)]);
+        let bins = Scanner::bin_pack(items, 100);
+        assert_eq!(bins.len(), 1);
+        assert_eq!(bins[0], vec![1]);
+    }
+
+    #[test]
+    fn test_bin_pack_single_item_exceeds_maximum() {
+        let items = HashMap::from([(1, 200)]);
+        let bins = Scanner::bin_pack(items, 100);
+        assert_eq!(bins.len(), 1);
+        assert_eq!(bins[0], vec![1]);
+    }
+
+    #[test]
+    fn test_bin_pack_single_item_equals_maximum() {
+        // Items with count >= maximum_count get their own bin
+        let items = HashMap::from([(1, 100)]);
+        let bins = Scanner::bin_pack(items, 100);
+        assert_eq!(bins.len(), 1);
+        assert_eq!(bins[0], vec![1]);
+    }
+
+    #[test]
+    fn test_bin_pack_multiple_items_fit_one_bin() {
+        let items = HashMap::from([(1, 30), (2, 30), (3, 30)]);
+        let bins = Scanner::bin_pack(items, 100);
+        assert_eq!(bins.len(), 1);
+        let mut ids: Vec<u64> = bins[0].clone();
+        ids.sort();
+        assert_eq!(ids, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_bin_pack_multiple_bins_needed() {
+        // Each item is 60, maximum is 100, so only one item per bin
+        // (60 + 60 = 120 >= 100, not strictly less than)
+        let items = HashMap::from([(1, 60), (2, 60), (3, 60)]);
+        let bins = Scanner::bin_pack(items, 100);
+        assert_eq!(bins.len(), 3);
+    }
+
+    #[test]
+    fn test_bin_pack_mixed_sizes() {
+        // maximum = 100
+        // Items: 70, 50, 40, 20, 10
+        // Sorted descending: 70, 50, 40, 20, 10
+        // Bin 1: 70, then try 50 (70+50=120 >= 100, no), try 40 (70+40=110 >= 100, no),
+        //        try 20 (70+20=90 < 100, yes) -> [70, 20]
+        // Bin 2: 50, then try 40 (50+40=90 < 100, yes) -> [50, 40]
+        // Bin 3: try 10 in bin1 (90+10=100, NOT < 100), try bin2 (90+10=100, NOT < 100) -> [10]
+        let items = HashMap::from([(1, 70), (2, 50), (3, 40), (4, 20), (5, 10)]);
+        let bins = Scanner::bin_pack(items, 100);
+
+        // Verify total items across all bins
+        let total_items: usize = bins.iter().map(|b| b.len()).sum();
+        assert_eq!(total_items, 5);
+
+        // Each bin's total count should be < maximum (or a single oversized item)
+        let item_map: HashMap<u64, usize> = [(1, 70), (2, 50), (3, 40), (4, 20), (5, 10)].into();
+        for bin in &bins {
+            let bin_total: usize = bin.iter().map(|id| item_map[id]).sum();
+            // Bins with a single oversized item can exceed, but here all are < 100
+            assert!(bin_total <= 100, "bin total {} exceeds maximum", bin_total);
+        }
+    }
+
+    #[test]
+    fn test_bin_pack_oversized_items_get_own_bin() {
+        let items = HashMap::from([(1, 200), (2, 150), (3, 30)]);
+        let bins = Scanner::bin_pack(items, 100);
+
+        // Oversized items (200, 150) each get their own bin
+        // Item 30 could fit in a new bin
+        assert_eq!(bins.len(), 3);
+
+        // Each bin should have exactly one item
+        for bin in &bins {
+            assert_eq!(bin.len(), 1);
+        }
+    }
+
+    #[test]
+    fn test_bin_pack_boundary_condition() {
+        // Test the strict less-than condition: bin_count + count < maximum_count
+        // Two items of 49 should fit in one bin (49 + 49 = 98 < 100)
+        let items = HashMap::from([(1, 49), (2, 49)]);
+        let bins = Scanner::bin_pack(items, 100);
+        assert_eq!(bins.len(), 1);
+
+        // Two items of 50 should NOT fit in one bin (50 + 50 = 100, not < 100)
+        let items = HashMap::from([(1, 50), (2, 50)]);
+        let bins = Scanner::bin_pack(items, 100);
+        assert_eq!(bins.len(), 2);
+    }
+
+    #[test]
+    fn test_bin_pack_all_ids_preserved() {
+        let items: HashMap<u64, usize> = (0..10).map(|i| (i, 25)).collect();
+        let bins = Scanner::bin_pack(items.clone(), 100);
+
+        let mut all_ids: Vec<u64> = bins.into_iter().flatten().collect();
+        all_ids.sort();
+        let mut expected_ids: Vec<u64> = items.keys().copied().collect();
+        expected_ids.sort();
+        assert_eq!(all_ids, expected_ids);
+    }
+
+    #[tokio::test]
+    async fn test_plan_splits_basic() {
+        // Create a dataset with 4 fragments of 100 rows each, single i32 column (4 bytes)
+        let dataset = lance_datagen::gen_batch()
+            .col("i", array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(4), FragmentRowCount::from(100))
+            .await
+            .unwrap();
+
+        let splits = dataset.scan().plan_splits(None).await.unwrap();
+
+        // Default split size is 128MB, each fragment has 100 rows of 4 bytes = 400 bytes
+        // max_rows_per_split = 128*1024*1024 / 4 = 33554432
+        // All 400 rows fit in one split
+        assert_eq!(splits.len(), 1);
+        assert_eq!(splits[0].fragments.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_plan_splits_with_small_split_size() {
+        // Create 4 fragments of 100 rows, single i32 column (4 bytes per row)
+        let dataset = lance_datagen::gen_batch()
+            .col("i", array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(4), FragmentRowCount::from(100))
+            .await
+            .unwrap();
+
+        // Set split size to 200 bytes -> max_rows = 200/4 = 50 rows per split
+        // Each fragment has 100 rows >= 50, so each gets its own bin
+        let options = SplitOptions::default().with_max_split_size_bytes(200);
+        let splits = dataset.scan().plan_splits(Some(options)).await.unwrap();
+
+        assert_eq!(splits.len(), 4);
+        for split in &splits {
+            assert_eq!(split.fragments.len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_plan_splits_grouping() {
+        // Create 4 fragments of 50 rows, single i32 column (4 bytes per row)
+        let dataset = lance_datagen::gen_batch()
+            .col("i", array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(4), FragmentRowCount::from(50))
+            .await
+            .unwrap();
+
+        // Set split size to 400 bytes -> max_rows = 400/4 = 100 rows per split
+        // Each fragment has 50 rows, so two fragments can fit per split (50+50=100, not < 100)
+        // Actually 50+50=100 is NOT < 100, so each fragment gets its own bin
+        let options = SplitOptions::default().with_max_split_size_bytes(400);
+        let splits = dataset.scan().plan_splits(Some(options)).await.unwrap();
+        assert_eq!(splits.len(), 4);
+
+        // With 404 bytes: max_rows = 404/4 = 101 rows per split
+        // Each fragment has 50 rows, 50+50=100 < 101, so two fragments per split
+        let options = SplitOptions::default().with_max_split_size_bytes(404);
+        let splits = dataset.scan().plan_splits(Some(options)).await.unwrap();
+        assert_eq!(splits.len(), 2);
+        for split in &splits {
+            assert_eq!(split.fragments.len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_plan_splits_with_projection() {
+        // Create dataset with two i32 columns (8 bytes per row)
+        let dataset = lance_datagen::gen_batch()
+            .col("a", array::step::<Int32Type>())
+            .col("b", array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(4), FragmentRowCount::from(100))
+            .await
+            .unwrap();
+
+        // Full projection: 8 bytes per row, max_rows = 800/8 = 100
+        // Each fragment has 100 rows >= 100, so each gets its own bin
+        let options = SplitOptions::default().with_max_split_size_bytes(800);
+        let splits = dataset.scan().plan_splits(Some(options)).await.unwrap();
+        assert_eq!(splits.len(), 4);
+
+        // Single column projection: 4 bytes per row, max_rows = 800/4 = 200
+        // Each fragment has 100 rows, 100+100=200 NOT < 200, so each gets its own bin
+        let mut scanner = dataset.scan();
+        scanner.project(&["a"]).unwrap();
+        let splits = scanner
+            .plan_splits(Some(SplitOptions::default().with_max_split_size_bytes(800)))
+            .await
+            .unwrap();
+        assert_eq!(splits.len(), 4);
+
+        // Single column projection with larger budget: max_rows = 804/4 = 201
+        // 100 + 100 = 200 < 201, so two fragments per split
+        let mut scanner = dataset.scan();
+        scanner.project(&["a"]).unwrap();
+        let splits = scanner
+            .plan_splits(Some(SplitOptions::default().with_max_split_size_bytes(804)))
+            .await
+            .unwrap();
+        assert_eq!(splits.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_plan_splits_with_fragments() {
+        // Create dataset with 4 fragments
+        let dataset = lance_datagen::gen_batch()
+            .col("i", array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(4), FragmentRowCount::from(100))
+            .await
+            .unwrap();
+
+        // Only scan 2 specific fragments
+        let frags: Vec<_> = dataset.fragments()[..2].to_vec();
+
+        let mut scanner = dataset.scan();
+        scanner.with_fragments(frags);
+
+        // Large split size so everything fits in one split
+        let splits = scanner.plan_splits(None).await.unwrap();
+        assert_eq!(splits.len(), 1);
+        assert_eq!(splits[0].fragments.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_plan_splits_single_fragment() {
+        let dataset = lance_datagen::gen_batch()
+            .col("i", array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(100))
+            .await
+            .unwrap();
+
+        let splits = dataset.scan().plan_splits(None).await.unwrap();
+        assert_eq!(splits.len(), 1);
+        assert_eq!(splits[0].fragments.len(), 1);
+    }
 }
