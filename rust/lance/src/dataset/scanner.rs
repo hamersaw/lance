@@ -52,7 +52,7 @@ use lance_core::datatypes::{
 };
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::address::RowAddress;
-use lance_core::utils::mask::{RowAddrMask, RowAddrTreeMap, RowSetOps};
+use lance_core::utils::mask::{RowAddrMask, RowAddrTreeMap};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR, ROW_ID, ROW_OFFSET};
 use lance_datafusion::exec::{
@@ -612,19 +612,19 @@ pub struct Split {
 }
 
 /// Options for configuring how splits are created.
+#[derive(Debug, Clone, Default)]
 pub struct SplitOptions {
-    /// A suggested number of rows per split. The scanner will attempt to create splits
-    /// with approximately this many rows, but the actual number may vary depending on
-    /// the sizes of the fragments.
-    /// For example, if a single fragment has more rows than this value, we will not split
-    /// the fragment, but include it in a single split.
-    max_rows_per_split: Option<usize>,
+    /// The target maximum size in bytes for each split. The scanner estimates
+    /// the row size from the output schema and calculates how many rows fit
+    /// within this budget. Defaults to 128MB if not specified.
+    max_split_size_bytes: Option<usize>,
 }
 
 impl SplitOptions {
-    /// Create a new SplitOptions with the given max_rows_per_split.
-    pub fn new(max_rows_per_split: Option<usize>) -> Self {
-        Self { max_rows_per_split }
+    /// Set the target maximum size in bytes for each split.
+    pub fn with_max_split_size_bytes(mut self, max_split_size_bytes: usize) -> Self {
+        self.max_split_size_bytes = Some(max_split_size_bytes);
+        self
     }
 }
 
@@ -886,7 +886,11 @@ impl Scanner {
         self.fragments.is_some()
     }
 
-    // TODO @hamersaw - docs
+    /// Plan splits for distributed or parallel scanning of the dataset.
+    ///
+    /// This method analyzes the fragments to be scanned and groups them into [`Split`]s
+    /// that can be processed independently by multiple workers or threads. It uses a
+    /// bin-packing algorithm to create balanced splits based on estimated row counts.
     pub async fn plan_splits(&self, options: Option<SplitOptions>) -> Result<Vec<Split>> {
         // Collect initial set of fragments to scan
         let fragments = if let Some(fragments) = self.fragments.as_ref() {
@@ -927,9 +931,9 @@ impl Scanner {
                                     {
                                         Some(frag_bitmap) => frag_bitmap.len() as usize,
                                         None => {
-                                            // Since we know `bitmap.contains(frag.id as u32)` is
-                                            // true, this `None` means the fragment bitmap is full.
-                                            // Use the total number of rows in the fragment.
+                                            // Since we know `frag.id` is in the bitmap, this `None
+                                            // means the fragment bitmap is full. Use the total
+                                            // number of rows in the fragment.
                                             frag.num_rows().unwrap_or(usize::MAX)
                                         }
                                     };
@@ -941,16 +945,33 @@ impl Scanner {
                             }
                         }
                         RowAddrMask::BlockList(bitmap) => {
-                            let _blocked_frag_ids: HashSet<u32> =
+                            // Iterate over covered fragments and update row counts
+                            let blocked_frag_ids: HashSet<u32> =
                                 bitmap.fragments().into_iter().collect();
 
-                            // TODO @hamersaw - figure out how to handle block list pruning correctly
-                            /*for frag in &covered_frags {
-                                if !bitmap.contains(frag.id as u32) {
-                                    // All rows in the fragment match
-                                    frag_max_row_counts.insert(frag.id, max_row_count);
+                            for frag in &covered_frags {
+                                if !blocked_frag_ids.contains(&(frag.id as u32)) {
+                                    // Fragment is not blocked, so all rows are allowed
+                                    frag_max_row_counts
+                                        .insert(frag.id, frag.num_rows().unwrap_or(usize::MAX));
+                                } else {
+                                    match bitmap.get_fragment_bitmap(frag.id as u32) {
+                                        Some(frag_bitmap) => {
+                                            let blocked_row_count = frag_bitmap.len() as usize;
+                                            let row_count = match frag.num_rows() {
+                                                Some(row_count) => row_count - blocked_row_count,
+                                                None => usize::MAX,
+                                            };
+                                            frag_max_row_counts.insert(frag.id, row_count);
+                                        }
+                                        None => {
+                                            // PRUNE fragment since no rows match
+                                            // Since we know `frag.id` is in the bitmap, this `None
+                                            // means the fragment bitmap is full.
+                                        }
+                                    }
                                 }
-                            }*/
+                            }
                         }
                     }
                 }
@@ -973,15 +994,28 @@ impl Scanner {
                     None => usize::MAX,
                 };
                 frag_max_row_counts.insert(frag.id, max_row_count);
-
-                // TODO - Query `ZoneMaps` to prune rows within fragments
-                // TODO - do we want to create splits with mixed covered / uncovered fragments?
             });
 
         // Bin pack fragments into splits for parallel processing
-        let max_rows_per_split = options
-            .and_then(|o| o.max_rows_per_split)
-            .unwrap_or(500_000); // TODO @hamersaw - default?!?
+        const DEFAULT_SPLIT_SIZE: usize = 128 * 1024 * 1024;
+        const DEFAULT_VARIABLE_FIELD_SIZE: usize = 64;
+
+        let target_split_size = options
+            .and_then(|o| o.max_split_size_bytes)
+            .unwrap_or(DEFAULT_SPLIT_SIZE);
+
+        let output_schema = self.projection_plan.output_schema()?;
+        let estimated_row_size: usize = output_schema
+            .fields()
+            .iter()
+            .map(|f| {
+                f.data_type()
+                    .byte_width_opt()
+                    .unwrap_or(DEFAULT_VARIABLE_FIELD_SIZE)
+            })
+            .sum();
+
+        let max_rows_per_split = target_split_size / estimated_row_size.max(1);
 
         let bins = Self::bin_pack(frag_max_row_counts, max_rows_per_split);
 

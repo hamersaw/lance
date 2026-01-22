@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use arrow::pyarrow::*;
 use arrow_array::RecordBatchReader;
-use lance::dataset::scanner::ExecutionSummaryCounts;
+use lance::dataset::scanner::{ExecutionSummaryCounts, SplitOptions};
 use pyo3::prelude::*;
 use pyo3::pyclass;
 
@@ -30,6 +30,7 @@ use pyo3::exceptions::PyValueError;
 use crate::reader::LanceReader;
 use crate::rt;
 use crate::schema::logical_arrow_schema;
+use crate::utils::PyLance;
 
 /// This will be wrapped by a python class to provide
 /// additional functionality
@@ -149,5 +150,33 @@ impl Scanner {
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
         Ok(PyArrowType(Box::new(reader)))
+    }
+
+    #[pyo3(signature = (max_split_size_bytes=None))]
+    fn plan_splits<'py>(
+        self_: PyRef<'py, Self>,
+        max_split_size_bytes: Option<usize>,
+    ) -> PyResult<Vec<Vec<Bound<'py, PyAny>>>> {
+        let scanner = self_.scanner.clone();
+        let mut options = SplitOptions::default();
+        if let Some(size) = max_split_size_bytes {
+            options = options.with_max_split_size_bytes(size);
+        }
+        let splits = rt()
+            .spawn(Some(self_.py()), async move {
+                scanner.plan_splits(Some(options)).await
+            })?
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        splits
+            .into_iter()
+            .map(|split| {
+                split
+                    .fragments
+                    .into_iter()
+                    .map(|frag| PyLance(frag).into_pyobject(self_.py()))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .collect::<Result<Vec<_>, _>>()
     }
 }

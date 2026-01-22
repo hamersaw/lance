@@ -5189,6 +5189,34 @@ class LanceScanner(pa.dataset.Scanner):
 
         return self._scanner.analyze_plan()
 
+    def plan_splits(
+        self, max_split_size_bytes: Optional[int] = None
+    ) -> List[List["FragmentMetadata"]]:
+        """Plan splits for distributed scanning.
+
+        This method analyzes the scanner's filter and uses indices to determine
+        which fragments need to be scanned and approximately how many rows each
+        fragment will return. It then groups fragments into splits that can be
+        processed independently.
+
+        The scanner estimates the size of each row based on the output schema
+        projection and uses that to determine how many rows fit within the
+        target split size.
+
+        Parameters
+        ----------
+        max_split_size_bytes : int, optional
+            The target maximum size in bytes for each split. Defaults to 128MB.
+
+        Returns
+        -------
+        List[List[FragmentMetadata]]
+            A list of splits, where each split is a list of FragmentMetadata objects.
+            Each split can be processed independently for distributed scanning.
+        """
+
+        return self._scanner.plan_splits(max_split_size_bytes=max_split_size_bytes)
+
 
 class DatasetOptimizer:
     def __init__(self, dataset: LanceDataset):
