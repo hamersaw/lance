@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 use std::task::{Context, Poll};
+use std::usize;
 
 use arrow::array::AsArray;
 use arrow_array::{Array, Float32Array, Int64Array, RecordBatch};
@@ -50,7 +52,7 @@ use lance_core::datatypes::{
 };
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::address::RowAddress;
-use lance_core::utils::mask::{RowAddrMask, RowAddrTreeMap};
+use lance_core::utils::mask::{RowAddrMask, RowAddrTreeMap, RowSetOps};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR, ROW_ID, ROW_OFFSET};
 use lance_datafusion::exec::{
@@ -600,6 +602,32 @@ pub struct Scanner {
     autoproject_scoring_columns: bool,
 }
 
+/// Represents a split for parallel scanning of fragments
+///
+/// A split contains one or more fragments that can be scanned together.
+/// Splits can be used to distribute scanning work across multiple workers or threads.
+#[derive(Debug, Clone)]
+pub struct Split {
+    pub fragments: Vec<Fragment>,
+}
+
+/// Options for configuring how splits are created.
+pub struct SplitOptions {
+    /// A suggested number of rows per split. The scanner will attempt to create splits
+    /// with approximately this many rows, but the actual number may vary depending on
+    /// the sizes of the fragments.
+    /// For example, if a single fragment has more rows than this value, we will not split
+    /// the fragment, but include it in a single split.
+    max_rows_per_split: Option<usize>,
+}
+
+impl SplitOptions {
+    /// Create a new SplitOptions with the given max_rows_per_split.
+    pub fn new(max_rows_per_split: Option<usize>) -> Self {
+        Self { max_rows_per_split }
+    }
+}
+
 /// Represents a user-requested take operation
 #[derive(Debug, Clone)]
 pub enum TakeOperation {
@@ -856,6 +884,159 @@ impl Scanner {
 
     fn is_fragment_scan(&self) -> bool {
         self.fragments.is_some()
+    }
+
+    // TODO @hamersaw - docs
+    pub async fn plan_splits(&self, options: Option<SplitOptions>) -> Result<Vec<Split>> {
+        // Collect initial set of fragments to scan
+        let fragments = if let Some(fragments) = self.fragments.as_ref() {
+            Arc::new(fragments.clone())
+        } else {
+            Arc::new(self.dataset.fragments().as_ref().clone())
+        };
+
+        // Use indices to prune fragments
+        let mut frag_max_row_counts: HashMap<u64, usize> = HashMap::new();
+        let mut covered_frag_ids: HashSet<_> = HashSet::new();
+
+        let filter_plan = self.create_filter_plan(true).await?;
+        if let Some(index_expr) = filter_plan.expr_filter_plan.index_query.as_ref() {
+            // Partition fragments by coverage of the index expression
+            let (covered_frags, _) = self
+                .partition_frags_by_coverage(index_expr, fragments.clone())
+                .await?;
+            covered_frags.iter().for_each(|frag| {
+                covered_frag_ids.insert(frag.id);
+            });
+
+            // Evaluate the index expression to retrieve a bitmask of matching rows
+            let expr_result = index_expr
+                .evaluate(self.dataset.as_ref(), &NoOpMetricsCollector)
+                .await?;
+            match expr_result {
+                IndexExprResult::Exact(mask) | IndexExprResult::AtMost(mask) => {
+                    match mask {
+                        RowAddrMask::AllowList(bitmap) => {
+                            // Iterate over covered fragments and update row counts
+                            let allow_frag_ids: HashSet<u32> =
+                                bitmap.fragments().into_iter().collect();
+
+                            for frag in &covered_frags {
+                                if allow_frag_ids.contains(&(frag.id as u32)) {
+                                    let row_count = match bitmap.get_fragment_bitmap(frag.id as u32)
+                                    {
+                                        Some(frag_bitmap) => frag_bitmap.len() as usize,
+                                        None => {
+                                            // Since we know `bitmap.contains(frag.id as u32)` is
+                                            // true, this `None` means the fragment bitmap is full.
+                                            // Use the total number of rows in the fragment.
+                                            frag.num_rows().unwrap_or(usize::MAX)
+                                        }
+                                    };
+
+                                    frag_max_row_counts.insert(frag.id, row_count);
+                                } else {
+                                    // PRUNE fragment since no rows match
+                                }
+                            }
+                        }
+                        RowAddrMask::BlockList(bitmap) => {
+                            let _blocked_frag_ids: HashSet<u32> =
+                                bitmap.fragments().into_iter().collect();
+
+                            // TODO @hamersaw - figure out how to handle block list pruning correctly
+                            /*for frag in &covered_frags {
+                                if !bitmap.contains(frag.id as u32) {
+                                    // All rows in the fragment match
+                                    frag_max_row_counts.insert(frag.id, max_row_count);
+                                }
+                            }*/
+                        }
+                    }
+                }
+                IndexExprResult::AtLeast(_) => {
+                    // In the `AtLeast` case some of the rows in the block list may be false
+                    // positives. Therefore, we can not prune any fragments as we can not guarantee
+                    // any fragments will not have matching rows.
+                }
+            }
+        }
+
+        // Estimate row counts for fragments not covered by indices.
+        fragments
+            .iter()
+            .filter(|frag| !covered_frag_ids.contains(&frag.id))
+            .for_each(|frag| {
+                // Estimate the number of rows in the fragment that satisfy the filter
+                let max_row_count = match frag.num_rows() {
+                    Some(count) => count,
+                    None => usize::MAX,
+                };
+                frag_max_row_counts.insert(frag.id, max_row_count);
+
+                // TODO - Query `ZoneMaps` to prune rows within fragments
+                // TODO - do we want to create splits with mixed covered / uncovered fragments?
+            });
+
+        // Bin pack fragments into splits for parallel processing
+        let max_rows_per_split = options
+            .and_then(|o| o.max_rows_per_split)
+            .unwrap_or(500_000); // TODO @hamersaw - default?!?
+
+        let bins = Self::bin_pack(frag_max_row_counts, max_rows_per_split);
+
+        // Convert bins to splits
+        let fragment_map: HashMap<u64, &Fragment> = fragments.iter().map(|f| (f.id, f)).collect();
+        let splits = bins
+            .into_iter()
+            .map(|bin| {
+                let frags = bin
+                    .into_iter()
+                    .filter_map(|id| fragment_map.get(&id).map(|&f| f.clone()))
+                    .collect();
+                Split { fragments: frags }
+            })
+            .collect();
+
+        Ok(splits)
+    }
+
+    /// Packs IDs into bins where each bin's total count is less than `maximum_count`.
+    ///
+    /// Uses a first-fit decreasing algorithm: items are sorted by count in descending
+    /// order, then each item is placed in the first bin that has room for it.
+    fn bin_pack(items: HashMap<u64, usize>, maximum_count: usize) -> Vec<Vec<u64>> {
+        // Convert to vec and sort by count descending for better packing
+        let mut items: Vec<(u64, usize)> = items.into_iter().collect();
+        items.sort_by(|a, b| b.1.cmp(&a.1));
+
+        let mut bins: Vec<(Vec<u64>, usize)> = Vec::new(); // (ids, current_count)
+
+        for (id, count) in items {
+            // Items that exceed the maximum get their own bin
+            if count >= maximum_count {
+                bins.push((vec![id], count));
+                continue;
+            }
+
+            // Find first bin with enough remaining capacity
+            let mut placed = false;
+            for (bin_ids, bin_count) in &mut bins {
+                if *bin_count + count < maximum_count {
+                    bin_ids.push(id);
+                    *bin_count += count;
+                    placed = true;
+                    break;
+                }
+            }
+
+            // Create new bin if no existing bin has room
+            if !placed {
+                bins.push((vec![id], count));
+            }
+        }
+
+        bins.into_iter().map(|(ids, _)| ids).collect()
     }
 
     /// Empty Projection (useful for count queries)
