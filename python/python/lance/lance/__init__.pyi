@@ -95,7 +95,6 @@ class LanceFileWriter:
         version: Optional[str],
         storage_options: Optional[Dict[str, str]],
         storage_options_provider: Optional[StorageOptionsProvider],
-        s3_credentials_refresh_offset_seconds: Optional[int],
         keep_original_array: Optional[bool],
         max_page_bytes: Optional[int],
     ): ...
@@ -110,7 +109,6 @@ class LanceFileSession:
         base_path: str,
         storage_options: Optional[Dict[str, str]] = None,
         storage_options_provider: Optional[StorageOptionsProvider] = None,
-        s3_credentials_refresh_offset_seconds: Optional[int] = None,
     ): ...
     def open_reader(
         self, path: str, columns: Optional[List[str]] = None
@@ -135,7 +133,6 @@ class LanceFileReader:
         path: str,
         storage_options: Optional[Dict[str, str]],
         storage_options_provider: Optional[StorageOptionsProvider],
-        s3_credentials_refresh_offset_seconds: Optional[int],
         columns: Optional[List[str]] = None,
     ): ...
     def read_all(
@@ -243,6 +240,7 @@ class _Dataset:
         fast_search: Optional[bool] = None,
         full_text_query: Optional[dict] = None,
         late_materialization: Optional[bool | List[str]] = None,
+        blob_handling: Optional[str] = None,
         use_scalar_index: Optional[bool] = None,
         include_deleted_rows: Optional[bool] = None,
     ) -> _Scanner: ...
