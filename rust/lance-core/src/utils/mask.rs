@@ -333,13 +333,6 @@ impl RowAddrSelection {
             res
         }
     }
-
-    pub fn len(&self) -> Option<u64> {
-        match self {
-            Self::Full => None,
-            Self::Partial(bitmap) => Some(bitmap.len()),
-        }
-    }
 }
 
 impl RowSetOps for RowAddrTreeMap {
@@ -352,7 +345,10 @@ impl RowSetOps for RowAddrTreeMap {
     fn len(&self) -> Option<u64> {
         self.inner
             .values()
-            .map(|row_addr_selection| row_addr_selection.len())
+            .map(|row_addr_selection| match row_addr_selection {
+                RowAddrSelection::Full => None,
+                RowAddrSelection::Partial(indices) => Some(indices.len()),
+            })
             .try_fold(0_u64, |acc, next| next.map(|next| next + acc))
     }
 

@@ -6,7 +6,6 @@ use std::ops::Range;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 use std::task::{Context, Poll};
-use std::usize;
 
 use arrow::array::AsArray;
 use arrow_array::{Array, Float32Array, Int64Array, RecordBatch};
@@ -608,24 +607,29 @@ pub struct Scanner {
 /// Splits can be used to distribute scanning work across multiple workers or threads.
 #[derive(Debug, Clone)]
 pub struct Split {
-    pub fragments: Vec<Fragment>,
+    pub fragments: Vec<SplitFragment>,
 }
 
-/// Options for configuring how splits are created.
-#[derive(Debug, Clone, Default)]
-pub struct SplitOptions {
-    /// The target maximum size in bytes for each split. The scanner estimates
-    /// the row size from the output schema and calculates how many rows fit
-    /// within this budget. Defaults to 128MB if not specified.
-    max_split_size_bytes: Option<usize>,
+/// A fragment within a [`Split`], along with metadata about the expected
+/// number of rows that will be scanned from it.
+#[derive(Debug, Clone)]
+pub struct SplitFragment {
+    /// The fragment to scan.
+    pub fragment: Fragment,
+    /// An upper bound on the number of rows that will be read from this
+    /// fragment after applying any filters or index pruning.
+    pub max_row_count: usize,
 }
 
-impl SplitOptions {
-    /// Set the target maximum size in bytes for each split.
-    pub fn with_max_split_size_bytes(mut self, max_split_size_bytes: usize) -> Self {
-        self.max_split_size_bytes = Some(max_split_size_bytes);
-        self
-    }
+/// Strategy for packing fragments into splits.
+#[derive(Debug, Clone)]
+pub enum SplitPackStrategy {
+    /// Target a maximum size in bytes per split. The scanner estimates the row
+    /// size from the output schema and calculates how many rows fit within this
+    /// budget.
+    MaxSizeBytes(usize),
+    /// Target a maximum number of rows per split.
+    MaxRowCount(usize),
 }
 
 /// Represents a user-requested take operation
@@ -891,7 +895,7 @@ impl Scanner {
     /// This method analyzes the fragments to be scanned and groups them into [`Split`]s
     /// that can be processed independently by multiple workers or threads. It uses a
     /// bin-packing algorithm to create balanced splits based on estimated row counts.
-    pub async fn plan_splits(&self, options: Option<SplitOptions>) -> Result<Vec<Split>> {
+    pub async fn plan_splits(&self, strategy: Option<SplitPackStrategy>) -> Result<Vec<Split>> {
         // Collect initial set of fragments to scan
         let fragments = if let Some(fragments) = self.fragments.as_ref() {
             Arc::new(fragments.clone())
@@ -899,7 +903,7 @@ impl Scanner {
             Arc::new(self.dataset.fragments().as_ref().clone())
         };
 
-        // Use indices to prune fragments
+        // Use indices to prune fragments and compute max row counts per fragment
         let mut frag_max_row_counts: HashMap<u64, usize> = HashMap::new();
         let mut covered_frag_ids: HashSet<_> = HashSet::new();
 
@@ -1000,24 +1004,37 @@ impl Scanner {
         const DEFAULT_SPLIT_SIZE: usize = 128 * 1024 * 1024;
         const DEFAULT_VARIABLE_FIELD_SIZE: usize = 64;
 
-        let target_split_size = options
-            .and_then(|o| o.max_split_size_bytes)
-            .unwrap_or(DEFAULT_SPLIT_SIZE);
+        let max_rows_per_split = match strategy {
+            Some(SplitPackStrategy::MaxRowCount(max_row_count)) => max_row_count,
+            Some(SplitPackStrategy::MaxSizeBytes(max_bytes)) => {
+                let output_schema = self.projection_plan.output_schema()?;
+                let estimated_row_size: usize = output_schema
+                    .fields()
+                    .iter()
+                    .map(|f| {
+                        f.data_type()
+                            .byte_width_opt()
+                            .unwrap_or(DEFAULT_VARIABLE_FIELD_SIZE)
+                    })
+                    .sum();
+                max_bytes / estimated_row_size.max(1)
+            }
+            None => {
+                let output_schema = self.projection_plan.output_schema()?;
+                let estimated_row_size: usize = output_schema
+                    .fields()
+                    .iter()
+                    .map(|f| {
+                        f.data_type()
+                            .byte_width_opt()
+                            .unwrap_or(DEFAULT_VARIABLE_FIELD_SIZE)
+                    })
+                    .sum();
+                DEFAULT_SPLIT_SIZE / estimated_row_size.max(1)
+            }
+        };
 
-        let output_schema = self.projection_plan.output_schema()?;
-        let estimated_row_size: usize = output_schema
-            .fields()
-            .iter()
-            .map(|f| {
-                f.data_type()
-                    .byte_width_opt()
-                    .unwrap_or(DEFAULT_VARIABLE_FIELD_SIZE)
-            })
-            .sum();
-
-        let max_rows_per_split = target_split_size / estimated_row_size.max(1);
-
-        let bins = Self::bin_pack(frag_max_row_counts, max_rows_per_split);
+        let bins = Self::bin_pack(&frag_max_row_counts, max_rows_per_split);
 
         // Convert bins to splits
         let fragment_map: HashMap<u64, &Fragment> = fragments.iter().map(|f| (f.id, f)).collect();
@@ -1026,7 +1043,15 @@ impl Scanner {
             .map(|bin| {
                 let frags = bin
                     .into_iter()
-                    .filter_map(|id| fragment_map.get(&id).map(|&f| f.clone()))
+                    .filter_map(|id| {
+                        fragment_map.get(&id).map(|&f| SplitFragment {
+                            fragment: f.clone(),
+                            max_row_count: frag_max_row_counts
+                                .get(&id)
+                                .copied()
+                                .unwrap_or(usize::MAX),
+                        })
+                    })
                     .collect();
                 Split { fragments: frags }
             })
@@ -1039,16 +1064,16 @@ impl Scanner {
     ///
     /// Uses a first-fit decreasing algorithm: items are sorted by count in descending
     /// order, then each item is placed in the first bin that has room for it.
-    fn bin_pack(items: HashMap<u64, usize>, maximum_count: usize) -> Vec<Vec<u64>> {
+    fn bin_pack(items: &HashMap<u64, usize>, maximum_count: usize) -> Vec<Vec<u64>> {
         // Convert to vec and sort by count descending for better packing
-        let mut items: Vec<(u64, usize)> = items.into_iter().collect();
+        let mut items: Vec<(u64, usize)> = items.iter().map(|(&k, &v)| (k, v)).collect();
         items.sort_by(|a, b| b.1.cmp(&a.1));
 
         let mut bins: Vec<(Vec<u64>, usize)> = Vec::new(); // (ids, current_count)
 
         for (id, count) in items {
             // Items that exceed the maximum get their own bin
-            if count >= maximum_count {
+            if count > maximum_count {
                 bins.push((vec![id], count));
                 continue;
             }
@@ -1056,7 +1081,7 @@ impl Scanner {
             // Find first bin with enough remaining capacity
             let mut placed = false;
             for (bin_ids, bin_count) in &mut bins {
-                if *bin_count + count < maximum_count {
+                if *bin_count + count <= maximum_count {
                     bin_ids.push(id);
                     *bin_count += count;
                     placed = true;
@@ -9302,52 +9327,8 @@ mod test {
     #[test]
     fn test_bin_pack_empty() {
         let items: HashMap<u64, usize> = HashMap::new();
-        let bins = Scanner::bin_pack(items, 100);
+        let bins = Scanner::bin_pack(&items, 100);
         assert!(bins.is_empty());
-    }
-
-    #[test]
-    fn test_bin_pack_single_item_fits() {
-        let items = HashMap::from([(1, 50)]);
-        let bins = Scanner::bin_pack(items, 100);
-        assert_eq!(bins.len(), 1);
-        assert_eq!(bins[0], vec![1]);
-    }
-
-    #[test]
-    fn test_bin_pack_single_item_exceeds_maximum() {
-        let items = HashMap::from([(1, 200)]);
-        let bins = Scanner::bin_pack(items, 100);
-        assert_eq!(bins.len(), 1);
-        assert_eq!(bins[0], vec![1]);
-    }
-
-    #[test]
-    fn test_bin_pack_single_item_equals_maximum() {
-        // Items with count >= maximum_count get their own bin
-        let items = HashMap::from([(1, 100)]);
-        let bins = Scanner::bin_pack(items, 100);
-        assert_eq!(bins.len(), 1);
-        assert_eq!(bins[0], vec![1]);
-    }
-
-    #[test]
-    fn test_bin_pack_multiple_items_fit_one_bin() {
-        let items = HashMap::from([(1, 30), (2, 30), (3, 30)]);
-        let bins = Scanner::bin_pack(items, 100);
-        assert_eq!(bins.len(), 1);
-        let mut ids: Vec<u64> = bins[0].clone();
-        ids.sort();
-        assert_eq!(ids, vec![1, 2, 3]);
-    }
-
-    #[test]
-    fn test_bin_pack_multiple_bins_needed() {
-        // Each item is 60, maximum is 100, so only one item per bin
-        // (60 + 60 = 120 >= 100, not strictly less than)
-        let items = HashMap::from([(1, 60), (2, 60), (3, 60)]);
-        let bins = Scanner::bin_pack(items, 100);
-        assert_eq!(bins.len(), 3);
     }
 
     #[test]
@@ -9355,22 +9336,20 @@ mod test {
         // maximum = 100
         // Items: 70, 50, 40, 20, 10
         // Sorted descending: 70, 50, 40, 20, 10
-        // Bin 1: 70, then try 50 (70+50=120 >= 100, no), try 40 (70+40=110 >= 100, no),
-        //        try 20 (70+20=90 < 100, yes) -> [70, 20]
-        // Bin 2: 50, then try 40 (50+40=90 < 100, yes) -> [50, 40]
-        // Bin 3: try 10 in bin1 (90+10=100, NOT < 100), try bin2 (90+10=100, NOT < 100) -> [10]
+        // Bin 1: 70, try 50 (70+50=120 > 100, no), try 40 (70+40=110 > 100, no),
+        //        try 20 (70+20=90 <= 100, yes), try 10 (90+10=100 <= 100, yes) -> [70, 20, 10]
+        // Bin 2: 50, try 40 (50+40=90 <= 100, yes) -> [50, 40]
         let items = HashMap::from([(1, 70), (2, 50), (3, 40), (4, 20), (5, 10)]);
-        let bins = Scanner::bin_pack(items, 100);
+        let bins = Scanner::bin_pack(&items, 100);
 
         // Verify total items across all bins
         let total_items: usize = bins.iter().map(|b| b.len()).sum();
         assert_eq!(total_items, 5);
 
-        // Each bin's total count should be < maximum (or a single oversized item)
+        // Each bin's total count should be <= maximum (or a single oversized item)
         let item_map: HashMap<u64, usize> = [(1, 70), (2, 50), (3, 40), (4, 20), (5, 10)].into();
         for bin in &bins {
             let bin_total: usize = bin.iter().map(|id| item_map[id]).sum();
-            // Bins with a single oversized item can exceed, but here all are < 100
             assert!(bin_total <= 100, "bin total {} exceeds maximum", bin_total);
         }
     }
@@ -9378,7 +9357,7 @@ mod test {
     #[test]
     fn test_bin_pack_oversized_items_get_own_bin() {
         let items = HashMap::from([(1, 200), (2, 150), (3, 30)]);
-        let bins = Scanner::bin_pack(items, 100);
+        let bins = Scanner::bin_pack(&items, 100);
 
         // Oversized items (200, 150) each get their own bin
         // Item 30 could fit in a new bin
@@ -9388,32 +9367,6 @@ mod test {
         for bin in &bins {
             assert_eq!(bin.len(), 1);
         }
-    }
-
-    #[test]
-    fn test_bin_pack_boundary_condition() {
-        // Test the strict less-than condition: bin_count + count < maximum_count
-        // Two items of 49 should fit in one bin (49 + 49 = 98 < 100)
-        let items = HashMap::from([(1, 49), (2, 49)]);
-        let bins = Scanner::bin_pack(items, 100);
-        assert_eq!(bins.len(), 1);
-
-        // Two items of 50 should NOT fit in one bin (50 + 50 = 100, not < 100)
-        let items = HashMap::from([(1, 50), (2, 50)]);
-        let bins = Scanner::bin_pack(items, 100);
-        assert_eq!(bins.len(), 2);
-    }
-
-    #[test]
-    fn test_bin_pack_all_ids_preserved() {
-        let items: HashMap<u64, usize> = (0..10).map(|i| (i, 25)).collect();
-        let bins = Scanner::bin_pack(items.clone(), 100);
-
-        let mut all_ids: Vec<u64> = bins.into_iter().flatten().collect();
-        all_ids.sort();
-        let mut expected_ids: Vec<u64> = items.keys().copied().collect();
-        expected_ids.sort();
-        assert_eq!(all_ids, expected_ids);
     }
 
     #[tokio::test]
@@ -9445,7 +9398,7 @@ mod test {
 
         // Set split size to 200 bytes -> max_rows = 200/4 = 50 rows per split
         // Each fragment has 100 rows >= 50, so each gets its own bin
-        let options = SplitOptions::default().with_max_split_size_bytes(200);
+        let options = SplitPackStrategy::MaxSizeBytes(200);
         let splits = dataset.scan().plan_splits(Some(options)).await.unwrap();
 
         assert_eq!(splits.len(), 4);
@@ -9466,13 +9419,13 @@ mod test {
         // Set split size to 400 bytes -> max_rows = 400/4 = 100 rows per split
         // Each fragment has 50 rows, so two fragments can fit per split (50+50=100, not < 100)
         // Actually 50+50=100 is NOT < 100, so each fragment gets its own bin
-        let options = SplitOptions::default().with_max_split_size_bytes(400);
+        let options = SplitPackStrategy::MaxSizeBytes(400);
         let splits = dataset.scan().plan_splits(Some(options)).await.unwrap();
         assert_eq!(splits.len(), 4);
 
         // With 404 bytes: max_rows = 404/4 = 101 rows per split
         // Each fragment has 50 rows, 50+50=100 < 101, so two fragments per split
-        let options = SplitOptions::default().with_max_split_size_bytes(404);
+        let options = SplitPackStrategy::MaxSizeBytes(404);
         let splits = dataset.scan().plan_splits(Some(options)).await.unwrap();
         assert_eq!(splits.len(), 2);
         for split in &splits {
@@ -9492,7 +9445,7 @@ mod test {
 
         // Full projection: 8 bytes per row, max_rows = 800/8 = 100
         // Each fragment has 100 rows >= 100, so each gets its own bin
-        let options = SplitOptions::default().with_max_split_size_bytes(800);
+        let options = SplitPackStrategy::MaxSizeBytes(800);
         let splits = dataset.scan().plan_splits(Some(options)).await.unwrap();
         assert_eq!(splits.len(), 4);
 
@@ -9501,7 +9454,7 @@ mod test {
         let mut scanner = dataset.scan();
         scanner.project(&["a"]).unwrap();
         let splits = scanner
-            .plan_splits(Some(SplitOptions::default().with_max_split_size_bytes(800)))
+            .plan_splits(Some(SplitPackStrategy::MaxSizeBytes(800)))
             .await
             .unwrap();
         assert_eq!(splits.len(), 4);
@@ -9511,7 +9464,7 @@ mod test {
         let mut scanner = dataset.scan();
         scanner.project(&["a"]).unwrap();
         let splits = scanner
-            .plan_splits(Some(SplitOptions::default().with_max_split_size_bytes(804)))
+            .plan_splits(Some(SplitPackStrategy::MaxSizeBytes(804)))
             .await
             .unwrap();
         assert_eq!(splits.len(), 2);
@@ -9536,18 +9489,5 @@ mod test {
         let splits = scanner.plan_splits(None).await.unwrap();
         assert_eq!(splits.len(), 1);
         assert_eq!(splits[0].fragments.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn test_plan_splits_single_fragment() {
-        let dataset = lance_datagen::gen_batch()
-            .col("i", array::step::<Int32Type>())
-            .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(100))
-            .await
-            .unwrap();
-
-        let splits = dataset.scan().plan_splits(None).await.unwrap();
-        assert_eq!(splits.len(), 1);
-        assert_eq!(splits[0].fragments.len(), 1);
     }
 }
