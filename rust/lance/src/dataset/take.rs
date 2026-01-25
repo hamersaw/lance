@@ -12,15 +12,17 @@ use arrow_array::cast::AsArray;
 use arrow_array::{Array, ArrayRef, RecordBatch, StructArray, UInt64Array};
 use arrow_buffer::{ArrowNativeType, BooleanBuffer, Buffer, NullBuffer};
 use arrow_schema::Field as ArrowField;
+use datafusion::common::Column;
 use datafusion::error::DataFusionError;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion_expr::Expr;
 use futures::{Future, Stream, StreamExt, TryStreamExt};
 use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::Schema;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::deletion::OffsetMapper;
 use lance_core::{ROW_ADDR, ROW_OFFSET};
-use lance_datafusion::projection::ProjectionPlan;
+use lance_datafusion::projection::{OutputColumn, ProjectionPlan};
 use snafu::location;
 
 use super::ProjectionRequest;
@@ -131,6 +133,25 @@ async fn do_take_rows(
     mut builder: TakeBuilder,
     projection: Arc<ProjectionPlan>,
 ) -> Result<RecordBatch> {
+    // If we need row addresses in output, add to projection's output expressions
+    let projection = if builder.with_row_address {
+        let mut proj = (*projection).clone();
+        // Add _rowaddr to output if not already present
+        if !proj
+            .requested_output_expr
+            .iter()
+            .any(|c| c.name == ROW_ADDR)
+        {
+            proj.requested_output_expr.push(OutputColumn {
+                expr: Expr::Column(Column::from_name(ROW_ADDR)),
+                name: ROW_ADDR.to_string(),
+            });
+        }
+        Arc::new(proj)
+    } else {
+        projection
+    };
+
     let with_row_id_in_projection = projection.physical_projection.with_row_id;
     let with_row_addr_in_projection = projection.physical_projection.with_row_addr;
     let with_row_created_at_version_in_projection =

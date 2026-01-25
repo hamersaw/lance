@@ -441,7 +441,10 @@ impl ProjectionPlan {
         let src = Arc::new(OneShotExec::from_batch(batch));
 
         // Need to add ROW_OFFSET to get filterable schema
-        let extra_columns = vec![ArrowField::new(ROW_OFFSET, DataType::UInt64, true)];
+        let extra_columns = vec![
+            ArrowField::new(ROW_ADDR, DataType::UInt64, true),
+            ArrowField::new(ROW_OFFSET, DataType::UInt64, true),
+        ];
         let mut filterable_schema = self.physical_projection.to_schema();
         filterable_schema = filterable_schema.merge(&ArrowSchema::new(extra_columns))?;
 
