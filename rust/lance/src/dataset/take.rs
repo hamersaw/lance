@@ -126,6 +126,7 @@ pub async fn take(
 }
 
 /// Take rows by the internal ROW ids.
+#[allow(clippy::needless_question_mark)]
 async fn do_take_rows(
     mut builder: TakeBuilder,
     projection: Arc<ProjectionPlan>,
@@ -376,7 +377,7 @@ async fn do_take_rows(
         }
     }
 
-    projection.project_batch(batch).await?
+    Ok(projection.project_batch(batch).await?)
 }
 
 async fn take_rows(builder: TakeBuilder) -> Result<RecordBatch> {
