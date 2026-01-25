@@ -376,7 +376,7 @@ async fn do_take_rows(
         }
     }
 
-    Ok(projection.project_batch(batch).await?)
+    projection.project_batch(batch).await?
 }
 
 async fn take_rows(builder: TakeBuilder) -> Result<RecordBatch> {

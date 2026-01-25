@@ -685,6 +685,143 @@ def test_take_rowid_rowaddr(tmp_path: Path):
     assert sample_dataset.num_columns == 2
 
 
+@pytest.mark.parametrize(
+    "column_name",
+    [
+        "_rowid",
+        "_rowaddr",
+        "_rowoffset",
+        "_row_created_at_version",
+        "_row_last_updated_at_version",
+    ],
+)
+def test_take_system_columns_values(tmp_path: Path, column_name: str):
+    """Test that system columns return correct values in take."""
+    table = pa.table({"a": range(100), "b": range(100, 200)})
+    base_dir = tmp_path / "test_take_system_columns_values"
+    # Use max_rows_per_file to create multiple fragments
+    lance.write_dataset(table, base_dir, max_rows_per_file=25)
+    dataset = lance.dataset(base_dir)
+
+    indices = [0, 5, 10, 50, 99]
+    result = dataset.take(indices, columns=[column_name, "a"])
+    assert result.num_rows == len(indices)
+    assert result.schema.names == [column_name, "a"]
+
+    col_values = result.column(column_name).to_pylist()
+    a_values = result.column("a").to_pylist()
+
+    # Verify column type is UInt64
+    assert result.column(column_name).type == pa.uint64()
+
+    # Verify data column values
+    assert a_values == indices
+
+    # Verify system column values based on column type
+    if column_name == "_rowid":
+        # Without stable row IDs, _rowid should match the index
+        assert col_values == indices
+    elif column_name in ("_row_created_at_version", "_row_last_updated_at_version"):
+        # All rows created/updated at version 1
+        assert col_values == [1] * len(indices)
+    # _rowaddr and _rowoffset values depend on fragment layout
+
+
+def test_take_system_columns_column_ordering(tmp_path: Path):
+    """Test that column ordering is preserved when using system columns."""
+    table = pa.table({"a": range(50), "b": range(50, 100)})
+    base_dir = tmp_path / "test_take_column_ordering"
+    lance.write_dataset(table, base_dir)
+    dataset = lance.dataset(base_dir)
+
+    indices = [0, 1, 2]
+
+    # Test different orderings with all system columns
+    result = dataset.take(indices, columns=["_rowid", "a", "_rowaddr"])
+    assert result.schema.names == ["_rowid", "a", "_rowaddr"]
+
+    result = dataset.take(indices, columns=["a", "_rowaddr", "_rowid"])
+    assert result.schema.names == ["a", "_rowaddr", "_rowid"]
+
+    result = dataset.take(indices, columns=["_rowaddr", "_rowid", "b", "a"])
+    assert result.schema.names == ["_rowaddr", "_rowid", "b", "a"]
+
+    # Test with version columns
+    result = dataset.take(
+        indices,
+        columns=[
+            "_row_created_at_version",
+            "a",
+            "_row_last_updated_at_version",
+            "_rowid",
+        ],
+    )
+    assert result.schema.names == [
+        "_row_created_at_version",
+        "a",
+        "_row_last_updated_at_version",
+        "_rowid",
+    ]
+
+    # Test with all system columns in mixed order
+    result = dataset.take(
+        indices,
+        columns=[
+            "_rowoffset",
+            "_row_last_updated_at_version",
+            "b",
+            "_rowaddr",
+            "_row_created_at_version",
+            "a",
+            "_rowid",
+        ],
+    )
+    assert result.schema.names == [
+        "_rowoffset",
+        "_row_last_updated_at_version",
+        "b",
+        "_rowaddr",
+        "_row_created_at_version",
+        "a",
+        "_rowid",
+    ]
+
+
+def test_take_version_system_columns(tmp_path: Path):
+    """Test _row_created_at_version and _row_last_updated_at_version columns."""
+    table = pa.table({"a": range(50)})
+    base_dir = tmp_path / "test_take_version_columns"
+    lance.write_dataset(table, base_dir)
+    dataset = lance.dataset(base_dir)
+
+    # Initial version is 1
+    initial_version = dataset.version
+
+    indices = [0, 10, 25]
+    result = dataset.take(
+        indices,
+        columns=["a", "_row_created_at_version", "_row_last_updated_at_version"],
+    )
+
+    assert result.num_rows == 3
+    created_at = result.column("_row_created_at_version").to_pylist()
+    updated_at = result.column("_row_last_updated_at_version").to_pylist()
+
+    # All rows were created and last updated at the initial version
+    assert created_at == [initial_version] * 3
+    assert updated_at == [initial_version] * 3
+
+    # Now update some rows by overwriting
+    table2 = pa.table({"a": range(50, 100)})
+    lance.write_dataset(table2, base_dir, mode="append")
+    dataset = lance.dataset(base_dir)
+
+    # New rows should have version 2
+    result = dataset.take([50, 60], columns=["_row_created_at_version"])
+    created_at = result.column("_row_created_at_version").to_pylist()
+    assert created_at == [dataset.version] * 2
+
+
 @pytest.mark.parametrize("indices", [[], [1, 1], [1, 1, 20, 20, 21], [21, 0, 21, 1, 0]])
 def test_take_duplicate_index(tmp_path: Path, indices: List[int]):
     table = pa.table({"x": range(24)})
