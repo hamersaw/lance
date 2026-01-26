@@ -632,6 +632,22 @@ pub enum SplitPackStrategy {
     MaxRowCount(usize),
 }
 
+/// Options for configuring split generation.
+///
+/// This struct allows specifying constraints on the maximum size and row count
+/// for splits. Both fields are optional; if neither is set, default behavior
+/// will be used.
+#[derive(Debug, Clone, Default)]
+pub struct SplitOptions {
+    /// Maximum size in bytes per split.
+    ///
+    /// The scanner estimates the row size from the output schema and calculates
+    /// how many rows fit within this budget.
+    pub max_size_bytes: Option<usize>,
+    /// Maximum number of rows per split.
+    pub max_row_count: Option<usize>,
+}
+
 /// Represents a user-requested take operation
 #[derive(Debug, Clone)]
 pub enum TakeOperation {
@@ -895,7 +911,12 @@ impl Scanner {
     /// This method analyzes the fragments to be scanned and groups them into [`Split`]s
     /// that can be processed independently by multiple workers or threads. It uses a
     /// bin-packing algorithm to create balanced splits based on estimated row counts.
-    pub async fn plan_splits(&self, strategy: Option<SplitPackStrategy>) -> Result<Vec<Split>> {
+    ///
+    /// The maximum number of rows per split is determined by taking the minimum of:
+    /// - `max_row_count` from [`SplitOptions`] (if provided)
+    /// - The estimated row count from `max_size_bytes` in [`SplitOptions`] (if provided)
+    /// - If neither is provided, uses a default split size of 128MB to estimate row count
+    pub async fn plan_splits(&self, options: Option<SplitOptions>) -> Result<Vec<Split>> {
         // Collect initial set of fragments to scan
         let fragments = if let Some(fragments) = self.fragments.as_ref() {
             Arc::new(fragments.clone())
@@ -1004,34 +1025,32 @@ impl Scanner {
         const DEFAULT_SPLIT_SIZE: usize = 128 * 1024 * 1024;
         const DEFAULT_VARIABLE_FIELD_SIZE: usize = 64;
 
-        let max_rows_per_split = match strategy {
-            Some(SplitPackStrategy::MaxRowCount(max_row_count)) => max_row_count,
-            Some(SplitPackStrategy::MaxSizeBytes(max_bytes)) => {
-                let output_schema = self.projection_plan.output_schema()?;
-                let estimated_row_size: usize = output_schema
-                    .fields()
-                    .iter()
-                    .map(|f| {
-                        f.data_type()
-                            .byte_width_opt()
-                            .unwrap_or(DEFAULT_VARIABLE_FIELD_SIZE)
-                    })
-                    .sum();
-                max_bytes / estimated_row_size.max(1)
+        let options = options.unwrap_or_default();
+
+        // Helper to estimate row count from a byte size
+        let estimate_rows_from_bytes = |max_bytes: usize| -> Result<usize> {
+            let output_schema = self.projection_plan.output_schema()?;
+            let estimated_row_size: usize = output_schema
+                .fields()
+                .iter()
+                .map(|f| {
+                    f.data_type()
+                        .byte_width_opt()
+                        .unwrap_or(DEFAULT_VARIABLE_FIELD_SIZE)
+                })
+                .sum();
+            Ok(max_bytes / estimated_row_size.max(1))
+        };
+
+        let max_rows_per_split = match (options.max_row_count, options.max_size_bytes) {
+            (Some(max_rows), Some(max_bytes)) => {
+                // Use the minimum of both constraints
+                let rows_from_bytes = estimate_rows_from_bytes(max_bytes)?;
+                max_rows.min(rows_from_bytes)
             }
-            None => {
-                let output_schema = self.projection_plan.output_schema()?;
-                let estimated_row_size: usize = output_schema
-                    .fields()
-                    .iter()
-                    .map(|f| {
-                        f.data_type()
-                            .byte_width_opt()
-                            .unwrap_or(DEFAULT_VARIABLE_FIELD_SIZE)
-                    })
-                    .sum();
-                DEFAULT_SPLIT_SIZE / estimated_row_size.max(1)
-            }
+            (Some(max_rows), None) => max_rows,
+            (None, Some(max_bytes)) => estimate_rows_from_bytes(max_bytes)?,
+            (None, None) => estimate_rows_from_bytes(DEFAULT_SPLIT_SIZE)?,
         };
 
         let bins = Self::bin_pack(&frag_max_row_counts, max_rows_per_split);
@@ -9398,7 +9417,10 @@ mod test {
 
         // Set split size to 200 bytes -> max_rows = 200/4 = 50 rows per split
         // Each fragment has 100 rows >= 50, so each gets its own bin
-        let options = SplitPackStrategy::MaxSizeBytes(200);
+        let options = SplitOptions {
+            max_size_bytes: Some(200),
+            ..Default::default()
+        };
         let splits = dataset.scan().plan_splits(Some(options)).await.unwrap();
 
         assert_eq!(splits.len(), 4);
@@ -9419,13 +9441,19 @@ mod test {
         // Set split size to 400 bytes -> max_rows = 400/4 = 100 rows per split
         // Each fragment has 50 rows, so two fragments can fit per split (50+50=100, not < 100)
         // Actually 50+50=100 is NOT < 100, so each fragment gets its own bin
-        let options = SplitPackStrategy::MaxSizeBytes(400);
+        let options = SplitOptions {
+            max_size_bytes: Some(400),
+            ..Default::default()
+        };
         let splits = dataset.scan().plan_splits(Some(options)).await.unwrap();
         assert_eq!(splits.len(), 4);
 
         // With 404 bytes: max_rows = 404/4 = 101 rows per split
         // Each fragment has 50 rows, 50+50=100 < 101, so two fragments per split
-        let options = SplitPackStrategy::MaxSizeBytes(404);
+        let options = SplitOptions {
+            max_size_bytes: Some(404),
+            ..Default::default()
+        };
         let splits = dataset.scan().plan_splits(Some(options)).await.unwrap();
         assert_eq!(splits.len(), 2);
         for split in &splits {
@@ -9445,7 +9473,10 @@ mod test {
 
         // Full projection: 8 bytes per row, max_rows = 800/8 = 100
         // Each fragment has 100 rows >= 100, so each gets its own bin
-        let options = SplitPackStrategy::MaxSizeBytes(800);
+        let options = SplitOptions {
+            max_size_bytes: Some(800),
+            ..Default::default()
+        };
         let splits = dataset.scan().plan_splits(Some(options)).await.unwrap();
         assert_eq!(splits.len(), 4);
 
@@ -9454,7 +9485,10 @@ mod test {
         let mut scanner = dataset.scan();
         scanner.project(&["a"]).unwrap();
         let splits = scanner
-            .plan_splits(Some(SplitPackStrategy::MaxSizeBytes(800)))
+            .plan_splits(Some(SplitOptions {
+                max_size_bytes: Some(800),
+                ..Default::default()
+            }))
             .await
             .unwrap();
         assert_eq!(splits.len(), 4);
@@ -9464,7 +9498,10 @@ mod test {
         let mut scanner = dataset.scan();
         scanner.project(&["a"]).unwrap();
         let splits = scanner
-            .plan_splits(Some(SplitPackStrategy::MaxSizeBytes(804)))
+            .plan_splits(Some(SplitOptions {
+                max_size_bytes: Some(804),
+                ..Default::default()
+            }))
             .await
             .unwrap();
         assert_eq!(splits.len(), 2);

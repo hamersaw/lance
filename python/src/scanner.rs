@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use arrow::pyarrow::*;
 use arrow_array::RecordBatchReader;
-use lance::dataset::scanner::{ExecutionSummaryCounts, SplitPackStrategy};
+use lance::dataset::scanner::{ExecutionSummaryCounts, SplitOptions};
 use pyo3::prelude::*;
 use pyo3::pyclass;
 
@@ -152,16 +152,24 @@ impl Scanner {
         Ok(PyArrowType(Box::new(reader)))
     }
 
-    #[pyo3(signature = (max_split_size_bytes=None))]
+    #[pyo3(signature = (max_size_bytes=None, max_row_count=None))]
     fn plan_splits<'py>(
         self_: PyRef<'py, Self>,
-        max_split_size_bytes: Option<usize>,
+        max_size_bytes: Option<usize>,
+        max_row_count: Option<usize>,
     ) -> PyResult<Vec<Vec<Bound<'py, PyAny>>>> {
         let scanner = self_.scanner.clone();
-        let strategy = max_split_size_bytes.map(SplitPackStrategy::MaxSizeBytes);
+        let options = if max_size_bytes.is_some() || max_row_count.is_some() {
+            Some(SplitOptions {
+                max_size_bytes,
+                max_row_count,
+            })
+        } else {
+            None
+        };
         let splits = rt()
             .spawn(Some(self_.py()), async move {
-                scanner.plan_splits(strategy).await
+                scanner.plan_splits(options).await
             })?
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
