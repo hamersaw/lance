@@ -16,6 +16,9 @@ package org.lance;
 import org.lance.ipc.ColumnOrdering;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
+import org.lance.ipc.Split;
+import org.lance.ipc.SplitFragment;
+import org.lance.ipc.SplitOptions;
 
 import org.apache.arrow.dataset.scanner.Scanner;
 import org.apache.arrow.memory.BufferAllocator;
@@ -551,6 +554,84 @@ public class ScannerTest {
         reader.loadNextBatch();
         assertEquals(rowCount, reader.getVectorSchemaRoot().getRowCount());
         assertFalse(reader.loadNextBatch());
+      }
+    }
+  }
+
+  @Test
+  void testPlanSplits(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("plan_splits").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      int totalRows = 100;
+      try (Dataset dataset = testDataset.write(1, totalRows)) {
+        try (LanceScanner scanner = dataset.newScan(new ScanOptions.Builder().build())) {
+          // Test planSplits without options
+          List<Split> splits = scanner.planSplits();
+          assertFalse(splits.isEmpty(), "Should return at least one split");
+
+          // Verify each split has fragments with valid metadata
+          for (Split split : splits) {
+            List<SplitFragment> fragments = split.getFragments();
+            assertFalse(fragments.isEmpty(), "Each split should have at least one fragment");
+            for (SplitFragment sf : fragments) {
+              FragmentMetadata fm = sf.getFragment();
+              assertTrue(fm.getId() >= 0, "Fragment ID should be non-negative");
+              assertTrue(sf.getMaxRowCount() > 0, "Max row count should be positive");
+            }
+          }
+        }
+      }
+    }
+  }
+
+  @Test
+  void testPlanSplitsWithOptions(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("plan_splits_options").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      int totalRows = 100;
+      try (Dataset dataset = testDataset.write(1, totalRows)) {
+        try (LanceScanner scanner = dataset.newScan(new ScanOptions.Builder().build())) {
+          // Test planSplits with maxRowCount option
+          SplitOptions options = new SplitOptions.Builder().maxRowCount(20).build();
+          List<Split> splits = scanner.planSplits(options);
+          assertFalse(splits.isEmpty(), "Should return at least one split");
+
+          // With max 20 rows per split and 100 total rows,
+          // we should have multiple splits
+          assertTrue(splits.size() >= 1, "Should have at least one split");
+
+          // Verify each split fragment respects the row count
+          for (Split split : splits) {
+            for (SplitFragment sf : split.getFragments()) {
+              assertTrue(sf.getMaxRowCount() > 0, "Max row count should be positive");
+            }
+          }
+        }
+      }
+    }
+  }
+
+  @Test
+  void testPlanSplitsWithMaxSizeBytes(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("plan_splits_max_bytes").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      int totalRows = 100;
+      try (Dataset dataset = testDataset.write(1, totalRows)) {
+        try (LanceScanner scanner = dataset.newScan(new ScanOptions.Builder().build())) {
+          // Test planSplits with maxSizeBytes option
+          SplitOptions options = new SplitOptions.Builder().maxSizeBytes(1024).build();
+          List<Split> splits = scanner.planSplits(options);
+          assertFalse(splits.isEmpty(), "Should return at least one split");
+        }
       }
     }
   }

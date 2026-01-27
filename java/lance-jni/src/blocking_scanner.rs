@@ -5,14 +5,16 @@ use std::sync::Arc;
 
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
-use crate::traits::{import_vec_from_method, import_vec_to_rust};
+use crate::traits::{export_vec, import_vec_from_method, import_vec_to_rust, IntoJava};
 use arrow::array::Float32Array;
 use arrow::{ffi::FFI_ArrowSchema, ffi_stream::FFI_ArrowArrayStream};
 use arrow_schema::SchemaRef;
-use jni::objects::{JObject, JString};
+use jni::objects::{JObject, JString, JValueGen};
 use jni::sys::{jboolean, jint, JNI_TRUE};
 use jni::{sys::jlong, JNIEnv};
-use lance::dataset::scanner::{ColumnOrdering, DatasetRecordBatchStream, Scanner};
+use lance::dataset::scanner::{
+    ColumnOrdering, DatasetRecordBatchStream, Scanner, Split, SplitFragment, SplitOptions,
+};
 use lance_index::scalar::inverted::query::{
     BooleanQuery as FtsBooleanQuery, BoostQuery as FtsBoostQuery, FtsQuery,
     MatchQuery as FtsMatchQuery, MultiMatchQuery as FtsMultiMatchQuery, Occur as FtsOccur,
@@ -24,7 +26,6 @@ use lance_linalg::distance::DistanceType;
 
 use crate::{
     blocking_dataset::{BlockingDataset, NATIVE_DATASET},
-    traits::IntoJava,
     RT,
 };
 
@@ -54,6 +55,11 @@ impl BlockingScanner {
 
     pub fn count_rows(&self) -> Result<u64> {
         let res = RT.block_on(self.inner.count_rows())?;
+        Ok(res)
+    }
+
+    pub fn plan_splits(&self, options: Option<SplitOptions>) -> Result<Vec<Split>> {
+        let res = RT.block_on(self.inner.plan_splits(options))?;
         Ok(res)
     }
 }
@@ -480,4 +486,81 @@ fn inner_count_rows(env: &mut JNIEnv, j_scanner: JObject) -> Result<u64> {
     let scanner_guard =
         unsafe { env.get_rust_field::<_, _, BlockingScanner>(j_scanner, NATIVE_SCANNER) }?;
     scanner_guard.count_rows()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_ipc_LanceScanner_nativePlanSplits<'local>(
+    mut env: JNIEnv<'local>,
+    j_scanner: JObject,
+    options_obj: JObject, // Optional<SplitOptions>
+) -> JObject<'local> {
+    ok_or_throw!(env, inner_plan_splits(&mut env, j_scanner, options_obj))
+}
+
+fn inner_plan_splits<'local>(
+    env: &mut JNIEnv<'local>,
+    j_scanner: JObject,
+    options_obj: JObject,
+) -> Result<JObject<'local>> {
+    let options = extract_split_options(env, &options_obj)?;
+    let splits = {
+        let scanner_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingScanner>(j_scanner, NATIVE_SCANNER) }?;
+        scanner_guard.plan_splits(options)?
+    };
+    export_vec(env, &splits)
+}
+
+fn extract_split_options(env: &mut JNIEnv, options_obj: &JObject) -> Result<Option<SplitOptions>> {
+    if options_obj.is_null() {
+        return Ok(None);
+    }
+
+    let is_present = env.call_method(options_obj, "isPresent", "()Z", &[])?.z()?;
+
+    if !is_present {
+        return Ok(None);
+    }
+
+    let options_inner = env
+        .call_method(options_obj, "get", "()Ljava/lang/Object;", &[])?
+        .l()?;
+
+    let max_size_bytes = env.get_optional_i64_from_method(&options_inner, "getMaxSizeBytes")?;
+    let max_row_count = env.get_optional_i64_from_method(&options_inner, "getMaxRowCount")?;
+
+    Ok(Some(SplitOptions {
+        max_size_bytes: max_size_bytes.map(|v| v as usize),
+        max_row_count: max_row_count.map(|v| v as usize),
+    }))
+}
+
+const SPLIT_CLASS: &str = "org/lance/ipc/Split";
+const SPLIT_CONSTRUCTOR_SIG: &str = "(Ljava/util/List;)V";
+const SPLIT_FRAGMENT_CLASS: &str = "org/lance/ipc/SplitFragment";
+const SPLIT_FRAGMENT_CONSTRUCTOR_SIG: &str = "(Lorg/lance/FragmentMetadata;J)V";
+
+impl IntoJava for &SplitFragment {
+    fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
+        let fragment = self.fragment.into_java(env)?;
+        Ok(env.new_object(
+            SPLIT_FRAGMENT_CLASS,
+            SPLIT_FRAGMENT_CONSTRUCTOR_SIG,
+            &[
+                JValueGen::Object(&fragment),
+                JValueGen::Long(self.max_row_count as i64),
+            ],
+        )?)
+    }
+}
+
+impl IntoJava for &Split {
+    fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
+        let fragments = export_vec(env, &self.fragments)?;
+        Ok(env.new_object(
+            SPLIT_CLASS,
+            SPLIT_CONSTRUCTOR_SIG,
+            &[JValueGen::Object(&fragments)],
+        )?)
+    }
 }

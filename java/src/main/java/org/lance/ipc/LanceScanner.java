@@ -164,4 +164,38 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
   }
 
   private native long nativeCountRows();
+
+  /**
+   * Plan splits for parallel scanning of the dataset.
+   *
+   * <p>Splits can be used to distribute scanning work across multiple workers or threads. Each
+   * split contains one or more fragments that can be scanned together.
+   *
+   * @return a list of splits for parallel scanning
+   */
+  public List<Split> planSplits() {
+    return planSplits(Optional.empty());
+  }
+
+  /**
+   * Plan splits for parallel scanning of the dataset with custom options.
+   *
+   * <p>Splits can be used to distribute scanning work across multiple workers or threads. Each
+   * split contains one or more fragments that can be scanned together.
+   *
+   * @param options options for configuring split generation
+   * @return a list of splits for parallel scanning
+   */
+  public List<Split> planSplits(SplitOptions options) {
+    return planSplits(Optional.ofNullable(options));
+  }
+
+  private List<Split> planSplits(Optional<SplitOptions> options) {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeScannerHandle != 0, "Scanner is closed");
+      return nativePlanSplits(options);
+    }
+  }
+
+  private native List<Split> nativePlanSplits(Optional<SplitOptions> options);
 }
