@@ -719,8 +719,17 @@ def test_take_system_columns_values(tmp_path: Path, column_name: str):
 
     # Verify system column values based on column type
     if column_name == "_rowid":
-        # Without stable row IDs, _rowid should match the index
-        assert col_values == indices
+        # Without stable row IDs, _rowid equals _rowaddr (not the index).
+        # Row address = (fragment_id << 32) | row_offset_within_fragment
+        # With max_rows_per_file=25: frag0=0-24, frag1=25-49, frag2=50-74, frag3=75-99
+        expected_rowids = [
+            (0 << 32) | 0,  # index 0: fragment 0, offset 0
+            (0 << 32) | 5,  # index 5: fragment 0, offset 5
+            (0 << 32) | 10,  # index 10: fragment 0, offset 10
+            (2 << 32) | 0,  # index 50: fragment 2, offset 0
+            (3 << 32) | 24,  # index 99: fragment 3, offset 24
+        ]
+        assert col_values == expected_rowids
     elif column_name in ("_row_created_at_version", "_row_last_updated_at_version"):
         # All rows created/updated at version 1
         assert col_values == [1] * len(indices)
