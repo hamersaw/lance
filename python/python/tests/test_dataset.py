@@ -800,7 +800,7 @@ def test_take_version_system_columns(tmp_path: Path):
     """Test _row_created_at_version and _row_last_updated_at_version columns."""
     table = pa.table({"a": range(50)})
     base_dir = tmp_path / "test_take_version_columns"
-    lance.write_dataset(table, base_dir)
+    lance.write_dataset(table, base_dir, enable_stable_row_ids=True)
     dataset = lance.dataset(base_dir)
 
     # Initial version is 1
