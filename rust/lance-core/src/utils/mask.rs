@@ -296,7 +296,7 @@ pub struct RowAddrTreeMap {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-enum RowAddrSelection {
+pub enum RowAddrSelection {
     Full,
     Partial(RoaringBitmap),
 }
@@ -555,6 +555,11 @@ impl RowAddrTreeMap {
             Some(RowAddrSelection::Full) => None,
             Some(RowAddrSelection::Partial(set)) => Some(set),
         }
+    }
+
+    /// Get the selection for a fragment
+    pub fn get(&self, fragment_id: &u32) -> Option<&RowAddrSelection> {
+        self.inner.get(fragment_id)
     }
 
     pub fn retain_fragments(&mut self, frag_ids: impl IntoIterator<Item = u32>) {
