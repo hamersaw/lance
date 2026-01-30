@@ -4245,44 +4245,6 @@ fn bin_pack(items: Vec<FragmentSplit>, maximum_count: u64) -> Vec<Vec<FragmentSp
     bins.into_iter().map(|(items, _)| items).collect()
 }
 
-/*/// Packs IDs into bins where each bin's total count is less than `maximum_count`.
-///
-/// Uses a first-fit decreasing algorithm: items are sorted by count in descending
-/// order, then each item is placed in the first bin that has room for it.
-fn bin_pack(items: &HashMap<u64, usize>, maximum_count: usize) -> Vec<Vec<u64>> {
-    // Convert to vec and sort by count descending for better packing
-    let mut items: Vec<(u64, usize)> = items.iter().map(|(&k, &v)| (k, v)).collect();
-    items.sort_by(|a, b| b.1.cmp(&a.1));
-
-    let mut bins: Vec<(Vec<u64>, usize)> = Vec::new(); // (ids, current_count)
-
-    for (id, count) in items {
-        // Items that exceed the maximum get their own bin
-        if count > maximum_count {
-            bins.push((vec![id], count));
-            continue;
-        }
-
-        // Find first bin with enough remaining capacity
-        let mut placed = false;
-        for (bin_ids, bin_count) in &mut bins {
-            if *bin_count + count <= maximum_count {
-                bin_ids.push(id);
-                *bin_count += count;
-                placed = true;
-                break;
-            }
-        }
-
-        // Create new bin if no existing bin has room
-        if !placed {
-            bins.push((vec![id], count));
-        }
-    }
-
-    bins.into_iter().map(|(ids, _)| ids).collect()
-}*/
-
 // Search over all indexed fields including nested ones, collecting columns that have an
 // inverted index
 async fn fts_indexed_columns(dataset: Arc<Dataset>) -> Result<Vec<String>> {
