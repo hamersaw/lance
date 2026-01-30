@@ -56,6 +56,7 @@ from .lance import (
     IOStats,
     LanceSchema,
     ScanStatistics,
+    Splits,
     _Dataset,
     _MergeInsertBuilder,
     _Scanner,
@@ -5221,6 +5222,53 @@ class LanceScanner(pa.dataset.Scanner):
         """
 
         return self._scanner.analyze_plan()
+
+    def plan_splits(
+        self,
+        *,
+        max_size_bytes: Optional[int] = None,
+        max_row_count: Optional[int] = None,
+    ) -> List[Splits]:
+        """Plan splits for parallel scanning.
+
+        This method divides the scan into splits that can be processed in parallel.
+        Each split contains fragment splits that specify which rows to read from
+        which fragments.
+
+        Parameters
+        ----------
+        max_size_bytes : int, optional
+            Maximum size in bytes per split. The scanner estimates the row size
+            from the output schema and calculates how many rows fit within this
+            budget. If not specified, defaults to 128MB.
+        max_row_count : int, optional
+            Maximum number of rows per split. If both max_size_bytes and
+            max_row_count are specified, the smaller constraint wins.
+
+        Returns
+        -------
+        List[Splits]
+            A list of splits, where each split contains:
+            - fragment_splits: List of FragmentSplit objects specifying which
+              rows to read from which fragments
+            - scan_range_after_filter: Optional tuple (start, end) specifying
+              row offset range to apply after filtering
+
+        Examples
+        --------
+        >>> import lance
+        >>> dataset = lance.dataset("my_dataset")
+        >>> scanner = dataset.scanner()
+        >>> splits = scanner.plan_splits(max_row_count=10000)
+        >>> for split in splits:
+        ...     for frag_split in split.fragment_splits:
+        ...         print(f"Fragment {frag_split.fragment_id}:"
+        ...            + f" {frag_split.row_count} rows")
+        """
+        return self._scanner.plan_splits(
+            max_size_bytes=max_size_bytes,
+            max_row_count=max_row_count,
+        )
 
 
 class DatasetOptimizer:

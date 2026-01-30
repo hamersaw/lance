@@ -28,7 +28,9 @@ from .fragment import FragmentMetadata, LanceFragment
 from .lance import (
     DatasetBasePath,
     FFILanceTableProvider,
+    FragmentSplit,
     ScanStatistics,
+    Splits,
     bytes_read_counter,
     iops_counter,
 )
@@ -61,6 +63,7 @@ __all__ = [
     "DataStatistics",
     "FieldStatistics",
     "FragmentMetadata",
+    "FragmentSplit",
     "Index",
     "LanceDataset",
     "LanceFragment",
@@ -69,6 +72,7 @@ __all__ = [
     "LanceNamespaceStorageOptionsProvider",
     "MergeInsertBuilder",
     "ScanStatistics",
+    "Splits",
     "Transaction",
     "__version__",
     "batch_udf",
