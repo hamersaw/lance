@@ -632,7 +632,6 @@ impl FilteredReadStream {
             options.scan_range_after_filter.clone()
         };
 
-        // Return internal plan with ranges (no bitmap conversion)
         FilteredReadInternalPlan {
             rows: fragments_to_read,
             filters,
@@ -640,8 +639,6 @@ impl FilteredReadStream {
         }
     }
 
-    /// Convert internal plan (ranges) to Vec<ScopedFragmentRead> for I/O
-    /// No bitmap conversion needed - ranges are used directly
     fn plan_to_scoped_fragments(
         plan: &FilteredReadInternalPlan,
         fragments: &[LoadedFragment],
@@ -845,7 +842,6 @@ impl FilteredReadStream {
         }
     }
 
-    /// Convert ranges to a RoaringBitmap
     // Given a logical position and bounds, calculate the number of rows to skip and take
     fn calculate_fetch(
         position: Range<u64>, // position of the fragment in dataset/fragment coordinates
@@ -1629,7 +1625,7 @@ impl FilteredReadExec {
         })
     }
 
-    /// Get or create the internal plan (ranges, no bitmap conversion)
+    /// Get or create the internal plan
     async fn get_or_create_plan_impl<'a>(
         plan_cell: &'a OnceCell<FilteredReadInternalPlan>,
         dataset: Arc<Dataset>,
