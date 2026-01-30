@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashMap;
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
@@ -51,7 +52,7 @@ use lance_core::datatypes::{
 };
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::address::RowAddress;
-use lance_core::utils::mask::{RowAddrMask, RowAddrTreeMap};
+use lance_core::utils::mask::{RowAddrMask, RowAddrSelection, RowAddrTreeMap};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR, ROW_ID, ROW_OFFSET};
 use lance_datafusion::exec::{
@@ -83,7 +84,7 @@ use crate::index::vector::utils::{
     default_distance_type_for, get_vector_dim, get_vector_type, validate_distance_type_for,
 };
 use crate::index::DatasetIndexInternalExt;
-use crate::io::exec::filtered_read::{FilteredReadExec, FilteredReadOptions, FilteredReadPlan};
+use crate::io::exec::filtered_read::{FilteredReadExec, FilteredReadOptions};
 use crate::io::exec::fts::{BoostQueryExec, FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec};
 use crate::io::exec::knn::MultivectorScoringExec;
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
@@ -599,6 +600,44 @@ pub struct Scanner {
     explicit_projection: bool,
     /// Whether the user wants to use the legacy projection behavior.
     autoproject_scoring_columns: bool,
+}
+
+// TODO @hamersaw - docs
+pub struct Splits {
+    // TODO @hamersaw - docs
+    pub fragment_splits: Vec<FragmentSplit>,
+    // TODO @hamersaw - docs
+    pub residual_filters: HashMap<u32, Arc<Expr>>,
+    /// Row offset range to apply after filtering (skip N rows, take M rows).
+    /// If the index guarantees enough matching rows, this is pushed down during planning
+    /// and set to None. Otherwise, it's applied during execution.
+    pub scan_range_after_filter: Option<Range<u64>>,
+}
+
+// TODO @hamersaw - docs
+pub struct FragmentSplit {
+    // TODO @hamersaw - docs
+    pub fragment_id: u32,
+    // TODO @hamersaw - docs - selection of row offsets within the fragment to read
+    pub selection: RowAddrSelection,
+    // TODO @hamersaw - docs
+    pub row_count: u32,
+}
+
+/// Options for configuring split generation.
+///
+/// This struct allows specifying constraints on the maximum size and row count
+/// for splits. Both fields are optional; if neither is set, default behavior
+/// will be used.
+#[derive(Debug, Clone, Default)]
+pub struct SplitOptions {
+    /// Maximum size in bytes per split.
+    ///
+    /// The scanner estimates the row size from the output schema and calculates
+    /// how many rows fit within this budget.
+    pub max_size_bytes: Option<usize>,
+    /// Maximum number of rows per split.
+    pub max_row_count: Option<usize>,
 }
 
 /// Represents a user-requested take operation
@@ -4012,8 +4051,13 @@ impl Scanner {
         Ok(format!("{}", display.indent(verbose)))
     }
 
-    // TODO @hamersaw - docs
-    pub async fn plan_splits(&self) -> Result<FilteredReadPlan> {
+    /// Plan splits for distributed execution.
+    ///
+    /// This function takes the scanner configuration and returns a vector of
+    /// [`FilteredReadPlan`]s, where each plan represents a split containing at most
+    /// `max_rows_per_split` rows. Splits can be executed independently in parallel
+    /// across distributed workers.
+    pub async fn plan_splits(&self, options: Option<SplitOptions>) -> Result<Vec<Splits>> {
         // Collect all fragments to plan over
         let fragments = if let Some(fragment) = self.fragments.as_ref() {
             Arc::new(fragment.clone())
@@ -4032,21 +4076,217 @@ impl Scanner {
                 filtered_read_exec.get_or_create_plan(ctx).await?
             }
             None => {
-                // TODO - return all fragments with no splits
-                // unsure if we support vector / fts search in Spark / Ray yet?
+                // TODO @hamersaw - create FilteredReadPlan with RowAddrSelect::Full after calling
+                // load_fragment.
+
+                // TODO - do we need to handle deleted rows / self.include_deleted_rows here?
+                //     ^^^ YES `get_or_create_plan` does. so it should return a bitmap of EXACTLY
+                //     the rows to read regardless of `include_deleted_rows` configuration.
+
                 unimplemented!()
             }
         };
 
-        // TODO - i don't like that we load_fragment internally, but then when counting rows we
-        // lost it - maybe in `FilteredReadPlan` we store # of physical / logical rows per fragment?
+        // Compute the max rows per split
+        const DEFAULT_SPLIT_SIZE: usize = 128 * 1024 * 1024;
+        const DEFAULT_VARIABLE_FIELD_SIZE: usize = 64;
 
-        //let ctx = Arc::new(TaskContext::default());
-        //exec.get_or_create_plan(ctx).await
+        let options = options.unwrap_or_default();
 
-        unimplemented!()
+        // Helper to estimate row count from a byte size
+        let estimate_rows_from_bytes = |max_bytes: usize| -> Result<usize> {
+            let output_schema = self.projection_plan.output_schema()?;
+            let estimated_row_size: usize = output_schema
+                .fields()
+                .iter()
+                .map(|f| {
+                    f.data_type()
+                        .byte_width_opt()
+                        .unwrap_or(DEFAULT_VARIABLE_FIELD_SIZE)
+                })
+                .sum();
+            Ok(max_bytes / estimated_row_size.max(1))
+        };
+
+        let max_rows_per_split = match (options.max_row_count, options.max_size_bytes) {
+            (Some(max_rows), Some(max_bytes)) => {
+                // Use the minimum of both constraints
+                let rows_from_bytes = estimate_rows_from_bytes(max_bytes)?;
+                max_rows.min(rows_from_bytes)
+            }
+            (Some(max_rows), None) => max_rows,
+            (None, Some(max_bytes)) => estimate_rows_from_bytes(max_bytes)?,
+            (None, None) => estimate_rows_from_bytes(DEFAULT_SPLIT_SIZE)?,
+        };
+
+        // Build a map from fragment_id to physical row count for Full selections
+        let fragment_row_counts: std::collections::HashMap<u32, u64> = fragments
+            .iter()
+            .filter_map(|f| f.physical_rows.map(|rows| (f.id as u32, rows as u64)))
+            .collect();
+
+        // Create fragment splits where each split has <= max_rows_per_split rows
+        let mut fragment_splits: Vec<FragmentSplit> = Vec::new();
+
+        for (frag_id, selection) in filtered_read_plan.rows.iter() {
+            let mut remaining = match selection {
+                RowAddrSelection::Full => {
+                    let row_count = fragment_row_counts.get(frag_id).copied().unwrap_or(0);
+                    if row_count > 0 && row_count <= max_rows_per_split as u64 {
+                        // Entire fragment fits in one split, preserve Full selection
+                        fragment_splits.push(FragmentSplit {
+                            fragment_id: *frag_id,
+                            selection: RowAddrSelection::Full,
+                            row_count: row_count as u32,
+                        });
+
+                        continue;
+                    } else {
+                        let mut bm = RoaringBitmap::new();
+                        if row_count > 0 {
+                            bm.insert_range(0..row_count as u32);
+                        }
+                        bm
+                    }
+                }
+                RowAddrSelection::Partial(bitmap) => bitmap.clone(),
+            };
+
+            // Split the remaining rows into chunks of max_rows_per_split
+            while !remaining.is_empty() {
+                let rows_available = remaining.len();
+                if rows_available <= max_rows_per_split as u64 {
+                    fragment_splits.push(FragmentSplit {
+                        fragment_id: *frag_id,
+                        selection: RowAddrSelection::Partial(remaining),
+                        row_count: rows_available as u32,
+                    });
+                    break;
+                } else {
+                    let mut taken = RoaringBitmap::new();
+                    for (i, row) in remaining.iter().enumerate() {
+                        if i >= max_rows_per_split {
+                            break;
+                        }
+                        taken.insert(row);
+                    }
+                    let taken_count = taken.len() as u32;
+                    remaining -= &taken;
+                    fragment_splits.push(FragmentSplit {
+                        fragment_id: *frag_id,
+                        selection: RowAddrSelection::Partial(taken),
+                        row_count: taken_count,
+                    });
+                }
+            }
+        }
+
+        // Sort in descending order by row count (for bin-packing efficiency) and pack into splits
+        fragment_splits.sort_by(|a, b| b.row_count.cmp(&a.row_count));
+        let binned_splits = bin_pack(fragment_splits, max_rows_per_split as u64);
+
+        // Convert binned_splits into Vec<Splits>
+        let splits = binned_splits
+            .into_iter()
+            .map(|fragment_splits| {
+                // Collect residual filters for fragments in this split
+                let residual_filters: HashMap<u32, Arc<Expr>> = fragment_splits
+                    .iter()
+                    .filter_map(|fs| {
+                        filtered_read_plan
+                            .filters
+                            .get(&fs.fragment_id)
+                            .map(|filter| (fs.fragment_id, filter.clone()))
+                    })
+                    .collect();
+
+                Splits {
+                    fragment_splits,
+                    residual_filters,
+                    scan_range_after_filter: filtered_read_plan.scan_range_after_filter.clone(),
+                }
+            })
+            .collect();
+
+        Ok(splits)
     }
 }
+
+/// Packs fragment splits into bins where each bin's total row count is at most `maximum_count`.
+///
+/// Uses a first-fit algorithm: each item is placed in the first bin that has room for it.
+/// For best results, the input should be sorted by row count in descending order.
+///
+/// Items that exceed `maximum_count` on their own are placed in their own bin.
+fn bin_pack(items: Vec<FragmentSplit>, maximum_count: u64) -> Vec<Vec<FragmentSplit>> {
+    let mut bins: Vec<(Vec<FragmentSplit>, u64)> = Vec::new(); // (items, current_count)
+
+    for item in items {
+        let item_count = item.row_count as u64;
+
+        // Items that exceed the maximum get their own bin
+        if item_count > maximum_count {
+            bins.push((vec![item], item_count));
+            continue;
+        }
+
+        // Find first bin with enough remaining capacity
+        let target_bin = bins
+            .iter()
+            .position(|(_, bin_count)| *bin_count + item_count <= maximum_count);
+
+        match target_bin {
+            Some(idx) => {
+                bins[idx].0.push(item);
+                bins[idx].1 += item_count;
+            }
+            None => {
+                // Create new bin if no existing bin has room
+                bins.push((vec![item], item_count));
+            }
+        }
+    }
+
+    bins.into_iter().map(|(items, _)| items).collect()
+}
+
+/*/// Packs IDs into bins where each bin's total count is less than `maximum_count`.
+///
+/// Uses a first-fit decreasing algorithm: items are sorted by count in descending
+/// order, then each item is placed in the first bin that has room for it.
+fn bin_pack(items: &HashMap<u64, usize>, maximum_count: usize) -> Vec<Vec<u64>> {
+    // Convert to vec and sort by count descending for better packing
+    let mut items: Vec<(u64, usize)> = items.iter().map(|(&k, &v)| (k, v)).collect();
+    items.sort_by(|a, b| b.1.cmp(&a.1));
+
+    let mut bins: Vec<(Vec<u64>, usize)> = Vec::new(); // (ids, current_count)
+
+    for (id, count) in items {
+        // Items that exceed the maximum get their own bin
+        if count > maximum_count {
+            bins.push((vec![id], count));
+            continue;
+        }
+
+        // Find first bin with enough remaining capacity
+        let mut placed = false;
+        for (bin_ids, bin_count) in &mut bins {
+            if *bin_count + count <= maximum_count {
+                bin_ids.push(id);
+                *bin_count += count;
+                placed = true;
+                break;
+            }
+        }
+
+        // Create new bin if no existing bin has room
+        if !placed {
+            bins.push((vec![id], count));
+        }
+    }
+
+    bins.into_iter().map(|(ids, _)| ids).collect()
+}*/
 
 // Search over all indexed fields including nested ones, collecting columns that have an
 // inverted index
