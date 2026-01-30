@@ -13,6 +13,7 @@ use arrow_select::concat::concat_batches;
 use async_recursion::async_recursion;
 use chrono::Utc;
 use datafusion::common::{exec_datafusion_err, DFSchema, JoinType, NullEquality, SchemaExt};
+use datafusion::execution::TaskContext;
 use datafusion::functions_aggregate;
 use datafusion::functions_aggregate::count::count_udaf;
 use datafusion::logical_expr::{col, lit, Expr, ScalarUDF};
@@ -82,7 +83,7 @@ use crate::index::vector::utils::{
     default_distance_type_for, get_vector_dim, get_vector_type, validate_distance_type_for,
 };
 use crate::index::DatasetIndexInternalExt;
-use crate::io::exec::filtered_read::{FilteredReadExec, FilteredReadOptions};
+use crate::io::exec::filtered_read::{FilteredReadExec, FilteredReadOptions, FilteredReadPlan};
 use crate::io::exec::fts::{BoostQueryExec, FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec};
 use crate::io::exec::knn::MultivectorScoringExec;
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
@@ -2012,64 +2013,8 @@ impl Scanner {
         let use_scalar_index = self.use_scalar_index && (self.prefilter || self.nearest.is_none());
         let mut filter_plan = self.create_filter_plan(use_scalar_index).await?;
 
-        let mut use_limit_node = true;
         // Stage 1: source (either an (K|A)NN search, full text search or or a (full|indexed) scan)
-        let mut plan: Arc<dyn ExecutionPlan> = match (&self.nearest, &self.full_text_query) {
-            (Some(_), None) => self.vector_search_source(&mut filter_plan).await?,
-            (None, Some(query)) => self.fts_search_source(&mut filter_plan, query).await?,
-            (None, None) => {
-                if self.projection_plan.has_output_cols()
-                    && self.projection_plan.physical_projection.is_empty()
-                {
-                    // This means the user is doing something like `SELECT 1 AS foo`.  We don't support this and
-                    // I'm not sure we should.  Users should use a full SQL API to do something like this.
-                    //
-                    // It's also possible we get here from `SELECT does_not_exist`
-
-                    // Note: even though we are just going to return an error we still want to calculate the
-                    // final projection here.  This lets us distinguish between a user doing something like:
-                    //
-                    // SELECT 1 FROM t (not supported error)
-                    // SELECT non_existent_column FROM t (column not found error)
-                    let output_expr = self.calculate_final_projection(&ArrowSchema::empty())?;
-                    return Err(Error::NotSupported {
-                        source: format!("Scans must request at least one column.  Received only dynamic expressions: {:?}", output_expr).into(),
-                        location: location!(),
-                    });
-                }
-
-                let take_op = filter_plan
-                    .expr_filter_plan
-                    .full_expr
-                    .as_ref()
-                    .and_then(TakeOperation::try_from_expr);
-                if let Some((take_op, remainder)) = take_op {
-                    // If there is any remainder use it as the filter (we don't even try and combine an indexed
-                    // search on the filter with a take as that seems excessive)
-                    filter_plan.expr_filter_plan = remainder
-                        .map(ExprFilterPlan::new_refine_only)
-                        .unwrap_or(ExprFilterPlan::default());
-                    self.take_source(take_op).await?
-                } else {
-                    let planned_read = self
-                        .filtered_read_source(&mut filter_plan.expr_filter_plan)
-                        .await?;
-                    if planned_read.limit_pushed_down {
-                        use_limit_node = false;
-                    }
-                    if planned_read.filter_pushed_down {
-                        filter_plan.disable_refine();
-                    }
-                    planned_read.plan
-                }
-            }
-            _ => {
-                return Err(Error::InvalidInput {
-                    source: "Cannot have both nearest and full text search".into(),
-                    location: location!(),
-                })
-            }
-        };
+        let (mut plan, use_limit_node) = self.create_execution_plan(&mut filter_plan).await?;
 
         // Stage 1.5 load columns needed for stages 2 & 3
         // Calculate the schema needed for the filter and ordering.
@@ -2163,6 +2108,72 @@ impl Scanner {
         }
 
         Ok(plan)
+    }
+
+    // TODO @hamersaw - docs
+    async fn create_execution_plan(
+        &self,
+        filter_plan: &mut FilterPlan,
+    ) -> Result<(Arc<dyn ExecutionPlan>, bool)> {
+        let mut use_limit_node = true;
+        let plan: Arc<dyn ExecutionPlan> = match (&self.nearest, &self.full_text_query) {
+            (Some(_), None) => self.vector_search_source(filter_plan).await?,
+            (None, Some(query)) => self.fts_search_source(filter_plan, query).await?,
+            (None, None) => {
+                if self.projection_plan.has_output_cols()
+                    && self.projection_plan.physical_projection.is_empty()
+                {
+                    // This means the user is doing something like `SELECT 1 AS foo`.  We don't support this and
+                    // I'm not sure we should.  Users should use a full SQL API to do something like this.
+                    //
+                    // It's also possible we get here from `SELECT does_not_exist`
+
+                    // Note: even though we are just going to return an error we still want to calculate the
+                    // final projection here.  This lets us distinguish between a user doing something like:
+                    //
+                    // SELECT 1 FROM t (not supported error)
+                    // SELECT non_existent_column FROM t (column not found error)
+                    let output_expr = self.calculate_final_projection(&ArrowSchema::empty())?;
+                    return Err(Error::NotSupported {
+                        source: format!("Scans must request at least one column.  Received only dynamic expressions: {:?}", output_expr).into(),
+                        location: location!(),
+                    });
+                }
+
+                let take_op = filter_plan
+                    .expr_filter_plan
+                    .full_expr
+                    .as_ref()
+                    .and_then(TakeOperation::try_from_expr);
+                if let Some((take_op, remainder)) = take_op {
+                    // If there is any remainder use it as the filter (we don't even try and combine an indexed
+                    // search on the filter with a take as that seems excessive)
+                    filter_plan.expr_filter_plan = remainder
+                        .map(ExprFilterPlan::new_refine_only)
+                        .unwrap_or(ExprFilterPlan::default());
+                    self.take_source(take_op).await?
+                } else {
+                    let planned_read = self
+                        .filtered_read_source(&mut filter_plan.expr_filter_plan)
+                        .await?;
+                    if planned_read.limit_pushed_down {
+                        use_limit_node = false;
+                    }
+                    if planned_read.filter_pushed_down {
+                        filter_plan.disable_refine();
+                    }
+                    planned_read.plan
+                }
+            }
+            _ => {
+                return Err(Error::InvalidInput {
+                    source: "Cannot have both nearest and full text search".into(),
+                    location: location!(),
+                })
+            }
+        };
+
+        Ok((plan, use_limit_node))
     }
 
     // Check if a filter plan references version columns
@@ -3999,6 +4010,41 @@ impl Scanner {
         let display = DisplayableExecutionPlan::new(plan.as_ref());
 
         Ok(format!("{}", display.indent(verbose)))
+    }
+
+    // TODO @hamersaw - docs
+    pub async fn plan_splits(&self) -> Result<FilteredReadPlan> {
+        // Collect all fragments to plan over
+        let fragments = if let Some(fragment) = self.fragments.as_ref() {
+            Arc::new(fragment.clone())
+        } else {
+            self.dataset.fragments().clone()
+        };
+
+        // Attempt to use filtering to prune fragments / rows
+        let use_scalar_index = self.use_scalar_index && (self.prefilter || self.nearest.is_none());
+        let mut filter_plan = self.create_filter_plan(use_scalar_index).await?;
+
+        let (exec_plan, _) = self.create_execution_plan(&mut filter_plan).await?;
+        let filtered_read_plan = match exec_plan.as_any().downcast_ref::<FilteredReadExec>() {
+            Some(filtered_read_exec) => {
+                let ctx = Arc::new(TaskContext::default());
+                filtered_read_exec.get_or_create_plan(ctx).await?
+            }
+            None => {
+                // TODO - return all fragments with no splits
+                // unsure if we support vector / fts search in Spark / Ray yet?
+                unimplemented!()
+            }
+        };
+
+        // TODO - i don't like that we load_fragment internally, but then when counting rows we
+        // lost it - maybe in `FilteredReadPlan` we store # of physical / logical rows per fragment?
+
+        //let ctx = Arc::new(TaskContext::default());
+        //exec.get_or_create_plan(ctx).await
+
+        unimplemented!()
     }
 }
 
