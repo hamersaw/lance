@@ -2326,7 +2326,6 @@ impl Scanner {
             self.dataset.clone(),
             read_options,
             index_input,
-            None,
         )?))
     }
 
@@ -2407,7 +2406,6 @@ impl Scanner {
             self.dataset.clone(),
             FilteredReadOptions::new(projection),
             Some(input),
-            None,
         )?))
     }
 
