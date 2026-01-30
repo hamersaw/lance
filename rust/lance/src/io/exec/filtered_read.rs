@@ -499,7 +499,7 @@ impl FilteredReadStream {
     // If the scan range is not ignoring the filters we can only push it down if:
     // 1. The index result is an exact match (we know exactly which rows will be in the result)
     // 2. The index result is AtLeast with guaranteed rows >= limit (we have enough guaranteed matches)
-    // Returns: FilteredReadInternalPlan with range-based row selection (no bitmap conversion)
+    // Returns: FilteredReadInternalPlan
     #[instrument(name = "plan_scan", skip_all)]
     fn plan_scan(
         fragments: &[LoadedFragment],
@@ -520,7 +520,6 @@ impl FilteredReadStream {
             .unwrap_or(u64::MAX);
 
         // Full fragment ranges to read before applying scan_range_after_filter
-        // Uses BTreeMap to maintain deterministic fragment order for scan_range_after_filter
         let mut fragments_to_read: BTreeMap<u32, Vec<Range<u64>>> = BTreeMap::new();
         // Fragment ranges to read after applying scan_range_after_filter
         // Adds an extra map because if scan_range_after_filter cannot be fulfilled we need to
@@ -3596,7 +3595,7 @@ mod tests {
         let exec2 =
             FilteredReadExec::try_new(fixture.dataset.clone(), options.clone(), index_input)
                 .unwrap();
-        let plan = exec2.get_or_create_plan(ctx.clone()).await.unwrap().clone();
+        let plan = exec2.get_or_create_plan(ctx.clone()).await.unwrap();
 
         // Create new exec and use with_plan to set the plan
         let index_input = fixture.index_input(&options).await;
@@ -3634,7 +3633,7 @@ mod tests {
         // Path 2: Get plan, then create new exec with_plan
         let exec2 =
             FilteredReadExec::try_new(fixture.dataset.clone(), options.clone(), None).unwrap();
-        let plan = exec2.get_or_create_plan(ctx.clone()).await.unwrap().clone();
+        let plan = exec2.get_or_create_plan(ctx.clone()).await.unwrap();
 
         let exec3 = FilteredReadExec::try_new(fixture.dataset.clone(), options.clone(), None)
             .unwrap()
