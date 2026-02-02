@@ -104,28 +104,26 @@ public class ReadOptions {
     private Optional<StorageOptionsProvider> storageOptionsProvider = Optional.empty();
 
     /**
-     * Set the version of the dataset to read. If not set, read from latest version. This is
-     * mutually exclusive with tag; setting version will clear any previously set tag.
+     * Set the version of the dataset to read. If neither version or tag is set, read from latest
+     * version.
      *
      * @param version the version of the dataset
      * @return this builder
      */
     public Builder setVersion(int version) {
       this.version = Optional.of(version);
-      this.tag = Optional.empty();
       return this;
     }
 
     /**
-     * Set the tag of the dataset to read. If not set, read from latest version. This is mutually
-     * exclusive with version; setting tag will clear any previously set version.
+     * Set the tag of the dataset to read. If neither version or tag is set, read from latest
+     * version.
      *
      * @param tag the tag of the dataset
      * @return this builder
      */
     public Builder setTag(String tag) {
       this.tag = Optional.of(tag);
-      this.version = Optional.empty();
       return this;
     }
 
