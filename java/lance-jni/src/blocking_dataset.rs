@@ -126,6 +126,7 @@ impl BlockingDataset {
     pub fn open(
         uri: &str,
         version: Option<i32>,
+        tag: Option<String>,
         block_size: Option<i32>,
         index_cache_size_bytes: i64,
         metadata_cache_size_bytes: i64,
@@ -164,8 +165,19 @@ impl BlockingDataset {
 
         let mut builder = DatasetBuilder::from_uri(uri).with_read_params(params);
 
-        if let Some(ver) = version {
-            builder = builder.with_version(ver as u64);
+        match (tag, version) {
+            (Some(_), Some(_)) => {
+                return Err(Error::input_error(
+                    "version and tag are mutually exclusive".to_string(),
+                ))
+            }
+            (Some(tag_str), None) => {
+                builder = builder.with_tag(tag_str.as_str());
+            }
+            (None, Some(ver)) => {
+                builder = builder.with_version(ver as u64);
+            }
+            _ => {}
         }
 
         if let Some(serialized_manifest) = serialized_manifest {
@@ -1039,6 +1051,7 @@ pub extern "system" fn Java_org_lance_Dataset_openNative<'local>(
     _obj: JObject,
     path: JString,
     version_obj: JObject,    // Optional<Integer>
+    tag_obj: JObject,        // Optional<String>
     block_size_obj: JObject, // Optional<Integer>
     index_cache_size_bytes: jlong,
     metadata_cache_size_bytes: jlong,
@@ -1052,6 +1065,7 @@ pub extern "system" fn Java_org_lance_Dataset_openNative<'local>(
             &mut env,
             path,
             version_obj,
+            tag_obj,
             block_size_obj,
             index_cache_size_bytes,
             metadata_cache_size_bytes,
@@ -1067,6 +1081,7 @@ fn inner_open_native<'local>(
     env: &mut JNIEnv<'local>,
     path: JString,
     version_obj: JObject,    // Optional<Integer>
+    tag_obj: JObject,        // Optional<String>
     block_size_obj: JObject, // Optional<Integer>
     index_cache_size_bytes: jlong,
     metadata_cache_size_bytes: jlong,
@@ -1076,6 +1091,7 @@ fn inner_open_native<'local>(
 ) -> Result<JObject<'local>> {
     let path_str: String = path.extract(env)?;
     let version = env.get_int_opt(&version_obj)?;
+    let tag = env.get_string_opt(&tag_obj)?;
     let block_size = env.get_int_opt(&block_size_obj)?;
     let jmap = JMap::from_env(env, &storage_options_obj)?;
     let storage_options = to_rust_map(env, &jmap)?;
@@ -1093,6 +1109,7 @@ fn inner_open_native<'local>(
     let dataset = BlockingDataset::open(
         &path_str,
         version,
+        tag,
         block_size,
         index_cache_size_bytes,
         metadata_cache_size_bytes,

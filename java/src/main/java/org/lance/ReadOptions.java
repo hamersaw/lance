@@ -26,6 +26,7 @@ import java.util.Optional;
 public class ReadOptions {
 
   private final Optional<Integer> version;
+  private final Optional<String> tag;
   private final Optional<Integer> blockSize;
   private final long indexCacheSizeBytes;
   private final long metadataCacheSizeBytes;
@@ -35,6 +36,7 @@ public class ReadOptions {
 
   private ReadOptions(Builder builder) {
     this.version = builder.version;
+    this.tag = builder.tag;
     this.blockSize = builder.blockSize;
     this.indexCacheSizeBytes = builder.indexCacheSizeBytes;
     this.metadataCacheSizeBytes = builder.metadataCacheSizeBytes;
@@ -45,6 +47,10 @@ public class ReadOptions {
 
   public Optional<Integer> getVersion() {
     return version;
+  }
+
+  public Optional<String> getTag() {
+    return tag;
   }
 
   public Optional<Integer> getBlockSize() {
@@ -75,6 +81,7 @@ public class ReadOptions {
   public String toString() {
     return MoreObjects.toStringHelper(this)
         .add("version", version.orElse(null))
+        .add("tag", tag.orElse(null))
         .add("blockSize", blockSize.orElse(null))
         .add("indexCacheSizeBytes", indexCacheSizeBytes)
         .add("metadataCacheSizeBytes", metadataCacheSizeBytes)
@@ -88,6 +95,7 @@ public class ReadOptions {
   public static class Builder {
 
     private Optional<Integer> version = Optional.empty();
+    private Optional<String> tag = Optional.empty();
     private Optional<Integer> blockSize = Optional.empty();
     private long indexCacheSizeBytes = 6 * 1024 * 1024 * 1024; // Default to 6 GiB like Rust
     private long metadataCacheSizeBytes = 1024 * 1024 * 1024; // Default to 1 GiB like Rust
@@ -96,13 +104,28 @@ public class ReadOptions {
     private Optional<StorageOptionsProvider> storageOptionsProvider = Optional.empty();
 
     /**
-     * Set the version of the dataset to read. If not set, read from latest version.
+     * Set the version of the dataset to read. If not set, read from latest version. This is
+     * mutually exclusive with tag; setting version will clear any previously set tag.
      *
      * @param version the version of the dataset
      * @return this builder
      */
     public Builder setVersion(int version) {
       this.version = Optional.of(version);
+      this.tag = Optional.empty();
+      return this;
+    }
+
+    /**
+     * Set the tag of the dataset to read. If not set, read from latest version. This is mutually
+     * exclusive with version; setting tag will clear any previously set version.
+     *
+     * @param tag the tag of the dataset
+     * @return this builder
+     */
+    public Builder setTag(String tag) {
+      this.tag = Optional.of(tag);
+      this.version = Optional.empty();
       return this;
     }
 

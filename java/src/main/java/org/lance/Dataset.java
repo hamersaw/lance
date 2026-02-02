@@ -328,6 +328,7 @@ public class Dataset implements Closeable {
         openNative(
             path,
             options.getVersion(),
+            options.getTag(),
             options.getBlockSize(),
             options.getIndexCacheSizeBytes(),
             options.getMetadataCacheSizeBytes(),
@@ -342,6 +343,7 @@ public class Dataset implements Closeable {
   private static native Dataset openNative(
       String path,
       Optional<Integer> version,
+      Optional<String> tag,
       Optional<Integer> blockSize,
       long indexCacheSize,
       long metadataCacheSizeBytes,
