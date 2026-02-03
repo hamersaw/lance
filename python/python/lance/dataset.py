@@ -53,10 +53,10 @@ from .lance import (
     Compaction,
     CompactionMetrics,
     DatasetBasePath,
+    FilteredReadPlan,
     IOStats,
     LanceSchema,
     ScanStatistics,
-    Splits,
     _Dataset,
     _MergeInsertBuilder,
     _Scanner,
@@ -5228,12 +5228,12 @@ class LanceScanner(pa.dataset.Scanner):
         *,
         max_size_bytes: Optional[int] = None,
         max_row_count: Optional[int] = None,
-    ) -> List[Splits]:
+    ) -> List[FilteredReadPlan]:
         """Plan splits for parallel scanning.
 
         This method divides the scan into splits that can be processed in parallel.
-        Each split contains fragment splits that specify which rows to read from
-        which fragments.
+        Each split is a :class:`FilteredReadPlan` specifying which rows to read
+        from which fragments, along with any residual filters.
 
         Parameters
         ----------
@@ -5247,10 +5247,10 @@ class LanceScanner(pa.dataset.Scanner):
 
         Returns
         -------
-        List[Splits]
-            A list of splits, where each split contains:
-            - fragment_splits: List of FragmentSplit objects specifying which
-              rows to read from which fragments
+        List[FilteredReadPlan]
+            A list of plans, where each plan contains:
+            - fragment_ranges: List of (fragment_id, [(start, end), ...]) tuples
+              describing row ranges to read per fragment.
             - scan_range_after_filter: Optional tuple (start, end) specifying
               row offset range to apply after filtering
 
@@ -5261,14 +5261,43 @@ class LanceScanner(pa.dataset.Scanner):
         >>> scanner = dataset.scanner()
         >>> splits = scanner.plan_splits(max_row_count=10000)
         >>> for split in splits:
-        ...     for frag_split in split.fragment_splits:
-        ...         print(f"Fragment {frag_split.fragment_id}:"
-        ...            + f" {frag_split.row_count} rows")
+        ...     for frag_id, ranges in split.fragment_ranges:
+        ...         row_count = sum(end - start for start, end in ranges)
+        ...         print(f"Fragment {frag_id}: {row_count} rows")
         """
         return self._scanner.plan_splits(
             max_size_bytes=max_size_bytes,
             max_row_count=max_row_count,
         )
+
+    def execute_split(self, split: FilteredReadPlan) -> pa.RecordBatchReader:
+        """Execute a single split from :meth:`plan_splits`.
+
+        Each split can be executed independently, potentially on different
+        workers. The returned reader applies any per-fragment residual filters
+        and ``scan_range_after_filter`` that are part of the split.
+
+        Parameters
+        ----------
+        split : FilteredReadPlan
+            A plan as returned by :meth:`plan_splits`.
+
+        Returns
+        -------
+        pa.RecordBatchReader
+            A reader that yields record batches for the split.
+
+        Examples
+        --------
+        >>> import lance
+        >>> dataset = lance.dataset("my_dataset")
+        >>> scanner = dataset.scanner(filter="id > 10")
+        >>> splits = scanner.plan_splits(max_row_count=10000)
+        >>> for split in splits:
+        ...     reader = scanner.execute_split(split)
+        ...     table = reader.read_all()
+        """
+        return self._scanner.execute_split(split)
 
 
 class DatasetOptimizer:

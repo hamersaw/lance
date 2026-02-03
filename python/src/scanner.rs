@@ -16,16 +16,12 @@
 // under the License.
 
 use std::collections::HashMap;
-use std::ops::Range;
 use std::sync::Arc;
 
 use arrow::pyarrow::*;
 use arrow_array::RecordBatchReader;
-use lance::dataset::scanner::{
-    ExecutionSummaryCounts, FragmentSplit as LanceFragmentSplit, SplitOptions as LanceSplitOptions,
-    Splits as LanceSplits,
-};
-use lance_core::utils::mask::RowAddrSelection;
+use lance::dataset::scanner::{ExecutionSummaryCounts, SplitOptions as LanceSplitOptions};
+use lance::io::exec::filtered_read::FilteredReadPlan;
 use pyo3::prelude::*;
 use pyo3::pyclass;
 
@@ -161,7 +157,7 @@ impl Scanner {
         self_: PyRef<'_, Self>,
         max_size_bytes: Option<usize>,
         max_row_count: Option<usize>,
-    ) -> PyResult<Vec<PySplits>> {
+    ) -> PyResult<Vec<PyFilteredReadPlan>> {
         let scanner = self_.scanner.clone();
         let options = if max_size_bytes.is_some() || max_row_count.is_some() {
             Some(LanceSplitOptions {
@@ -178,87 +174,82 @@ impl Scanner {
             })?
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
-        Ok(splits.into_iter().map(PySplits::from).collect())
+        Ok(splits.into_iter().map(PyFilteredReadPlan::from).collect())
+    }
+
+    fn execute_split(
+        self_: PyRef<'_, Self>,
+        split: PyFilteredReadPlan,
+    ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
+        let scanner = self_.scanner.clone();
+        let inner = split.inner;
+        let stream = rt()
+            .spawn(Some(self_.py()), async move {
+                scanner.execute_split(inner).await
+            })?
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        Ok(PyArrowType(Box::new(LanceReader::from_stream(stream))))
     }
 }
 
-/// A split represents a unit of work for scanning a dataset.
-/// It contains fragment splits and residual filters that need to be applied.
-#[pyclass(name = "Splits", module = "_lib", get_all)]
+/// A filtered read plan represents a unit of work for scanning a dataset.
+/// It specifies which fragment row ranges to read and any residual filters to apply.
+#[pyclass(name = "FilteredReadPlan", module = "_lib")]
 #[derive(Clone)]
-pub struct PySplits {
-    /// The fragment splits in this split.
-    pub fragment_splits: Vec<PyFragmentSplit>,
+pub struct PyFilteredReadPlan {
+    /// Per-fragment row ranges as `(fragment_id, [(start, end), ...])` pairs.
+    #[pyo3(get)]
+    pub fragment_ranges: Vec<(u32, Vec<(u64, u64)>)>,
     /// Row offset range to apply after filtering (skip N rows, take M rows).
+    #[pyo3(get)]
     pub scan_range_after_filter: Option<(u64, u64)>,
+    /// The inner Rust FilteredReadPlan, retained for execute_split.
+    pub(crate) inner: FilteredReadPlan,
 }
 
-impl From<LanceSplits> for PySplits {
-    fn from(splits: LanceSplits) -> Self {
+impl From<FilteredReadPlan> for PyFilteredReadPlan {
+    fn from(plan: FilteredReadPlan) -> Self {
+        let fragment_ranges = plan
+            .rows
+            .iter()
+            .map(|(frag_id, ranges)| {
+                let py_ranges: Vec<(u64, u64)> = ranges.iter().map(|r| (r.start, r.end)).collect();
+                (*frag_id, py_ranges)
+            })
+            .collect();
+        let scan_range_after_filter = plan
+            .scan_range_after_filter
+            .as_ref()
+            .map(|r| (r.start, r.end));
         Self {
-            fragment_splits: splits
-                .fragment_splits
-                .into_iter()
-                .map(PyFragmentSplit::from)
-                .collect(),
-            scan_range_after_filter: splits
-                .scan_range_after_filter
-                .map(|r: Range<u64>| (r.start, r.end)),
+            fragment_ranges,
+            scan_range_after_filter,
+            inner: plan,
         }
     }
 }
 
 #[pymethods]
-impl PySplits {
+impl PyFilteredReadPlan {
     fn __repr__(&self) -> String {
+        let fragments_str = self
+            .fragment_ranges
+            .iter()
+            .map(|(frag_id, ranges)| {
+                let row_count: u64 = ranges.iter().map(|(s, e)| e - s).sum();
+                format!(
+                    "(fragment_id={}, ranges={}, rows={})",
+                    frag_id,
+                    ranges.len(),
+                    row_count
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
         format!(
-            "Splits(fragment_splits=[{}], scan_range_after_filter={:?})",
-            self.fragment_splits
-                .iter()
-                .map(|fs| fs.__repr__())
-                .collect::<Vec<_>>()
-                .join(", "),
-            self.scan_range_after_filter,
-        )
-    }
-}
-
-/// A fragment split represents a portion of a fragment to scan.
-#[pyclass(name = "FragmentSplit", module = "_lib", get_all)]
-#[derive(Clone)]
-pub struct PyFragmentSplit {
-    /// The fragment ID.
-    pub fragment_id: u32,
-    /// Row offsets to read. None means read all rows (Full selection).
-    pub row_offsets: Option<Vec<u32>>,
-    /// The number of rows in this split.
-    pub row_count: u32,
-}
-
-impl From<LanceFragmentSplit> for PyFragmentSplit {
-    fn from(split: LanceFragmentSplit) -> Self {
-        let row_offsets = match split.selection {
-            RowAddrSelection::Full => None,
-            RowAddrSelection::Partial(bitmap) => Some(bitmap.iter().collect()),
-        };
-        Self {
-            fragment_id: split.fragment_id,
-            row_offsets,
-            row_count: split.row_count,
-        }
-    }
-}
-
-#[pymethods]
-impl PyFragmentSplit {
-    fn __repr__(&self) -> String {
-        let selection_str = match &self.row_offsets {
-            None => "Full".to_string(),
-            Some(offsets) => format!("Partial({} rows)", offsets.len()),
-        };
-        format!(
-            "FragmentSplit(fragment_id={}, selection={}, row_count={})",
-            self.fragment_id, selection_str, self.row_count
+            "FilteredReadPlan(fragments=[{}], scan_range_after_filter={:?})",
+            fragments_str, self.scan_range_after_filter,
         )
     }
 }

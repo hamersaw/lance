@@ -32,7 +32,7 @@ use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::OnMissing;
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::futures::FinallyStreamExt;
-use lance_core::utils::mask::{bitmap_to_ranges, RowAddrMask, RowAddrSelection, RowAddrTreeMap};
+use lance_core::utils::mask::RowAddrMask;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{datatypes::Projection, Error, Result};
 use lance_datafusion::planner::Planner;
@@ -362,7 +362,7 @@ impl FilteredReadStream {
         dataset: Arc<Dataset>,
         options: FilteredReadOptions,
         metrics: &ExecutionPlanMetricsSet,
-        plan: FilteredReadInternalPlan,
+        plan: FilteredReadPlan,
     ) -> DataFusionResult<Self> {
         let global_metrics = Arc::new(FilteredReadGlobalMetrics::new(metrics));
 
@@ -499,13 +499,13 @@ impl FilteredReadStream {
     // If the scan range is not ignoring the filters we can only push it down if:
     // 1. The index result is an exact match (we know exactly which rows will be in the result)
     // 2. The index result is AtLeast with guaranteed rows >= limit (we have enough guaranteed matches)
-    // Returns: FilteredReadInternalPlan
+    // Returns: FilteredReadPlan
     #[instrument(name = "plan_scan", skip_all)]
     fn plan_scan(
         fragments: &[LoadedFragment],
         evaluated_index: &Option<Arc<EvaluatedIndex>>,
         options: &FilteredReadOptions,
-    ) -> FilteredReadInternalPlan {
+    ) -> FilteredReadPlan {
         // For pushing down scan_range_after_filter
         let mut scan_planned_with_limit_pushed_down = false;
         let mut to_skip = options
@@ -632,7 +632,7 @@ impl FilteredReadStream {
             options.scan_range_after_filter.clone()
         };
 
-        FilteredReadInternalPlan {
+        FilteredReadPlan {
             rows: fragments_to_read,
             filters,
             scan_range_after_filter,
@@ -640,7 +640,7 @@ impl FilteredReadStream {
     }
 
     fn plan_to_scoped_fragments(
-        plan: &FilteredReadInternalPlan,
+        plan: &FilteredReadPlan,
         fragments: &[LoadedFragment],
         dataset: &Dataset,
         options: &FilteredReadOptions,
@@ -1463,59 +1463,28 @@ pub struct FilteredReadExec {
     metrics: ExecutionPlanMetricsSet,
     index_input: Option<Arc<dyn ExecutionPlan>>,
     // Precomputed internal plan
-    plan: Arc<OnceCell<FilteredReadInternalPlan>>,
+    plan: Arc<OnceCell<FilteredReadPlan>>,
     // When execute is first called we will initialize the FilteredReadStream.  In order to support
     // multiple partitions, each partition will share the stream.
     running_stream: Arc<AsyncMutex<Option<FilteredReadStream>>>,
 }
 
-/// Public plan for distributed execution - uses bitmap for flexibility
-#[derive(Clone)]
+/// Plan for distributed execution — uses ranges for efficient representation.
+///
+/// Created by [`FilteredReadExec::get_or_create_plan`] and consumed by
+/// [`FilteredReadExec::with_plan`]. Can be split into smaller plans
+/// by [`Scanner::plan_splits`] for parallel execution.
+#[derive(Clone, Debug)]
 pub struct FilteredReadPlan {
-    /// What fragments and physical rows to read
-    pub rows: RowAddrTreeMap,
-    /// Filter to apply per fragment
-    /// fragments not here don't need filtering
+    /// Fragment ID to row ranges to read (BTreeMap for deterministic order
+    /// with scan_range_after_filter).
+    pub rows: BTreeMap<u32, Vec<Range<u64>>>,
+    /// Filter to apply per fragment — fragments not present don't need filtering.
     pub filters: HashMap<u32, Arc<Expr>>,
     /// Row offset range to apply after filtering (skip N rows, take M rows).
-    /// If the index guarantees enough matching rows, this is pushed down during planning
-    /// and set to None. Otherwise, it's applied during execution.
+    /// If the index guarantees enough matching rows, this is pushed down during
+    /// planning and set to `None`. Otherwise, it's applied during execution.
     pub scan_range_after_filter: Option<Range<u64>>,
-}
-
-/// Internal plan representation - uses ranges for efficiency in local execution
-/// This avoids expensive range↔bitmap conversion
-#[derive(Clone, Debug)]
-struct FilteredReadInternalPlan {
-    /// Fragment ID to ranges to read (BTreeMap for deterministic order with scan_range_after_filter)
-    rows: BTreeMap<u32, Vec<Range<u64>>>,
-    /// Filter to apply per fragment (fragments not here don't need filtering)
-    filters: HashMap<u32, Arc<Expr>>,
-    /// Row offset range to apply after filtering (skip N rows, take M rows).
-    /// If the index guarantees enough matching rows, this is pushed down during planning
-    /// and set to None. Otherwise, it's applied during execution.
-    scan_range_after_filter: Option<Range<u64>>,
-}
-
-impl FilteredReadInternalPlan {
-    /// Convert internal plan (ranges) to external plan (bitmap) for distributed execution
-    fn to_external_plan(&self) -> FilteredReadPlan {
-        let mut rows = RowAddrTreeMap::new();
-        for (fragment_id, ranges) in &self.rows {
-            if !ranges.is_empty() {
-                let mut bitmap = RoaringBitmap::new();
-                for range in ranges {
-                    bitmap.insert_range(range.start as u32..range.end as u32);
-                }
-                rows.insert_bitmap(*fragment_id, bitmap);
-            }
-        }
-        FilteredReadPlan {
-            rows,
-            filters: self.filters.clone(),
-            scan_range_after_filter: self.scan_range_after_filter.clone(),
-        }
-    }
 }
 
 impl FilteredReadExec {
@@ -1590,50 +1559,25 @@ impl FilteredReadExec {
         })
     }
 
-    /// Set the pre-computed plan for execution
-    pub async fn with_plan(self, plan: FilteredReadPlan) -> Result<Self> {
-        let mut rows = BTreeMap::new();
-        for (fragment_id, selection) in plan.rows.iter() {
-            let ranges = match selection {
-                RowAddrSelection::Partial(bitmap) => bitmap_to_ranges(bitmap),
-                RowAddrSelection::Full => {
-                    let fragment = self
-                        .dataset
-                        .get_fragment(*fragment_id as usize)
-                        .ok_or_else(|| Error::InvalidInput {
-                            source: format!("Fragment {} not found", fragment_id).into(),
-                            location: location!(),
-                        })?;
-                    let num_rows = fragment.physical_rows().await?;
-                    vec![0..num_rows as u64]
-                }
-            };
-            if !ranges.is_empty() {
-                rows.insert(*fragment_id, ranges);
-            }
-        }
-        let internal_plan = FilteredReadInternalPlan {
-            rows,
-            filters: plan.filters,
-            scan_range_after_filter: plan.scan_range_after_filter,
-        };
+    /// Set the pre-computed plan for execution.
+    pub fn with_plan(self, plan: FilteredReadPlan) -> Self {
         let plan_cell = Arc::new(OnceCell::new());
-        let _ = plan_cell.set(internal_plan);
-        Ok(Self {
+        let _ = plan_cell.set(plan);
+        Self {
             plan: plan_cell,
             ..self
-        })
+        }
     }
 
     /// Get or create the internal plan
     async fn get_or_create_plan_impl<'a>(
-        plan_cell: &'a OnceCell<FilteredReadInternalPlan>,
+        plan_cell: &'a OnceCell<FilteredReadPlan>,
         dataset: Arc<Dataset>,
         options: &FilteredReadOptions,
         index_input: Option<&Arc<dyn ExecutionPlan>>,
         partition: usize,
         ctx: Arc<TaskContext>,
-    ) -> Result<&'a FilteredReadInternalPlan> {
+    ) -> Result<&'a FilteredReadPlan> {
         plan_cell
             .get_or_try_init(|| async {
                 // Execute index if present
@@ -1683,9 +1627,9 @@ impl FilteredReadExec {
             .await
     }
 
-    /// Get the existing plan or create it if it doesn't exist
+    /// Get the existing plan or create it if it doesn't exist.
     pub async fn get_or_create_plan(&self, ctx: Arc<TaskContext>) -> Result<FilteredReadPlan> {
-        let internal_plan = Self::get_or_create_plan_impl(
+        let plan = Self::get_or_create_plan_impl(
             &self.plan,
             self.dataset.clone(),
             &self.options,
@@ -1694,7 +1638,7 @@ impl FilteredReadExec {
             ctx,
         )
         .await?;
-        Ok(internal_plan.to_external_plan())
+        Ok(plan.clone())
     }
 
     fn obtain_stream(
@@ -3598,9 +3542,7 @@ mod tests {
         let exec3 =
             FilteredReadExec::try_new(fixture.dataset.clone(), options.clone(), index_input)
                 .unwrap()
-                .with_plan(plan)
-                .await
-                .unwrap();
+                .with_plan(plan);
         let stream3 = exec3.execute(0, ctx.clone()).unwrap();
         let schema3 = stream3.schema();
         let batches3 = stream3.try_collect::<Vec<_>>().await.unwrap();
@@ -3633,9 +3575,7 @@ mod tests {
 
         let exec3 = FilteredReadExec::try_new(fixture.dataset.clone(), options.clone(), None)
             .unwrap()
-            .with_plan(plan)
-            .await
-            .unwrap();
+            .with_plan(plan);
         let stream3 = exec3.execute(0, ctx.clone()).unwrap();
         let schema3 = stream3.schema();
         let batches3 = stream3.try_collect::<Vec<_>>().await.unwrap();

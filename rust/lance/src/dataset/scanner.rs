@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
@@ -52,7 +52,7 @@ use lance_core::datatypes::{
 };
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::address::RowAddress;
-use lance_core::utils::mask::{RowAddrMask, RowAddrSelection, RowAddrTreeMap};
+use lance_core::utils::mask::{RowAddrMask, RowAddrTreeMap};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR, ROW_ID, ROW_OFFSET};
 use lance_datafusion::exec::{
@@ -84,7 +84,7 @@ use crate::index::vector::utils::{
     default_distance_type_for, get_vector_dim, get_vector_type, validate_distance_type_for,
 };
 use crate::index::DatasetIndexInternalExt;
-use crate::io::exec::filtered_read::{FilteredReadExec, FilteredReadOptions};
+use crate::io::exec::filtered_read::{FilteredReadExec, FilteredReadOptions, FilteredReadPlan};
 use crate::io::exec::fts::{BoostQueryExec, FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec};
 use crate::io::exec::knn::MultivectorScoringExec;
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
@@ -602,26 +602,11 @@ pub struct Scanner {
     autoproject_scoring_columns: bool,
 }
 
-// TODO @hamersaw - docs
-pub struct Splits {
-    // TODO @hamersaw - docs
-    pub fragment_splits: Vec<FragmentSplit>,
-    // TODO @hamersaw - docs
-    pub residual_filters: HashMap<u32, Arc<Expr>>,
-    /// Row offset range to apply after filtering (skip N rows, take M rows).
-    /// If the index guarantees enough matching rows, this is pushed down during planning
-    /// and set to None. Otherwise, it's applied during execution.
-    pub scan_range_after_filter: Option<Range<u64>>,
-}
-
-// TODO @hamersaw - docs
-pub struct FragmentSplit {
-    // TODO @hamersaw - docs
-    pub fragment_id: u32,
-    // TODO @hamersaw - docs - selection of row offsets within the fragment to read
-    pub selection: RowAddrSelection,
-    // TODO @hamersaw - docs
-    pub row_count: u32,
+/// A lightweight item used during bin-packing in [`Scanner::plan_splits`].
+struct BinItem {
+    fragment_id: u32,
+    ranges: Vec<Range<u64>>,
+    row_count: u64,
 }
 
 /// Options for configuring split generation.
@@ -4052,14 +4037,10 @@ impl Scanner {
     /// [`FilteredReadPlan`]s, where each plan represents a split containing at most
     /// `max_rows_per_split` rows. Splits can be executed independently in parallel
     /// across distributed workers.
-    pub async fn plan_splits(&self, options: Option<SplitOptions>) -> Result<Vec<Splits>> {
-        // Collect all fragments to plan over
-        let fragments = if let Some(fragment) = self.fragments.as_ref() {
-            Arc::new(fragment.clone())
-        } else {
-            self.dataset.fragments().clone()
-        };
-
+    pub async fn plan_splits(
+        &self,
+        options: Option<SplitOptions>,
+    ) -> Result<Vec<FilteredReadPlan>> {
         // Attempt to use filtering to prune fragments / rows
         let use_scalar_index = self.use_scalar_index && (self.prefilter || self.nearest.is_none());
         let mut filter_plan = self.create_filter_plan(use_scalar_index).await?;
@@ -4114,90 +4095,84 @@ impl Scanner {
             (None, None) => estimate_rows_from_bytes(DEFAULT_SPLIT_SIZE)?,
         };
 
-        // Build a map from fragment_id to physical row count for Full selections
-        let fragment_row_counts: std::collections::HashMap<u32, u64> = fragments
-            .iter()
-            .filter_map(|f| f.physical_rows.map(|rows| (f.id as u32, rows as u64)))
-            .collect();
+        // Create bin items where each item has <= max_rows_per_split rows
+        let mut bin_items: Vec<BinItem> = Vec::new();
+        let max_rows = max_rows_per_split as u64;
 
-        // Create fragment splits where each split has <= max_rows_per_split rows
-        let mut fragment_splits: Vec<FragmentSplit> = Vec::new();
+        for (frag_id, frag_ranges) in &filtered_read_plan.rows {
+            let total_rows: u64 = frag_ranges.iter().map(|r| r.end - r.start).sum();
 
-        for (frag_id, selection) in filtered_read_plan.rows.iter() {
-            let mut remaining = match selection {
-                RowAddrSelection::Full => {
-                    let row_count = fragment_row_counts.get(frag_id).copied().unwrap_or(0);
-                    if row_count > 0 && row_count <= max_rows_per_split as u64 {
-                        // Entire fragment fits in one split, preserve Full selection
-                        fragment_splits.push(FragmentSplit {
-                            fragment_id: *frag_id,
-                            selection: RowAddrSelection::Full,
-                            row_count: row_count as u32,
-                        });
+            if total_rows <= max_rows {
+                // Fragment fits in one item
+                bin_items.push(BinItem {
+                    fragment_id: *frag_id,
+                    ranges: frag_ranges.clone(),
+                    row_count: total_rows,
+                });
+                continue;
+            }
 
-                        continue;
+            // Split ranges into chunks of at most max_rows
+            let mut current_ranges: Vec<Range<u64>> = Vec::new();
+            let mut current_count: u64 = 0;
+
+            for range in frag_ranges {
+                let mut remaining = range.clone();
+                while !remaining.is_empty() {
+                    let room = max_rows - current_count;
+                    let range_len = remaining.end - remaining.start;
+                    if range_len <= room {
+                        current_ranges.push(remaining.clone());
+                        current_count += range_len;
+                        break;
                     } else {
-                        let mut bm = RoaringBitmap::new();
-                        if row_count > 0 {
-                            bm.insert_range(0..row_count as u32);
-                        }
-                        bm
-                    }
-                }
-                RowAddrSelection::Partial(bitmap) => bitmap.clone(),
-            };
+                        // Take what fits and flush
+                        current_ranges.push(remaining.start..remaining.start + room);
+                        current_count += room;
+                        remaining.start += room;
 
-            // Split the remaining rows into chunks of max_rows_per_split
-            while !remaining.is_empty() {
-                let rows_available = remaining.len();
-                if rows_available <= max_rows_per_split as u64 {
-                    fragment_splits.push(FragmentSplit {
-                        fragment_id: *frag_id,
-                        selection: RowAddrSelection::Partial(remaining),
-                        row_count: rows_available as u32,
-                    });
-                    break;
-                } else {
-                    let mut taken = RoaringBitmap::new();
-                    for (i, row) in remaining.iter().enumerate() {
-                        if i >= max_rows_per_split {
-                            break;
-                        }
-                        taken.insert(row);
+                        bin_items.push(BinItem {
+                            fragment_id: *frag_id,
+                            ranges: std::mem::take(&mut current_ranges),
+                            row_count: current_count,
+                        });
+                        current_count = 0;
                     }
-                    let taken_count = taken.len() as u32;
-                    remaining -= &taken;
-                    fragment_splits.push(FragmentSplit {
-                        fragment_id: *frag_id,
-                        selection: RowAddrSelection::Partial(taken),
-                        row_count: taken_count,
-                    });
                 }
+            }
+            if !current_ranges.is_empty() {
+                bin_items.push(BinItem {
+                    fragment_id: *frag_id,
+                    ranges: current_ranges,
+                    row_count: current_count,
+                });
             }
         }
 
-        // Sort in descending order by row count (for bin-packing efficiency) and pack into splits
-        fragment_splits.sort_by(|a, b| b.row_count.cmp(&a.row_count));
-        let binned_splits = bin_pack(fragment_splits, max_rows_per_split as u64);
+        // Sort in descending order by row count (for bin-packing efficiency) and pack into bins
+        bin_items.sort_by(|a, b| b.row_count.cmp(&a.row_count));
+        let bins = bin_pack(bin_items, max_rows);
 
-        // Convert binned_splits into Vec<Splits>
-        let splits = binned_splits
+        // Convert bins into Vec<FilteredReadPlan>
+        let splits = bins
             .into_iter()
-            .map(|fragment_splits| {
-                // Collect residual filters for fragments in this split
-                let residual_filters: HashMap<u32, Arc<Expr>> = fragment_splits
-                    .iter()
-                    .filter_map(|fs| {
-                        filtered_read_plan
-                            .filters
-                            .get(&fs.fragment_id)
-                            .map(|filter| (fs.fragment_id, filter.clone()))
-                    })
-                    .collect();
+            .map(|items| {
+                let mut rows: BTreeMap<u32, Vec<Range<u64>>> = BTreeMap::new();
+                let mut filters: HashMap<u32, Arc<Expr>> = HashMap::new();
 
-                Splits {
-                    fragment_splits,
-                    residual_filters,
+                for item in items {
+                    rows.entry(item.fragment_id)
+                        .or_default()
+                        .extend(item.ranges);
+
+                    if let Some(filter) = filtered_read_plan.filters.get(&item.fragment_id) {
+                        filters.insert(item.fragment_id, filter.clone());
+                    }
+                }
+
+                FilteredReadPlan {
+                    rows,
+                    filters,
                     scan_range_after_filter: filtered_read_plan.scan_range_after_filter.clone(),
                 }
             })
@@ -4205,19 +4180,104 @@ impl Scanner {
 
         Ok(splits)
     }
+
+    /// Execute a single split from [`plan_splits`].
+    ///
+    /// This takes one [`FilteredReadPlan`] value (as returned by [`plan_splits`])
+    /// and executes it, returning a stream of [`RecordBatch`]es. Each split can
+    /// be executed independently, potentially on different workers.
+    ///
+    /// The returned stream applies any per-fragment residual filters and
+    /// `scan_range_after_filter` that are part of the split.
+    pub async fn execute_split(&self, split: FilteredReadPlan) -> Result<DatasetRecordBatchStream> {
+        // 1. Compute the read projection, extending it with columns needed by
+        //    residual filters so the fragment reader loads them.
+        let output_projection = self.projection_plan.physical_projection.clone();
+        let output_schema = output_projection.to_arrow_schema();
+        let mut read_projection = output_projection;
+
+        let mut filter_columns = Vec::new();
+        for filter_expr in split.filters.values() {
+            filter_columns.extend(Planner::column_names_in_expr(filter_expr));
+        }
+        if !filter_columns.is_empty() {
+            read_projection = read_projection.union_columns(filter_columns, OnMissing::Ignore)?;
+        }
+
+        let read_schema = read_projection.to_arrow_schema();
+        let projection_extended = read_schema != output_schema;
+
+        // 2. Build FilteredReadOptions with only the fragments referenced by
+        //    this split.
+        let split_fragment_ids: std::collections::HashSet<u32> =
+            split.rows.keys().copied().collect();
+
+        let fragments: Vec<Fragment> = self
+            .dataset
+            .fragments()
+            .iter()
+            .filter(|f| split_fragment_ids.contains(&(f.id as u32)))
+            .cloned()
+            .collect();
+
+        let mut read_options =
+            FilteredReadOptions::new(read_projection).with_fragments(Arc::new(fragments));
+
+        if let Some(batch_size) = self.batch_size {
+            read_options = read_options.with_batch_size(batch_size as u32);
+        }
+        if let Some(fragment_readahead) = self.fragment_readahead {
+            read_options = read_options.with_fragment_readahead(fragment_readahead);
+        }
+        if let Some(io_buffer_size) = self.io_buffer_size {
+            read_options = read_options.with_io_buffer_size(io_buffer_size);
+        }
+
+        // 4. Create FilteredReadExec and apply the pre-computed plan.
+        let exec = FilteredReadExec::try_new(self.dataset.clone(), read_options, None)?;
+        let exec = exec.with_plan(split);
+
+        // 5. If the read projection was extended with filter-only columns, add a
+        //    final projection to drop them from the output.
+        let plan: Arc<dyn ExecutionPlan> = if projection_extended {
+            let projection_exprs: Vec<(Arc<dyn PhysicalExpr>, String)> = output_schema
+                .fields()
+                .iter()
+                .map(|field| {
+                    Ok((
+                        expressions::col(field.name(), exec.schema().as_ref())?
+                            as Arc<dyn PhysicalExpr>,
+                        field.name().clone(),
+                    ))
+                })
+                .collect::<Result<_>>()?;
+            Arc::new(DFProjectionExec::try_new(projection_exprs, Arc::new(exec))?)
+        } else {
+            Arc::new(exec)
+        };
+
+        // 6. Execute and return the stream.
+        Ok(DatasetRecordBatchStream::new(execute_plan(
+            plan,
+            LanceExecutionOptions {
+                batch_size: self.batch_size,
+                ..Default::default()
+            },
+        )?))
+    }
 }
 
-/// Packs fragment splits into bins where each bin's total row count is at most `maximum_count`.
+/// Packs bin items into bins where each bin's total row count is at most `maximum_count`.
 ///
 /// Uses a first-fit algorithm: each item is placed in the first bin that has room for it.
 /// For best results, the input should be sorted by row count in descending order.
 ///
 /// Items that exceed `maximum_count` on their own are placed in their own bin.
-fn bin_pack(items: Vec<FragmentSplit>, maximum_count: u64) -> Vec<Vec<FragmentSplit>> {
-    let mut bins: Vec<(Vec<FragmentSplit>, u64)> = Vec::new(); // (items, current_count)
+fn bin_pack(items: Vec<BinItem>, maximum_count: u64) -> Vec<Vec<BinItem>> {
+    let mut bins: Vec<(Vec<BinItem>, u64)> = Vec::new(); // (items, current_count)
 
     for item in items {
-        let item_count = item.row_count as u64;
+        let item_count = item.row_count;
 
         // Items that exceed the maximum get their own bin
         if item_count > maximum_count {
