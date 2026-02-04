@@ -27,11 +27,8 @@ import java.util.Optional;
  *       residual filters.
  *   <li>{@link #getFragments()} - fragment IDs only, where each fragment is a split.
  * </ul>
- *
- * <p>When using the {@code FilteredReadPlans} variant, the plans must be closed when no longer
- * needed.
  */
-public class Splits implements AutoCloseable {
+public class Splits {
   private final List<FilteredReadPlan> filteredReadPlans;
   private final List<Integer> fragments;
 
@@ -57,14 +54,5 @@ public class Splits implements AutoCloseable {
    */
   public Optional<List<Integer>> getFragments() {
     return Optional.ofNullable(fragments);
-  }
-
-  @Override
-  public void close() {
-    if (filteredReadPlans != null) {
-      for (FilteredReadPlan plan : filteredReadPlans) {
-        plan.close();
-      }
-    }
   }
 }

@@ -199,7 +199,7 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
       Preconditions.checkArgument(nativeScannerHandle != 0, "Scanner is closed");
       Preconditions.checkNotNull(plan);
       try (ArrowArrayStream s = ArrowArrayStream.allocateNew(allocator)) {
-        nativeExecuteFilteredReadPlan(plan.getNativeHandle(), s.memoryAddress());
+        nativeExecuteFilteredReadPlan(plan, s.memoryAddress());
         return Data.importArrayStream(allocator, s);
       } catch (IOException e) {
         throw new RuntimeException(e);
@@ -207,6 +207,6 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
     }
   }
 
-  private native void nativeExecuteFilteredReadPlan(long planHandle, long streamAddress)
+  private native void nativeExecuteFilteredReadPlan(FilteredReadPlan plan, long streamAddress)
       throws IOException;
 }

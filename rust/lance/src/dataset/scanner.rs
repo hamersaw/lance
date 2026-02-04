@@ -1052,6 +1052,11 @@ impl Scanner {
         self
     }
 
+    /// Get the schema of the underlying dataset.
+    pub fn dataset_schema(&self) -> &Schema {
+        self.dataset.schema()
+    }
+
     /// Set the batch size.
     pub fn batch_size(&mut self, batch_size: usize) -> &mut Self {
         self.batch_size = Some(batch_size);

@@ -20,16 +20,13 @@ import java.util.Optional;
 /**
  * A filtered read plan represents a unit of work for scanning a dataset.
  *
- * <p>It specifies which fragment row ranges to read and any residual filters to apply. Plans are
- * created by {@link LanceScanner#planSplits} and executed by {@link
- * LanceScanner#executeFilteredReadPlan}.
+ * <p>It specifies which fragment row ranges to read, any residual filters to apply (encoded as
+ * Substrait), and an optional post-filter scan range. Plans are created by {@link
+ * LanceScanner#planSplits} and executed by {@link LanceScanner#executeFilteredReadPlan}.
  *
- * <p>This class holds a native handle to a Rust {@code FilteredReadPlan} object and must be closed
- * when no longer needed.
+ * <p>This class is a pure data object that is fully serializable for distributed execution.
  */
-public class FilteredReadPlan implements AutoCloseable {
-  private long nativeHandle;
-
+public class FilteredReadPlan {
   /**
    * Per-fragment row ranges: maps fragment ID to a list of [start, end) ranges.
    *
@@ -43,6 +40,21 @@ public class FilteredReadPlan implements AutoCloseable {
    * <p>The array has two elements: {@code [start, end)}.
    */
   private long[] scanRangeAfterFilter;
+
+  /**
+   * Deduplicated list of Substrait-encoded filter expressions.
+   *
+   * <p>Each element is a serialized Substrait ExtendedExpression message. Multiple fragments may
+   * share the same filter; this list stores each unique filter exactly once.
+   */
+  private List<byte[]> filterExpressions;
+
+  /**
+   * Maps fragment ID to an index in {@link #filterExpressions}.
+   *
+   * <p>Fragments that do not require filtering are absent from this map.
+   */
+  private Map<Integer, Integer> fragmentFilterIndex;
 
   private FilteredReadPlan() {}
 
@@ -65,21 +77,20 @@ public class FilteredReadPlan implements AutoCloseable {
   }
 
   /**
-   * Get the native handle for this plan.
+   * Get the deduplicated Substrait-encoded filter expressions.
    *
-   * @return the native handle value.
+   * @return list of serialized Substrait ExtendedExpression messages.
    */
-  long getNativeHandle() {
-    return nativeHandle;
+  public List<byte[]> getFilterExpressions() {
+    return filterExpressions;
   }
 
-  @Override
-  public void close() {
-    if (nativeHandle != 0) {
-      releaseNativePlan(nativeHandle);
-      nativeHandle = 0;
-    }
+  /**
+   * Get the mapping from fragment ID to filter expression index.
+   *
+   * @return map from fragment ID to index in {@link #getFilterExpressions()}.
+   */
+  public Map<Integer, Integer> getFragmentFilterIndex() {
+    return fragmentFilterIndex;
   }
-
-  private static native void releaseNativePlan(long handle);
 }

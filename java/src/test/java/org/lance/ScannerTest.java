@@ -554,12 +554,11 @@ public class ScannerTest {
       try (Dataset dataset = testDataset.write(1, totalRows)) {
         try (LanceScanner scanner =
             dataset.newScan(new ScanOptions.Builder().batchSize(50).build())) {
-          try (Splits splits = scanner.planSplits(null)) {
-            // Should return either FilteredReadPlans or Fragments
-            assertTrue(
-                splits.getFilteredReadPlans().isPresent() || splits.getFragments().isPresent(),
-                "Splits should have either filteredReadPlans or fragments");
-          }
+          Splits splits = scanner.planSplits(null);
+          // Should return either FilteredReadPlans or Fragments
+          assertTrue(
+              splits.getFilteredReadPlans().isPresent() || splits.getFragments().isPresent(),
+              "Splits should have either filteredReadPlans or fragments");
         }
       }
     }
@@ -577,10 +576,9 @@ public class ScannerTest {
         try (LanceScanner scanner =
             dataset.newScan(new ScanOptions.Builder().batchSize(50).build())) {
           SplitOptions options = new SplitOptions.Builder().maxRowCount(10).build();
-          try (Splits splits = scanner.planSplits(options)) {
-            assertTrue(
-                splits.getFilteredReadPlans().isPresent() || splits.getFragments().isPresent());
-          }
+          Splits splits = scanner.planSplits(options);
+          assertTrue(
+              splits.getFilteredReadPlans().isPresent() || splits.getFragments().isPresent());
         }
       }
     }
@@ -597,31 +595,28 @@ public class ScannerTest {
       try (Dataset dataset = testDataset.write(1, totalRows)) {
         try (LanceScanner scanner =
             dataset.newScan(new ScanOptions.Builder().batchSize(50).build())) {
-          try (Splits splits = scanner.planSplits(null)) {
-            if (splits.getFilteredReadPlans().isPresent()) {
-              List<FilteredReadPlan> plans = splits.getFilteredReadPlans().get();
-              assertFalse(plans.isEmpty(), "Should have at least one plan");
+          Splits splits = scanner.planSplits(null);
+          if (splits.getFilteredReadPlans().isPresent()) {
+            List<FilteredReadPlan> plans = splits.getFilteredReadPlans().get();
+            assertFalse(plans.isEmpty(), "Should have at least one plan");
 
-              // Verify plan has fragment ranges
-              FilteredReadPlan plan = plans.get(0);
-              Map<Integer, List<long[]>> ranges = plan.getFragmentRanges();
-              assertNotNull(ranges);
-              assertFalse(ranges.isEmpty(), "Plan should have fragment ranges");
+            // Verify plan has fragment ranges
+            FilteredReadPlan plan = plans.get(0);
+            Map<Integer, List<long[]>> ranges = plan.getFragmentRanges();
+            assertNotNull(ranges);
+            assertFalse(ranges.isEmpty(), "Plan should have fragment ranges");
 
-              // Execute each plan and collect total rows
-              int totalScannedRows = 0;
-              for (FilteredReadPlan p : plans) {
-                try (ArrowReader reader = scanner.executeFilteredReadPlan(p)) {
-                  while (reader.loadNextBatch()) {
-                    totalScannedRows += reader.getVectorSchemaRoot().getRowCount();
-                  }
+            // Execute each plan and collect total rows
+            int totalScannedRows = 0;
+            for (FilteredReadPlan p : plans) {
+              try (ArrowReader reader = scanner.executeFilteredReadPlan(p)) {
+                while (reader.loadNextBatch()) {
+                  totalScannedRows += reader.getVectorSchemaRoot().getRowCount();
                 }
               }
-              assertEquals(
-                  totalRows,
-                  totalScannedRows,
-                  "Total scanned rows should match total dataset rows");
             }
+            assertEquals(
+                totalRows, totalScannedRows, "Total scanned rows should match total dataset rows");
           }
         }
       }
@@ -639,19 +634,18 @@ public class ScannerTest {
       try (Dataset dataset = testDataset.write(1, totalRows)) {
         try (LanceScanner scanner =
             dataset.newScan(new ScanOptions.Builder().filter("id < 50").build())) {
-          try (Splits splits = scanner.planSplits(null)) {
-            if (splits.getFilteredReadPlans().isPresent()) {
-              List<FilteredReadPlan> plans = splits.getFilteredReadPlans().get();
-              int totalScannedRows = 0;
-              for (FilteredReadPlan p : plans) {
-                try (ArrowReader reader = scanner.executeFilteredReadPlan(p)) {
-                  while (reader.loadNextBatch()) {
-                    totalScannedRows += reader.getVectorSchemaRoot().getRowCount();
-                  }
+          Splits splits = scanner.planSplits(null);
+          if (splits.getFilteredReadPlans().isPresent()) {
+            List<FilteredReadPlan> plans = splits.getFilteredReadPlans().get();
+            int totalScannedRows = 0;
+            for (FilteredReadPlan p : plans) {
+              try (ArrowReader reader = scanner.executeFilteredReadPlan(p)) {
+                while (reader.loadNextBatch()) {
+                  totalScannedRows += reader.getVectorSchemaRoot().getRowCount();
                 }
               }
-              assertEquals(50, totalScannedRows, "Filtered scan should return 50 rows");
             }
+            assertEquals(50, totalScannedRows, "Filtered scan should return 50 rows");
           }
         }
       }
