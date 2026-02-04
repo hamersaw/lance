@@ -14,8 +14,11 @@
 package org.lance;
 
 import org.lance.ipc.ColumnOrdering;
+import org.lance.ipc.FilteredReadPlan;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
+import org.lance.ipc.SplitOptions;
+import org.lance.ipc.Splits;
 
 import org.apache.arrow.dataset.scanner.Scanner;
 import org.apache.arrow.memory.BufferAllocator;
@@ -37,11 +40,13 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class ScannerTest {
@@ -532,6 +537,121 @@ public class ScannerTest {
               expectedIdStart += batchRowCount;
             }
             assertEquals(limit, rowCount, "Total rows should match the limit");
+          }
+        }
+      }
+    }
+  }
+
+  @Test
+  void testPlanSplitsDefault(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("plan_splits_default").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      int totalRows = 100;
+      try (Dataset dataset = testDataset.write(1, totalRows)) {
+        try (LanceScanner scanner =
+            dataset.newScan(new ScanOptions.Builder().batchSize(50).build())) {
+          try (Splits splits = scanner.planSplits(null)) {
+            // Should return either FilteredReadPlans or Fragments
+            assertTrue(
+                splits.getFilteredReadPlans().isPresent() || splits.getFragments().isPresent(),
+                "Splits should have either filteredReadPlans or fragments");
+          }
+        }
+      }
+    }
+  }
+
+  @Test
+  void testPlanSplitsWithOptions(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("plan_splits_options").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      int totalRows = 100;
+      try (Dataset dataset = testDataset.write(1, totalRows)) {
+        try (LanceScanner scanner =
+            dataset.newScan(new ScanOptions.Builder().batchSize(50).build())) {
+          SplitOptions options = new SplitOptions.Builder().maxRowCount(10).build();
+          try (Splits splits = scanner.planSplits(options)) {
+            assertTrue(
+                splits.getFilteredReadPlans().isPresent() || splits.getFragments().isPresent());
+          }
+        }
+      }
+    }
+  }
+
+  @Test
+  void testExecuteFilteredReadPlan(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("execute_filtered_read_plan").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      int totalRows = 100;
+      try (Dataset dataset = testDataset.write(1, totalRows)) {
+        try (LanceScanner scanner =
+            dataset.newScan(new ScanOptions.Builder().batchSize(50).build())) {
+          try (Splits splits = scanner.planSplits(null)) {
+            if (splits.getFilteredReadPlans().isPresent()) {
+              List<FilteredReadPlan> plans = splits.getFilteredReadPlans().get();
+              assertFalse(plans.isEmpty(), "Should have at least one plan");
+
+              // Verify plan has fragment ranges
+              FilteredReadPlan plan = plans.get(0);
+              Map<Integer, List<long[]>> ranges = plan.getFragmentRanges();
+              assertNotNull(ranges);
+              assertFalse(ranges.isEmpty(), "Plan should have fragment ranges");
+
+              // Execute each plan and collect total rows
+              int totalScannedRows = 0;
+              for (FilteredReadPlan p : plans) {
+                try (ArrowReader reader = scanner.executeFilteredReadPlan(p)) {
+                  while (reader.loadNextBatch()) {
+                    totalScannedRows += reader.getVectorSchemaRoot().getRowCount();
+                  }
+                }
+              }
+              assertEquals(
+                  totalRows,
+                  totalScannedRows,
+                  "Total scanned rows should match total dataset rows");
+            }
+          }
+        }
+      }
+    }
+  }
+
+  @Test
+  void testPlanSplitsWithFilter(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("plan_splits_filter").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      int totalRows = 100;
+      try (Dataset dataset = testDataset.write(1, totalRows)) {
+        try (LanceScanner scanner =
+            dataset.newScan(new ScanOptions.Builder().filter("id < 50").build())) {
+          try (Splits splits = scanner.planSplits(null)) {
+            if (splits.getFilteredReadPlans().isPresent()) {
+              List<FilteredReadPlan> plans = splits.getFilteredReadPlans().get();
+              int totalScannedRows = 0;
+              for (FilteredReadPlan p : plans) {
+                try (ArrowReader reader = scanner.executeFilteredReadPlan(p)) {
+                  while (reader.loadNextBatch()) {
+                    totalScannedRows += reader.getVectorSchemaRoot().getRowCount();
+                  }
+                }
+              }
+              assertEquals(50, totalScannedRows, "Filtered scan should return 50 rows");
+            }
           }
         }
       }

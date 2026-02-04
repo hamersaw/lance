@@ -12,7 +12,10 @@ use arrow_schema::SchemaRef;
 use jni::objects::{JObject, JString};
 use jni::sys::{jboolean, jint, JNI_TRUE};
 use jni::{sys::jlong, JNIEnv};
-use lance::dataset::scanner::{ColumnOrdering, DatasetRecordBatchStream, Scanner};
+use lance::dataset::scanner::{
+    ColumnOrdering, DatasetRecordBatchStream, Scanner, SplitOptions, Splits,
+};
+use lance::io::exec::filtered_read::FilteredReadPlan;
 use lance_index::scalar::inverted::query::{
     BooleanQuery as FtsBooleanQuery, BoostQuery as FtsBoostQuery, FtsQuery,
     MatchQuery as FtsMatchQuery, MultiMatchQuery as FtsMultiMatchQuery, Occur as FtsOccur,
@@ -54,6 +57,19 @@ impl BlockingScanner {
 
     pub fn count_rows(&self) -> Result<u64> {
         let res = RT.block_on(self.inner.count_rows())?;
+        Ok(res)
+    }
+
+    pub fn plan_splits(&self, options: Option<SplitOptions>) -> Result<Splits> {
+        let res = RT.block_on(self.inner.plan_splits(options))?;
+        Ok(res)
+    }
+
+    pub fn execute_filtered_read_plan(
+        &self,
+        plan: FilteredReadPlan,
+    ) -> Result<DatasetRecordBatchStream> {
+        let res = RT.block_on(self.inner.execute_filtered_read_plan(plan))?;
         Ok(res)
     }
 }
@@ -480,4 +496,206 @@ fn inner_count_rows(env: &mut JNIEnv, j_scanner: JObject) -> Result<u64> {
     let scanner_guard =
         unsafe { env.get_rust_field::<_, _, BlockingScanner>(j_scanner, NATIVE_SCANNER) }?;
     scanner_guard.count_rows()
+}
+
+////////////////////////
+// plan_splits        //
+////////////////////////
+#[no_mangle]
+pub extern "system" fn Java_org_lance_ipc_LanceScanner_nativePlanSplits<'local>(
+    mut env: JNIEnv<'local>,
+    j_scanner: JObject,
+    max_size_bytes_obj: JObject, // Optional<Long>
+    max_row_count_obj: JObject,  // Optional<Long>
+) -> JObject<'local> {
+    ok_or_throw!(
+        env,
+        inner_plan_splits(&mut env, j_scanner, max_size_bytes_obj, max_row_count_obj)
+    )
+}
+
+fn inner_plan_splits<'local>(
+    env: &mut JNIEnv<'local>,
+    j_scanner: JObject,
+    max_size_bytes_obj: JObject,
+    max_row_count_obj: JObject,
+) -> Result<JObject<'local>> {
+    let max_size_bytes = env.get_long_opt(&max_size_bytes_obj)?.map(|v| v as usize);
+    let max_row_count = env.get_long_opt(&max_row_count_obj)?.map(|v| v as usize);
+
+    let options = if max_size_bytes.is_some() || max_row_count.is_some() {
+        Some(SplitOptions {
+            max_size_bytes,
+            max_row_count,
+        })
+    } else {
+        None
+    };
+
+    let splits = {
+        let scanner_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingScanner>(j_scanner, NATIVE_SCANNER) }?;
+        scanner_guard.plan_splits(options)?
+    };
+
+    create_java_splits(env, splits)
+}
+
+fn create_java_splits<'a>(env: &mut JNIEnv<'a>, splits: Splits) -> Result<JObject<'a>> {
+    match splits {
+        Splits::FilteredReadPlans(plans) => {
+            // Create ArrayList<FilteredReadPlan>
+            let j_list = env.new_object(
+                "java/util/ArrayList",
+                "(I)V",
+                &[(plans.len() as jint).into()],
+            )?;
+            for plan in plans {
+                let j_plan = create_java_filtered_read_plan(env, plan)?;
+                env.call_method(&j_list, "add", "(Ljava/lang/Object;)Z", &[(&j_plan).into()])?;
+            }
+            // new Splits(filteredReadPlans, null)
+            let j_splits = env.new_object(
+                "org/lance/ipc/Splits",
+                "(Ljava/util/List;Ljava/util/List;)V",
+                &[(&j_list).into(), (&JObject::null()).into()],
+            )?;
+            Ok(j_splits)
+        }
+        Splits::Fragments(fragment_ids) => {
+            // Create ArrayList<Integer>
+            let j_list = env.new_object(
+                "java/util/ArrayList",
+                "(I)V",
+                &[(fragment_ids.len() as jint).into()],
+            )?;
+            for frag_id in fragment_ids {
+                let j_int =
+                    env.new_object("java/lang/Integer", "(I)V", &[(frag_id as jint).into()])?;
+                env.call_method(&j_list, "add", "(Ljava/lang/Object;)Z", &[(&j_int).into()])?;
+            }
+            // new Splits(null, fragments)
+            let j_splits = env.new_object(
+                "org/lance/ipc/Splits",
+                "(Ljava/util/List;Ljava/util/List;)V",
+                &[(&JObject::null()).into(), (&j_list).into()],
+            )?;
+            Ok(j_splits)
+        }
+    }
+}
+
+fn create_java_filtered_read_plan<'a>(
+    env: &mut JNIEnv<'a>,
+    plan: FilteredReadPlan,
+) -> Result<JObject<'a>> {
+    let j_plan = env.new_object("org/lance/ipc/FilteredReadPlan", "()V", &[])?;
+
+    // Store the native handle as a boxed raw pointer
+    let boxed = Box::new(plan.clone());
+    let ptr = Box::into_raw(boxed) as jlong;
+    env.set_field(&j_plan, "nativeHandle", "J", ptr.into())?;
+
+    // Create HashMap<Integer, List<long[]>> for fragmentRanges
+    let j_map = env.new_object("java/util/HashMap", "()V", &[])?;
+    for (frag_id, ranges) in &plan.rows {
+        let j_key = env.new_object("java/lang/Integer", "(I)V", &[(*frag_id as jint).into()])?;
+        let j_range_list = env.new_object(
+            "java/util/ArrayList",
+            "(I)V",
+            &[(ranges.len() as jint).into()],
+        )?;
+        for range in ranges {
+            let j_arr = env.new_long_array(2)?;
+            env.set_long_array_region(&j_arr, 0, &[range.start as jlong, range.end as jlong])?;
+            env.call_method(
+                &j_range_list,
+                "add",
+                "(Ljava/lang/Object;)Z",
+                &[(&j_arr).into()],
+            )?;
+        }
+        env.call_method(
+            &j_map,
+            "put",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[(&j_key).into(), (&j_range_list).into()],
+        )?;
+    }
+    env.set_field(
+        &j_plan,
+        "fragmentRanges",
+        "Ljava/util/Map;",
+        (&j_map).into(),
+    )?;
+
+    // Set scanRangeAfterFilter if present
+    if let Some(ref scan_range) = plan.scan_range_after_filter {
+        let j_arr = env.new_long_array(2)?;
+        env.set_long_array_region(
+            &j_arr,
+            0,
+            &[scan_range.start as jlong, scan_range.end as jlong],
+        )?;
+        env.set_field(&j_plan, "scanRangeAfterFilter", "[J", (&j_arr).into())?;
+    }
+
+    Ok(j_plan)
+}
+
+/////////////////////////////
+// FilteredReadPlan release //
+/////////////////////////////
+#[no_mangle]
+pub extern "system" fn Java_org_lance_ipc_FilteredReadPlan_releaseNativePlan(
+    _env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+) {
+    if handle != 0 {
+        unsafe {
+            drop(Box::from_raw(handle as *mut FilteredReadPlan));
+        }
+    }
+}
+
+/////////////////////////////////////
+// execute_filtered_read_plan      //
+/////////////////////////////////////
+#[no_mangle]
+pub extern "system" fn Java_org_lance_ipc_LanceScanner_nativeExecuteFilteredReadPlan(
+    mut env: JNIEnv,
+    j_scanner: JObject,
+    plan_handle: jlong,
+    stream_addr: jlong,
+) {
+    ok_or_throw_without_return!(
+        env,
+        inner_execute_filtered_read_plan(&mut env, j_scanner, plan_handle, stream_addr)
+    );
+}
+
+fn inner_execute_filtered_read_plan(
+    env: &mut JNIEnv,
+    j_scanner: JObject,
+    plan_handle: jlong,
+    stream_addr: jlong,
+) -> Result<()> {
+    if plan_handle == 0 {
+        return Err(Error::input_error(
+            "FilteredReadPlan has already been closed".to_string(),
+        ));
+    }
+    // Clone the plan so the handle remains valid for future calls
+    let plan = unsafe { &*(plan_handle as *const FilteredReadPlan) };
+    let plan_clone = plan.clone();
+
+    let record_batch_stream = {
+        let scanner_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingScanner>(j_scanner, NATIVE_SCANNER) }?;
+        scanner_guard.execute_filtered_read_plan(plan_clone)?
+    };
+    let ffi_stream = to_ffi_arrow_array_stream(record_batch_stream, RT.handle().clone())?;
+    unsafe { std::ptr::write_unaligned(stream_addr as *mut FFI_ArrowArrayStream, ffi_stream) }
+    Ok(())
 }

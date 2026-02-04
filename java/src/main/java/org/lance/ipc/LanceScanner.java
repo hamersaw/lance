@@ -164,4 +164,49 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
   }
 
   private native long nativeCountRows();
+
+  /**
+   * Plan splits for distributed execution.
+   *
+   * <p>This method divides the scan into splits that can be processed in parallel. Returns a {@link
+   * Splits} object which is either a list of {@link FilteredReadPlan} or a list of fragment IDs.
+   *
+   * @param options split options, or null to use defaults
+   * @return a {@link Splits} object describing how to divide the scan
+   */
+  public Splits planSplits(SplitOptions options) {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeScannerHandle != 0, "Scanner is closed");
+      return nativePlanSplits(
+          options != null ? options.getMaxSizeBytes() : Optional.empty(),
+          options != null ? options.getMaxRowCount() : Optional.empty());
+    }
+  }
+
+  private native Splits nativePlanSplits(Optional<Long> maxSizeBytes, Optional<Long> maxRowCount);
+
+  /**
+   * Execute a single {@link FilteredReadPlan}.
+   *
+   * <p>Each plan can be executed independently, potentially on different workers. The returned
+   * reader applies any per-fragment residual filters and scan range that are part of the plan.
+   *
+   * @param plan the plan to execute
+   * @return an ArrowReader that yields record batches for the plan
+   */
+  public ArrowReader executeFilteredReadPlan(FilteredReadPlan plan) {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeScannerHandle != 0, "Scanner is closed");
+      Preconditions.checkNotNull(plan);
+      try (ArrowArrayStream s = ArrowArrayStream.allocateNew(allocator)) {
+        nativeExecuteFilteredReadPlan(plan.getNativeHandle(), s.memoryAddress());
+        return Data.importArrayStream(allocator, s);
+      } catch (IOException e) {
+        throw new RuntimeException(e);
+      }
+    }
+  }
+
+  private native void nativeExecuteFilteredReadPlan(long planHandle, long streamAddress)
+      throws IOException;
 }
