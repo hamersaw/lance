@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use arrow::pyarrow::*;
 use arrow_array::RecordBatchReader;
-use lance::dataset::scanner::{ExecutionSummaryCounts, SplitOptions as LanceSplitOptions};
+use lance::dataset::scanner::{ExecutionSummaryCounts, SplitOptions as LanceSplitOptions, Splits};
 use lance::io::exec::filtered_read::FilteredReadPlan;
 use pyo3::prelude::*;
 use pyo3::pyclass;
@@ -157,7 +157,7 @@ impl Scanner {
         self_: PyRef<'_, Self>,
         max_size_bytes: Option<usize>,
         max_row_count: Option<usize>,
-    ) -> PyResult<Vec<PyFilteredReadPlan>> {
+    ) -> PyResult<PySplits> {
         let scanner = self_.scanner.clone();
         let options = if max_size_bytes.is_some() || max_row_count.is_some() {
             Some(LanceSplitOptions {
@@ -174,10 +174,10 @@ impl Scanner {
             })?
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
-        Ok(splits.into_iter().map(PyFilteredReadPlan::from).collect())
+        Ok(PySplits::from(splits))
     }
 
-    fn execute_split(
+    fn execute_filtered_read_plan(
         self_: PyRef<'_, Self>,
         split: PyFilteredReadPlan,
     ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
@@ -185,11 +185,54 @@ impl Scanner {
         let inner = split.inner;
         let stream = rt()
             .spawn(Some(self_.py()), async move {
-                scanner.execute_split(inner).await
+                scanner.execute_filtered_read_plan(inner).await
             })?
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
         Ok(PyArrowType(Box::new(LanceReader::from_stream(stream))))
+    }
+}
+
+/// Result of [`Scanner::plan_splits`], representing how to divide a scan
+/// for distributed execution.
+#[pyclass(name = "Splits", module = "_lib")]
+#[derive(Clone)]
+pub struct PySplits {
+    /// The filtered read plans, if this is a `FilteredReadPlans` variant.
+    #[pyo3(get)]
+    pub filtered_read_plans: Option<Vec<PyFilteredReadPlan>>,
+    /// The fragment IDs, if this is a `Fragments` variant.
+    #[pyo3(get)]
+    pub fragments: Option<Vec<u32>>,
+}
+
+impl From<Splits> for PySplits {
+    fn from(splits: Splits) -> Self {
+        match splits {
+            Splits::FilteredReadPlans(plans) => Self {
+                filtered_read_plans: Some(
+                    plans.into_iter().map(PyFilteredReadPlan::from).collect(),
+                ),
+                fragments: None,
+            },
+            Splits::Fragments(fragment_ids) => Self {
+                filtered_read_plans: None,
+                fragments: Some(fragment_ids),
+            },
+        }
+    }
+}
+
+#[pymethods]
+impl PySplits {
+    fn __repr__(&self) -> String {
+        if let Some(plans) = &self.filtered_read_plans {
+            format!("Splits(filtered_read_plans=[{} plans])", plans.len())
+        } else if let Some(fragments) = &self.fragments {
+            format!("Splits(fragments={:?})", fragments)
+        } else {
+            "Splits()".to_string()
+        }
     }
 }
 
@@ -204,7 +247,7 @@ pub struct PyFilteredReadPlan {
     /// Row offset range to apply after filtering (skip N rows, take M rows).
     #[pyo3(get)]
     pub scan_range_after_filter: Option<(u64, u64)>,
-    /// The inner Rust FilteredReadPlan, retained for execute_split.
+    /// The inner Rust FilteredReadPlan, retained for execute_filtered_read_plan.
     pub(crate) inner: FilteredReadPlan,
 }
 

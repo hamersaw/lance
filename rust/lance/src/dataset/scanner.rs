@@ -625,6 +625,16 @@ pub struct SplitOptions {
     pub max_row_count: Option<usize>,
 }
 
+/// Result of [`Scanner::plan_splits`], representing how to divide a scan
+/// for distributed execution.
+#[derive(Debug, Clone)]
+pub enum Splits {
+    /// Detailed per-fragment read plans with row ranges and residual filters.
+    FilteredReadPlans(Vec<FilteredReadPlan>),
+    /// Fragment IDs only — each fragment is a split.
+    Fragments(Vec<u32>),
+}
+
 /// Represents a user-requested take operation
 #[derive(Debug, Clone)]
 pub enum TakeOperation {
@@ -4037,10 +4047,7 @@ impl Scanner {
     /// [`FilteredReadPlan`]s, where each plan represents a split containing at most
     /// `max_rows_per_split` rows. Splits can be executed independently in parallel
     /// across distributed workers.
-    pub async fn plan_splits(
-        &self,
-        options: Option<SplitOptions>,
-    ) -> Result<Vec<FilteredReadPlan>> {
+    pub async fn plan_splits(&self, options: Option<SplitOptions>) -> Result<Splits> {
         // Attempt to use filtering to prune fragments / rows
         let use_scalar_index = self.use_scalar_index && (self.prefilter || self.nearest.is_none());
         let mut filter_plan = self.create_filter_plan(use_scalar_index).await?;
@@ -4052,14 +4059,18 @@ impl Scanner {
                 filtered_read_exec.get_or_create_plan(ctx).await?
             }
             None => {
-                // TODO @hamersaw - create FilteredReadPlan with RowAddrSelect::Full after calling
-                // load_fragment.
-
-                // TODO - do we need to handle deleted rows / self.include_deleted_rows here?
-                //     ^^^ YES `get_or_create_plan` does. so it should return a bitmap of EXACTLY
-                //     the rows to read regardless of `include_deleted_rows` configuration.
-
-                unimplemented!()
+                let fragments: Vec<u32> = self
+                    .fragments
+                    .as_ref()
+                    .map(|frags| frags.iter().map(|f| f.id as u32).collect())
+                    .unwrap_or_else(|| {
+                        self.dataset
+                            .fragments()
+                            .iter()
+                            .map(|f| f.id as u32)
+                            .collect()
+                    });
+                return Ok(Splits::Fragments(fragments));
             }
         };
 
@@ -4178,18 +4189,21 @@ impl Scanner {
             })
             .collect();
 
-        Ok(splits)
+        Ok(Splits::FilteredReadPlans(splits))
     }
 
-    /// Execute a single split from [`plan_splits`].
+    /// Execute a single [`FilteredReadPlan`].
     ///
-    /// This takes one [`FilteredReadPlan`] value (as returned by [`plan_splits`])
-    /// and executes it, returning a stream of [`RecordBatch`]es. Each split can
-    /// be executed independently, potentially on different workers.
+    /// This takes a [`FilteredReadPlan`] and executes it, returning a stream
+    /// of [`RecordBatch`]es. Each plan can be executed independently, potentially
+    /// on different workers.
     ///
     /// The returned stream applies any per-fragment residual filters and
-    /// `scan_range_after_filter` that are part of the split.
-    pub async fn execute_split(&self, split: FilteredReadPlan) -> Result<DatasetRecordBatchStream> {
+    /// `scan_range_after_filter` that are part of the plan.
+    pub async fn execute_filtered_read_plan(
+        &self,
+        split: FilteredReadPlan,
+    ) -> Result<DatasetRecordBatchStream> {
         // 1. Compute the read projection, extending it with columns needed by
         //    residual filters so the fragment reader loads them.
         let output_projection = self.projection_plan.physical_projection.clone();

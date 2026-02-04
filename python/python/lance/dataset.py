@@ -57,6 +57,7 @@ from .lance import (
     IOStats,
     LanceSchema,
     ScanStatistics,
+    Splits,
     _Dataset,
     _MergeInsertBuilder,
     _Scanner,
@@ -5228,12 +5229,12 @@ class LanceScanner(pa.dataset.Scanner):
         *,
         max_size_bytes: Optional[int] = None,
         max_row_count: Optional[int] = None,
-    ) -> List[FilteredReadPlan]:
+    ) -> Splits:
         """Plan splits for parallel scanning.
 
         This method divides the scan into splits that can be processed in parallel.
-        Each split is a :class:`FilteredReadPlan` specifying which rows to read
-        from which fragments, along with any residual filters.
+        Returns a :class:`Splits` object which is either a list of
+        :class:`FilteredReadPlan` or a list of fragment IDs.
 
         Parameters
         ----------
@@ -5247,12 +5248,11 @@ class LanceScanner(pa.dataset.Scanner):
 
         Returns
         -------
-        List[FilteredReadPlan]
-            A list of plans, where each plan contains:
-            - fragment_ranges: List of (fragment_id, [(start, end), ...]) tuples
-              describing row ranges to read per fragment.
-            - scan_range_after_filter: Optional tuple (start, end) specifying
-              row offset range to apply after filtering
+        Splits
+            A :class:`Splits` object with either:
+            - ``filtered_read_plans``: A list of :class:`FilteredReadPlan`,
+              each containing fragment_ranges and scan_range_after_filter.
+            - ``fragments``: A list of fragment IDs.
 
         Examples
         --------
@@ -5260,44 +5260,37 @@ class LanceScanner(pa.dataset.Scanner):
         >>> dataset = lance.dataset("my_dataset")
         >>> scanner = dataset.scanner()
         >>> splits = scanner.plan_splits(max_row_count=10000)
-        >>> for split in splits:
-        ...     for frag_id, ranges in split.fragment_ranges:
-        ...         row_count = sum(end - start for start, end in ranges)
-        ...         print(f"Fragment {frag_id}: {row_count} rows")
+        >>> if splits.filtered_read_plans is not None:
+        ...     for plan in splits.filtered_read_plans:
+        ...         for frag_id, ranges in plan.fragment_ranges:
+        ...             row_count = sum(end - start for start, end in ranges)
+        ...             print(f"Fragment {frag_id}: {row_count} rows")
         """
         return self._scanner.plan_splits(
             max_size_bytes=max_size_bytes,
             max_row_count=max_row_count,
         )
 
-    def execute_split(self, split: FilteredReadPlan) -> pa.RecordBatchReader:
-        """Execute a single split from :meth:`plan_splits`.
+    def execute_filtered_read_plan(
+        self, plan: FilteredReadPlan
+    ) -> pa.RecordBatchReader:
+        """Execute a single :class:`FilteredReadPlan`.
 
-        Each split can be executed independently, potentially on different
+        Each plan can be executed independently, potentially on different
         workers. The returned reader applies any per-fragment residual filters
-        and ``scan_range_after_filter`` that are part of the split.
+        and ``scan_range_after_filter`` that are part of the plan.
 
         Parameters
         ----------
-        split : FilteredReadPlan
-            A plan as returned by :meth:`plan_splits`.
+        plan : FilteredReadPlan
+            The plan to execute.
 
         Returns
         -------
         pa.RecordBatchReader
-            A reader that yields record batches for the split.
-
-        Examples
-        --------
-        >>> import lance
-        >>> dataset = lance.dataset("my_dataset")
-        >>> scanner = dataset.scanner(filter="id > 10")
-        >>> splits = scanner.plan_splits(max_row_count=10000)
-        >>> for split in splits:
-        ...     reader = scanner.execute_split(split)
-        ...     table = reader.read_all()
+            A reader that yields record batches for the plan.
         """
-        return self._scanner.execute_split(split)
+        return self._scanner.execute_filtered_read_plan(plan)
 
 
 class DatasetOptimizer:
