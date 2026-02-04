@@ -2403,11 +2403,6 @@ impl Scanner {
         }?;
 
         let mut filtered_read_options = FilteredReadOptions::new(projection);
-        if self.fragments.is_some() {
-            filtered_read_options = filtered_read_options
-                .with_fragments(self.fragments.as_ref().unwrap().clone().into());
-        }
-
         if let Some(fragment) = self.fragments.as_ref() {
             filtered_read_options =
                 filtered_read_options.with_fragments(Arc::new(fragment.clone()));
