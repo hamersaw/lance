@@ -5268,6 +5268,8 @@ class LanceScanner(pa.dataset.Scanner):
         ...         for frag_id, ranges in plan.fragment_ranges:
         ...             row_count = sum(end - start for start, end in ranges)
         ...             print(f"Fragment {frag_id}: {row_count} rows")
+        Fragment 0: 2 rows
+        Fragment 0: 1 rows
         """
         return self._scanner.plan_splits(
             max_size_bytes=max_size_bytes,
