@@ -6155,6 +6155,7 @@ mod test {
         scan.filter("filterable > 5").unwrap();
         scan.nearest("vector", query_key.as_ref(), 1).unwrap();
         scan.minimum_nprobes(100);
+        scan.ef(100);
         scan.with_row_id();
 
         let batches = scan
