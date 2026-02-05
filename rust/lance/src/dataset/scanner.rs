@@ -2144,7 +2144,24 @@ impl Scanner {
         Ok(plan)
     }
 
-    // TODO @hamersaw - docs
+    /// Create the source execution plan for the scan (Stage 1 of [`Self::create_plan`]).
+    ///
+    /// Selects the appropriate source strategy based on the scan configuration:
+    /// - Vector search ([`Self::vector_search_source`]) when a nearest-neighbor query is set.
+    /// - Full-text search ([`Self::fts_search_source`]) when a full-text query is set.
+    /// - Take-based scan ([`Self::take_source`]) when the filter is a simple row selection.
+    /// - Filtered read scan ([`Self::filtered_read_source`]) for all other cases.
+    ///
+    /// Setting both a nearest-neighbor query and a full-text query is not supported.
+    ///
+    /// The `filter_plan` may be modified by this method. For example, if the filter is
+    /// fully pushed down into the source, the refine step is disabled. Similarly, if the
+    /// filter is recognized as a take operation, the remaining expression (if any) replaces
+    /// the original filter plan.
+    ///
+    /// Returns a tuple of the source [`ExecutionPlan`] and a boolean indicating whether a
+    /// limit node should still be applied in later stages (`true` means the limit was **not**
+    /// pushed into the source).
     async fn create_execution_plan(
         &self,
         filter_plan: &mut FilterPlan,
@@ -9762,5 +9779,108 @@ mod test {
             }
             Splits::Fragments(_) => panic!("Expected FilteredReadPlans"),
         }
+    }
+
+    #[test]
+    fn test_bin_pack_empty() {
+        let bins = bin_pack(vec![], 100);
+        assert!(bins.is_empty());
+    }
+
+    #[test]
+    fn test_bin_pack_single_item_fits() {
+        let items = vec![BinItem {
+            fragment_id: 0,
+            ranges: vec![0..50],
+            row_count: 50,
+        }];
+        let bins = bin_pack(items, 100);
+        assert_eq!(bins.len(), 1);
+        assert_eq!(bins[0].len(), 1);
+        assert_eq!(bins[0][0].fragment_id, 0);
+    }
+
+    #[test]
+    fn test_bin_pack_single_item_exceeds_maximum() {
+        let items = vec![BinItem {
+            fragment_id: 0,
+            ranges: vec![0..200],
+            row_count: 200,
+        }];
+        let bins = bin_pack(items, 100);
+        assert_eq!(bins.len(), 1);
+        assert_eq!(bins[0].len(), 1);
+        assert_eq!(bins[0][0].row_count, 200);
+    }
+
+    #[test]
+    fn test_bin_pack_multiple_items_fit_single_bin() {
+        let items = vec![
+            BinItem {
+                fragment_id: 0,
+                ranges: vec![0..30],
+                row_count: 30,
+            },
+            BinItem {
+                fragment_id: 1,
+                ranges: vec![0..30],
+                row_count: 30,
+            },
+            BinItem {
+                fragment_id: 2,
+                ranges: vec![0..30],
+                row_count: 30,
+            },
+        ];
+        let bins = bin_pack(items, 100);
+        assert_eq!(bins.len(), 1);
+        assert_eq!(bins[0].len(), 3);
+    }
+
+    #[test]
+    fn test_bin_pack_items_split_across_bins() {
+        let items = vec![
+            BinItem {
+                fragment_id: 0,
+                ranges: vec![0..60],
+                row_count: 60,
+            },
+            BinItem {
+                fragment_id: 1,
+                ranges: vec![0..60],
+                row_count: 60,
+            },
+            BinItem {
+                fragment_id: 2,
+                ranges: vec![0..60],
+                row_count: 60,
+            },
+        ];
+        let bins = bin_pack(items, 100);
+        // 60+60 > 100, so each item needs its own bin
+        assert_eq!(bins.len(), 3);
+        for bin in &bins {
+            assert_eq!(bin.len(), 1);
+        }
+    }
+
+    #[test]
+    fn test_bin_pack_all_rows_preserved() {
+        let items: Vec<BinItem> = (0..10)
+            .map(|i| BinItem {
+                fragment_id: i,
+                ranges: vec![0..(i as u64 * 10 + 10)],
+                row_count: i as u64 * 10 + 10,
+            })
+            .collect();
+        let total_input: u64 = items.iter().map(|i| i.row_count).sum();
+
+        let bins = bin_pack(items, 75);
+        let total_output: u64 = bins
+            .iter()
+            .flat_map(|bin| bin.iter())
+            .map(|item| item.row_count)
+            .sum();
+        assert_eq!(total_input, total_output);
     }
 }
