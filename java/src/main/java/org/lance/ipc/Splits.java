@@ -25,14 +25,15 @@ import java.util.Optional;
  * <ul>
  *   <li>{@link #getFilteredReadPlans()} - detailed per-fragment read plans with row ranges and
  *       residual filters.
- *   <li>{@link #getFragments()} - fragment IDs only, where each fragment is a split.
+ *   <li>{@link #getFragments()} - fragment IDs only, where each split is a collection of fragment
+ *       IDs.
  * </ul>
  */
 public class Splits {
   private final List<FilteredReadPlan> filteredReadPlans;
-  private final List<Integer> fragments;
+  private final List<List<Integer>> fragments;
 
-  Splits(List<FilteredReadPlan> filteredReadPlans, List<Integer> fragments) {
+  Splits(List<FilteredReadPlan> filteredReadPlans, List<List<Integer>> fragments) {
     this.filteredReadPlans = filteredReadPlans;
     this.fragments = fragments;
   }
@@ -47,12 +48,12 @@ public class Splits {
   }
 
   /**
-   * Get the fragment IDs, if this is a {@code Fragments} variant.
+   * Get the fragment IDs per split, if this is a {@code Fragments} variant.
    *
-   * @return Optional containing the list of fragment IDs, or empty if this is a {@code
-   *     FilteredReadPlans} variant.
+   * @return Optional containing the list of splits (each split is a list of fragment IDs), or empty
+   *     if this is a {@code FilteredReadPlans} variant.
    */
-  public Optional<List<Integer>> getFragments() {
+  public Optional<List<List<Integer>>> getFragments() {
     return Optional.ofNullable(fragments);
   }
 }

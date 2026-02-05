@@ -631,8 +631,8 @@ pub struct SplitOptions {
 pub enum Splits {
     /// Detailed per-fragment read plans with row ranges and residual filters.
     FilteredReadPlans(Vec<FilteredReadPlan>),
-    /// Fragment IDs only — each fragment is a split.
-    Fragments(Vec<u32>),
+    /// Fragment IDs only — each split is a collection of fragment IDs.
+    Fragments(Vec<Vec<u32>>),
 }
 
 /// Represents a user-requested take operation
@@ -4064,15 +4064,15 @@ impl Scanner {
                 filtered_read_exec.get_or_create_plan(ctx).await?
             }
             None => {
-                let fragments: Vec<u32> = self
+                let fragments: Vec<Vec<u32>> = self
                     .fragments
                     .as_ref()
-                    .map(|frags| frags.iter().map(|f| f.id as u32).collect())
+                    .map(|frags| frags.iter().map(|f| vec![f.id as u32]).collect())
                     .unwrap_or_else(|| {
                         self.dataset
                             .fragments()
                             .iter()
-                            .map(|f| f.id as u32)
+                            .map(|f| vec![f.id as u32])
                             .collect()
                     });
                 return Ok(Splits::Fragments(fragments));
@@ -9404,5 +9404,363 @@ mod test {
             "Tasks should have finished within 10 seconds but there are still {} tasks running",
             runtime.handle().metrics().num_alive_tasks()
         );
+    }
+
+    // =========================================================================
+    // plan_splits tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_plan_splits_basic_returns_filtered_read_plans() {
+        // Basic scan should return FilteredReadPlans variant
+        let dataset = lance_datagen::gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(4), FragmentRowCount::from(100))
+            .await
+            .unwrap();
+
+        let splits = dataset.scan().plan_splits(None).await.unwrap();
+
+        match splits {
+            Splits::FilteredReadPlans(plans) => {
+                assert!(!plans.is_empty(), "Should have at least one plan");
+                // Verify all fragments are covered
+                let total_rows: u64 = plans
+                    .iter()
+                    .flat_map(|p| p.rows.values())
+                    .flatten()
+                    .map(|r| r.end - r.start)
+                    .sum();
+                assert_eq!(total_rows, 400, "Should cover all 400 rows");
+            }
+            Splits::Fragments(_) => panic!("Expected FilteredReadPlans for basic scan"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_plan_splits_with_filter() {
+        // Filtered scan should still return FilteredReadPlans
+        let dataset = lance_datagen::gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(4), FragmentRowCount::from(100))
+            .await
+            .unwrap();
+
+        let splits = dataset
+            .scan()
+            .filter("id >= 50")
+            .unwrap()
+            .plan_splits(None)
+            .await
+            .unwrap();
+
+        match splits {
+            Splits::FilteredReadPlans(plans) => {
+                assert!(!plans.is_empty(), "Should have at least one plan");
+                // Each plan should have filters for the fragments it covers
+                for plan in &plans {
+                    assert!(!plan.rows.is_empty(), "Each plan should have rows");
+                }
+            }
+            Splits::Fragments(_) => panic!("Expected FilteredReadPlans for filtered scan"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_plan_splits_with_max_row_count() {
+        // Splits should respect max_row_count constraint
+        let dataset = lance_datagen::gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(4), FragmentRowCount::from(100))
+            .await
+            .unwrap();
+
+        let options = SplitOptions {
+            max_row_count: Some(50),
+            max_size_bytes: None,
+        };
+
+        let splits = dataset.scan().plan_splits(Some(options)).await.unwrap();
+
+        match splits {
+            Splits::FilteredReadPlans(plans) => {
+                // With 400 rows and max 50 per split, we need at least 8 splits
+                assert!(
+                    plans.len() >= 8,
+                    "Should have at least 8 splits for 400 rows with max 50 per split, got {}",
+                    plans.len()
+                );
+                // Verify each split has at most 50 rows
+                for (i, plan) in plans.iter().enumerate() {
+                    let rows: u64 = plan.rows.values().flatten().map(|r| r.end - r.start).sum();
+                    assert!(
+                        rows <= 50,
+                        "Split {} has {} rows, expected at most 50",
+                        i,
+                        rows
+                    );
+                }
+            }
+            Splits::Fragments(_) => panic!("Expected FilteredReadPlans"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_plan_splits_with_max_size_bytes() {
+        // Splits should respect max_size_bytes constraint
+        // Int32 is 4 bytes, so 40 bytes = 10 rows
+        let dataset = lance_datagen::gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(4), FragmentRowCount::from(100))
+            .await
+            .unwrap();
+
+        let options = SplitOptions {
+            max_row_count: None,
+            max_size_bytes: Some(40), // Should fit ~10 rows with 4-byte Int32
+        };
+
+        let splits = dataset.scan().plan_splits(Some(options)).await.unwrap();
+
+        match splits {
+            Splits::FilteredReadPlans(plans) => {
+                // With 400 rows and max ~10 per split, we need at least 40 splits
+                assert!(
+                    plans.len() >= 40,
+                    "Should have at least 40 splits, got {}",
+                    plans.len()
+                );
+            }
+            Splits::Fragments(_) => panic!("Expected FilteredReadPlans"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_plan_splits_with_both_constraints_uses_minimum() {
+        // When both constraints are set, the stricter one should be used
+        let dataset = lance_datagen::gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(4), FragmentRowCount::from(100))
+            .await
+            .unwrap();
+
+        // max_row_count = 100 rows, max_size_bytes = 40 bytes (~10 rows for Int32)
+        // The byte constraint is stricter, so should use ~10 rows per split
+        let options = SplitOptions {
+            max_row_count: Some(100),
+            max_size_bytes: Some(40),
+        };
+
+        let splits = dataset.scan().plan_splits(Some(options)).await.unwrap();
+
+        match splits {
+            Splits::FilteredReadPlans(plans) => {
+                // Should use the byte constraint (~10 rows), not the row count (100 rows)
+                assert!(
+                    plans.len() >= 40,
+                    "Should have at least 40 splits when byte constraint is stricter, got {}",
+                    plans.len()
+                );
+            }
+            Splits::Fragments(_) => panic!("Expected FilteredReadPlans"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_plan_splits_default_options() {
+        // Default should use 128 MiB split size
+        let dataset = lance_datagen::gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(4), FragmentRowCount::from(100))
+            .await
+            .unwrap();
+
+        // With default 128 MiB and small dataset, should get few splits
+        let splits = dataset.scan().plan_splits(None).await.unwrap();
+
+        match splits {
+            Splits::FilteredReadPlans(plans) => {
+                // Small dataset should fit in very few splits with 128 MiB default
+                // Bin packing may combine fragments
+                assert!(!plans.is_empty(), "Should have at least one plan");
+            }
+            Splits::Fragments(_) => panic!("Expected FilteredReadPlans"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_plan_splits_single_fragment() {
+        // Dataset with single fragment should work correctly
+        let dataset = lance_datagen::gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(100))
+            .await
+            .unwrap();
+
+        let options = SplitOptions {
+            max_row_count: Some(25),
+            max_size_bytes: None,
+        };
+
+        let splits = dataset.scan().plan_splits(Some(options)).await.unwrap();
+
+        match splits {
+            Splits::FilteredReadPlans(plans) => {
+                // Single fragment with 100 rows, max 25 per split -> 4 splits
+                assert!(
+                    plans.len() >= 4,
+                    "Should have at least 4 splits for 100 rows with max 25 per split, got {}",
+                    plans.len()
+                );
+                // All plans should reference fragment 0
+                for plan in &plans {
+                    assert!(
+                        plan.rows.keys().all(|&frag_id| frag_id == 0),
+                        "Single fragment dataset should only have fragment 0"
+                    );
+                }
+            }
+            Splits::Fragments(_) => panic!("Expected FilteredReadPlans"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_plan_splits_fragment_larger_than_max() {
+        // Fragment exceeding max_row_count should be split into smaller chunks
+        let dataset = lance_datagen::gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(100))
+            .await
+            .unwrap();
+
+        let options = SplitOptions {
+            max_row_count: Some(10),
+            max_size_bytes: None,
+        };
+
+        let splits = dataset.scan().plan_splits(Some(options)).await.unwrap();
+
+        match splits {
+            Splits::FilteredReadPlans(plans) => {
+                // 100 rows with max 10 per split -> at least 10 splits
+                assert!(
+                    plans.len() >= 10,
+                    "Should have at least 10 splits, got {}",
+                    plans.len()
+                );
+                // Verify each split respects the max
+                for (i, plan) in plans.iter().enumerate() {
+                    let rows: u64 = plan.rows.values().flatten().map(|r| r.end - r.start).sum();
+                    assert!(
+                        rows <= 10,
+                        "Split {} has {} rows, expected at most 10",
+                        i,
+                        rows
+                    );
+                }
+            }
+            Splits::Fragments(_) => panic!("Expected FilteredReadPlans"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_plan_splits_vector_search_returns_fragments() {
+        // Vector search should return Fragments variant, not FilteredReadPlans
+        let (_tmp_dir, dataset) = make_binary_vector_dataset().await.unwrap();
+
+        let query = UInt8Array::from(vec![0b0000_1111u8, 0, 0, 0]);
+        let splits = dataset
+            .scan()
+            .nearest("bin", &query, 2)
+            .unwrap()
+            .plan_splits(None)
+            .await
+            .unwrap();
+
+        match splits {
+            Splits::Fragments(frags) => {
+                assert!(!frags.is_empty(), "Should have fragment groups");
+                // Each fragment should be in its own group for vector search
+                for frag_group in &frags {
+                    assert_eq!(
+                        frag_group.len(),
+                        1,
+                        "Each fragment group should contain one fragment"
+                    );
+                }
+            }
+            Splits::FilteredReadPlans(_) => {
+                panic!("Expected Fragments variant for vector search")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_plan_splits_bin_packing_combines_small_fragments() {
+        // Small fragments should be combined via bin packing
+        let dataset = lance_datagen::gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(10), FragmentRowCount::from(10))
+            .await
+            .unwrap();
+
+        let options = SplitOptions {
+            max_row_count: Some(50),
+            max_size_bytes: None,
+        };
+
+        let splits = dataset.scan().plan_splits(Some(options)).await.unwrap();
+
+        match splits {
+            Splits::FilteredReadPlans(plans) => {
+                // 100 total rows, max 50 per split -> bin packing should give 2 splits
+                assert!(
+                    plans.len() <= 3,
+                    "Bin packing should combine small fragments, got {} splits",
+                    plans.len()
+                );
+                // Some plans should have multiple fragments
+                let multi_frag_plans = plans.iter().filter(|p| p.rows.len() > 1).count();
+                assert!(
+                    multi_frag_plans > 0,
+                    "At least one plan should combine multiple fragments"
+                );
+            }
+            Splits::Fragments(_) => panic!("Expected FilteredReadPlans"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_plan_splits_preserves_all_rows() {
+        // Verify that all rows are accounted for across all splits
+        let dataset = lance_datagen::gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(5), FragmentRowCount::from(73))
+            .await
+            .unwrap();
+
+        let options = SplitOptions {
+            max_row_count: Some(30),
+            max_size_bytes: None,
+        };
+
+        let splits = dataset.scan().plan_splits(Some(options)).await.unwrap();
+
+        match splits {
+            Splits::FilteredReadPlans(plans) => {
+                let total_rows: u64 = plans
+                    .iter()
+                    .flat_map(|p| p.rows.values())
+                    .flatten()
+                    .map(|r| r.end - r.start)
+                    .sum();
+                assert_eq!(
+                    total_rows,
+                    5 * 73,
+                    "All rows should be accounted for in splits"
+                );
+            }
+            Splits::Fragments(_) => panic!("Expected FilteredReadPlans"),
+        }
     }
 }

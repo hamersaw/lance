@@ -573,17 +573,36 @@ fn create_java_splits<'a>(
             )?;
             Ok(j_splits)
         }
-        Splits::Fragments(fragment_ids) => {
-            // Create ArrayList<Integer>
+        Splits::Fragments(splits) => {
+            // Create ArrayList<List<Integer>> - outer list of splits
             let j_list = env.new_object(
                 "java/util/ArrayList",
                 "(I)V",
-                &[(fragment_ids.len() as jint).into()],
+                &[(splits.len() as jint).into()],
             )?;
-            for frag_id in fragment_ids {
-                let j_int =
-                    env.new_object("java/lang/Integer", "(I)V", &[(frag_id as jint).into()])?;
-                env.call_method(&j_list, "add", "(Ljava/lang/Object;)Z", &[(&j_int).into()])?;
+            for split in splits {
+                // Create inner ArrayList<Integer> for each split's fragment IDs
+                let j_inner_list = env.new_object(
+                    "java/util/ArrayList",
+                    "(I)V",
+                    &[(split.len() as jint).into()],
+                )?;
+                for frag_id in split {
+                    let j_int =
+                        env.new_object("java/lang/Integer", "(I)V", &[(frag_id as jint).into()])?;
+                    env.call_method(
+                        &j_inner_list,
+                        "add",
+                        "(Ljava/lang/Object;)Z",
+                        &[(&j_int).into()],
+                    )?;
+                }
+                env.call_method(
+                    &j_list,
+                    "add",
+                    "(Ljava/lang/Object;)Z",
+                    &[(&j_inner_list).into()],
+                )?;
             }
             // new Splits(null, fragments)
             let j_splits = env.new_object(

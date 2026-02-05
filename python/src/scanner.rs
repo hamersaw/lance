@@ -201,9 +201,9 @@ pub struct PySplits {
     /// The filtered read plans, if this is a `FilteredReadPlans` variant.
     #[pyo3(get)]
     pub filtered_read_plans: Option<Vec<PyFilteredReadPlan>>,
-    /// The fragment IDs, if this is a `Fragments` variant.
+    /// The fragment IDs per split, if this is a `Fragments` variant.
     #[pyo3(get)]
-    pub fragments: Option<Vec<u32>>,
+    pub fragments: Option<Vec<Vec<u32>>>,
 }
 
 impl From<Splits> for PySplits {
