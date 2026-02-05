@@ -1472,8 +1472,7 @@ pub struct FilteredReadExec {
 /// Plan for distributed execution — uses ranges for efficient representation.
 ///
 /// Created by [`FilteredReadExec::get_or_create_plan`] and consumed by
-/// [`FilteredReadExec::with_plan`]. Can be split into smaller plans
-/// by [`Scanner::plan_splits`] for parallel execution.
+/// [`FilteredReadExec::with_plan`].
 #[derive(Clone, Debug)]
 pub struct FilteredReadPlan {
     /// Fragment ID to row ranges to read (BTreeMap for deterministic order

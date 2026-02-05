@@ -5257,9 +5257,12 @@ class LanceScanner(pa.dataset.Scanner):
         Examples
         --------
         >>> import lance
-        >>> dataset = lance.dataset("my_dataset")
+        >>> import pyarrow as pa
+        >>> data = pa.table([pa.array([1, 2, 3]), pa.array(['a', 'b', 'c'])],
+        ...                names=['user_id', 'user_name'])
+        >>> dataset = lance.write_dataset(data, "memory://test")
         >>> scanner = dataset.scanner()
-        >>> splits = scanner.plan_splits(max_row_count=10000)
+        >>> splits = scanner.plan_splits(max_row_count=2)
         >>> if splits.filtered_read_plans is not None:
         ...     for plan in splits.filtered_read_plans:
         ...         for frag_id, ranges in plan.fragment_ranges:
