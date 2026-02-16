@@ -79,7 +79,7 @@ use tracing::{info_span, instrument, Span};
 
 use super::Dataset;
 use crate::dataset::row_offsets_to_row_addresses;
-use crate::dataset::split::{bin_pack, max_rows_per_split, BinItem};
+use crate::dataset::split::{bin_pack, max_rows_per_split, BinItem, Splits, SplittingOptions};
 use crate::dataset::utils::SchemaAdapter;
 use crate::index::vector::utils::{
     default_distance_type_for, get_vector_dim, get_vector_type, validate_distance_type_for,
@@ -601,32 +601,6 @@ pub struct Scanner {
     explicit_projection: bool,
     /// Whether the user wants to use the legacy projection behavior.
     autoproject_scoring_columns: bool,
-}
-
-/// Options for configuring split generation.
-///
-/// This struct allows specifying constraints on the maximum size and row count
-/// for splits. Both fields are optional; if neither is set, default behavior
-/// will be used.
-#[derive(Debug, Clone, Default)]
-pub struct SplittingOptions {
-    /// Maximum size in bytes per split.
-    ///
-    /// The scanner estimates the row size from the output schema and calculates
-    /// how many rows fit within this budget.
-    pub max_size_bytes: Option<usize>,
-    /// Maximum number of rows per split.
-    pub max_row_count: Option<usize>,
-}
-
-/// Result of [`Scanner::plan_splits`], representing how to divide a scan
-/// for distributed execution.
-#[derive(Debug, Clone)]
-pub enum Splits {
-    /// Detailed per-fragment read plans with row ranges and residual filters.
-    FilteredReadPlans(Vec<FilteredReadPlan>),
-    /// Fragment IDs only — each split is a collection of fragment IDs.
-    Fragments(Vec<Vec<u32>>),
 }
 
 /// Represents a user-requested take operation

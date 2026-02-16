@@ -1,13 +1,42 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::VecDeque;
 use std::ops::Range;
 
 use arrow_schema::Schema as ArrowSchema;
 use lance_arrow::DataTypeExt;
 
+use crate::io::exec::filtered_read::FilteredReadPlan;
+
 const DEFAULT_SPLIT_SIZE: usize = 128 * 1024 * 1024;
 const DEFAULT_VARIABLE_FIELD_SIZE: usize = 64;
+
+/// Options for configuring split generation.
+///
+/// This struct allows specifying constraints on the maximum size and row count
+/// for splits. Both fields are optional; if neither is set, default behavior
+/// will be used.
+#[derive(Debug, Clone, Default)]
+pub struct SplittingOptions {
+    /// Maximum size in bytes per split.
+    ///
+    /// The scanner estimates the row size from the output schema and calculates
+    /// how many rows fit within this budget.
+    pub max_size_bytes: Option<usize>,
+    /// Maximum number of rows per split.
+    pub max_row_count: Option<usize>,
+}
+
+/// Result of [`super::scanner::Scanner::plan_splits`], representing how to divide a scan
+/// for distributed execution.
+#[derive(Debug, Clone)]
+pub enum Splits {
+    /// Detailed per-fragment read plans with row ranges and residual filters.
+    FilteredReadPlans(Vec<FilteredReadPlan>),
+    /// Fragment IDs only — each split is a collection of fragment IDs.
+    Fragments(Vec<Vec<u32>>),
+}
 
 /// Computes the maximum number of rows per split from optional row-count and byte-size
 /// constraints.
@@ -55,40 +84,39 @@ pub(crate) struct BinItem {
 
 /// Packs bin items into bins where each bin's total row count is at most `maximum_count`.
 ///
-/// Uses a first-fit algorithm: each item is placed in the first bin that has room for it.
-/// For best results, the input should be sorted by row count in descending order.
+/// Uses a head-tail algorithm: items must be sorted by row count in descending order. The
+/// largest remaining item (head) starts a new bin, then the smallest remaining items (tail)
+/// are added while they fit. This pairs large and small items together for better utilization.
 ///
 /// Items that exceed `maximum_count` on their own are placed in their own bin.
 pub(crate) fn bin_pack(items: Vec<BinItem>, maximum_count: u64) -> Vec<Vec<BinItem>> {
-    let mut bins: Vec<(Vec<BinItem>, u64)> = Vec::new(); // (items, current_count)
+    let mut deque: VecDeque<BinItem> = VecDeque::from(items);
+    let mut bins: Vec<Vec<BinItem>> = Vec::new();
 
-    for item in items {
-        let item_count = item.row_count;
-
+    while let Some(head) = deque.pop_front() {
         // Items that exceed the maximum get their own bin
-        if item_count > maximum_count {
-            bins.push((vec![item], item_count));
+        if head.row_count > maximum_count {
+            bins.push(vec![head]);
             continue;
         }
 
-        // Find first bin with enough remaining capacity
-        let target_bin = bins
-            .iter()
-            .position(|(_, bin_count)| *bin_count + item_count <= maximum_count);
+        let mut bin_count = head.row_count;
+        let mut bin = vec![head];
 
-        match target_bin {
-            Some(idx) => {
-                bins[idx].0.push(item);
-                bins[idx].1 += item_count;
+        // Fill from the tail with the smallest items that fit
+        while let Some(tail) = deque.back() {
+            if bin_count + tail.row_count > maximum_count {
+                break;
             }
-            None => {
-                // Create new bin if no existing bin has room
-                bins.push((vec![item], item_count));
-            }
+            let tail = deque.pop_back().unwrap();
+            bin_count += tail.row_count;
+            bin.push(tail);
         }
+
+        bins.push(bin);
     }
 
-    bins.into_iter().map(|(items, _)| items).collect()
+    bins
 }
 
 #[cfg(test)]
