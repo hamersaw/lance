@@ -20,7 +20,9 @@ use std::sync::Arc;
 
 use arrow::pyarrow::*;
 use arrow_array::RecordBatchReader;
-use lance::dataset::scanner::{ExecutionSummaryCounts, SplitOptions as LanceSplitOptions, Splits};
+use lance::dataset::scanner::{
+    ExecutionSummaryCounts, Splits, SplittingOptions as LanceSplittingOptions,
+};
 use lance::io::exec::filtered_read::FilteredReadPlan;
 use pyo3::prelude::*;
 use pyo3::pyclass;
@@ -160,7 +162,7 @@ impl Scanner {
     ) -> PyResult<PySplits> {
         let scanner = self_.scanner.clone();
         let options = if max_size_bytes.is_some() || max_row_count.is_some() {
-            Some(LanceSplitOptions {
+            Some(LanceSplittingOptions {
                 max_size_bytes,
                 max_row_count,
             })

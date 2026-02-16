@@ -20,11 +20,11 @@ import java.util.Optional;
  *
  * <p>Both fields are optional; if neither is set, a default split size of 128 MiB is used.
  */
-public class SplitOptions {
+public class SplittingOptions {
   private final Optional<Long> maxSizeBytes;
   private final Optional<Long> maxRowCount;
 
-  private SplitOptions(Optional<Long> maxSizeBytes, Optional<Long> maxRowCount) {
+  private SplittingOptions(Optional<Long> maxSizeBytes, Optional<Long> maxRowCount) {
     this.maxSizeBytes = maxSizeBytes;
     this.maxRowCount = maxRowCount;
   }
@@ -47,7 +47,7 @@ public class SplitOptions {
     return maxRowCount;
   }
 
-  /** Builder for constructing SplitOptions. */
+  /** Builder for constructing SplittingOptions. */
   public static class Builder {
     private Optional<Long> maxSizeBytes = Optional.empty();
     private Optional<Long> maxRowCount = Optional.empty();
@@ -78,12 +78,12 @@ public class SplitOptions {
     }
 
     /**
-     * Build the SplitOptions instance.
+     * Build the SplittingOptions instance.
      *
-     * @return SplitOptions instance with the specified parameters.
+     * @return SplittingOptions instance with the specified parameters.
      */
-    public SplitOptions build() {
-      return new SplitOptions(maxSizeBytes, maxRowCount);
+    public SplittingOptions build() {
+      return new SplittingOptions(maxSizeBytes, maxRowCount);
     }
   }
 }

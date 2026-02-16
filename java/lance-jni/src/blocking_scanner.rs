@@ -15,7 +15,7 @@ use jni::objects::{JByteArray, JLongArray, JObject, JString};
 use jni::sys::{jboolean, jint, JNI_TRUE};
 use jni::{sys::jlong, JNIEnv};
 use lance::dataset::scanner::{
-    ColumnOrdering, DatasetRecordBatchStream, Scanner, SplitOptions, Splits,
+    ColumnOrdering, DatasetRecordBatchStream, Scanner, Splits, SplittingOptions,
 };
 use lance::deps::datafusion::prelude::Expr;
 use lance::io::exec::filtered_read::FilteredReadPlan;
@@ -65,7 +65,7 @@ impl BlockingScanner {
         Ok(res)
     }
 
-    pub fn plan_splits(&self, options: Option<SplitOptions>) -> Result<Splits> {
+    pub fn plan_splits(&self, options: Option<SplittingOptions>) -> Result<Splits> {
         let res = RT.block_on(self.inner.plan_splits(options))?;
         Ok(res)
     }
@@ -529,7 +529,7 @@ fn inner_plan_splits<'local>(
     let max_row_count = env.get_long_opt(&max_row_count_obj)?.map(|v| v as usize);
 
     let options = if max_size_bytes.is_some() || max_row_count.is_some() {
-        Some(SplitOptions {
+        Some(SplittingOptions {
             max_size_bytes,
             max_row_count,
         })

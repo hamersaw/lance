@@ -615,7 +615,7 @@ struct BinItem {
 /// for splits. Both fields are optional; if neither is set, default behavior
 /// will be used.
 #[derive(Debug, Clone, Default)]
-pub struct SplitOptions {
+pub struct SplittingOptions {
     /// Maximum size in bytes per split.
     ///
     /// The scanner estimates the row size from the output schema and calculates
@@ -4069,7 +4069,7 @@ impl Scanner {
     /// [`FilteredReadPlan`]s, where each plan represents a split containing at most
     /// `max_rows_per_split` rows. Splits can be executed independently in parallel
     /// across distributed workers.
-    pub async fn plan_splits(&self, options: Option<SplitOptions>) -> Result<Splits> {
+    pub async fn plan_splits(&self, options: Option<SplittingOptions>) -> Result<Splits> {
         // Attempt to use filtering to prune fragments / rows
         let use_scalar_index = self.use_scalar_index && (self.prefilter || self.nearest.is_none());
         let mut filter_plan = self.create_filter_plan(use_scalar_index).await?;
@@ -9493,7 +9493,7 @@ mod test {
             .await
             .unwrap();
 
-        let options = SplitOptions {
+        let options = SplittingOptions {
             max_row_count: Some(50),
             max_size_bytes: None,
         };
@@ -9533,7 +9533,7 @@ mod test {
             .await
             .unwrap();
 
-        let options = SplitOptions {
+        let options = SplittingOptions {
             max_row_count: None,
             max_size_bytes: Some(40), // Should fit ~10 rows with 4-byte Int32
         };
@@ -9564,7 +9564,7 @@ mod test {
 
         // max_row_count = 100 rows, max_size_bytes = 40 bytes (~10 rows for Int32)
         // The byte constraint is stricter, so should use ~10 rows per split
-        let options = SplitOptions {
+        let options = SplittingOptions {
             max_row_count: Some(100),
             max_size_bytes: Some(40),
         };
@@ -9615,7 +9615,7 @@ mod test {
             .await
             .unwrap();
 
-        let options = SplitOptions {
+        let options = SplittingOptions {
             max_row_count: Some(25),
             max_size_bytes: None,
         };
@@ -9651,7 +9651,7 @@ mod test {
             .await
             .unwrap();
 
-        let options = SplitOptions {
+        let options = SplittingOptions {
             max_row_count: Some(10),
             max_size_bytes: None,
         };
@@ -9722,7 +9722,7 @@ mod test {
             .await
             .unwrap();
 
-        let options = SplitOptions {
+        let options = SplittingOptions {
             max_row_count: Some(50),
             max_size_bytes: None,
         };
@@ -9757,7 +9757,7 @@ mod test {
             .await
             .unwrap();
 
-        let options = SplitOptions {
+        let options = SplittingOptions {
             max_row_count: Some(30),
             max_size_bytes: None,
         };

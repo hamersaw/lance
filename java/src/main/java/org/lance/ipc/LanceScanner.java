@@ -174,7 +174,7 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
    * @param options split options, or null to use defaults
    * @return a {@link Splits} object describing how to divide the scan
    */
-  public Splits planSplits(SplitOptions options) {
+  public Splits planSplits(SplittingOptions options) {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeScannerHandle != 0, "Scanner is closed");
       return nativePlanSplits(

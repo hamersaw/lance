@@ -17,7 +17,7 @@ import org.lance.ipc.ColumnOrdering;
 import org.lance.ipc.FilteredReadPlan;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
-import org.lance.ipc.SplitOptions;
+import org.lance.ipc.SplittingOptions;
 import org.lance.ipc.Splits;
 
 import org.apache.arrow.dataset.scanner.Scanner;
@@ -575,7 +575,7 @@ public class ScannerTest {
       try (Dataset dataset = testDataset.write(1, totalRows)) {
         try (LanceScanner scanner =
             dataset.newScan(new ScanOptions.Builder().batchSize(50).build())) {
-          SplitOptions options = new SplitOptions.Builder().maxRowCount(10).build();
+          SplittingOptions options = new SplittingOptions.Builder().maxRowCount(10).build();
           Splits splits = scanner.planSplits(options);
           assertTrue(
               splits.getFilteredReadPlans().isPresent() || splits.getFragments().isPresent());
