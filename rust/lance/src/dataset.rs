@@ -76,6 +76,7 @@ pub mod refs;
 pub(crate) mod rowids;
 pub mod scanner;
 mod schema_evolution;
+pub(crate) mod split;
 pub mod sql;
 pub mod statistics;
 mod take;

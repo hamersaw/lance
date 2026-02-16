@@ -79,6 +79,7 @@ use tracing::{info_span, instrument, Span};
 
 use super::Dataset;
 use crate::dataset::row_offsets_to_row_addresses;
+use crate::dataset::split::{bin_pack, max_rows_per_split, BinItem};
 use crate::dataset::utils::SchemaAdapter;
 use crate::index::vector::utils::{
     default_distance_type_for, get_vector_dim, get_vector_type, validate_distance_type_for,
@@ -600,13 +601,6 @@ pub struct Scanner {
     explicit_projection: bool,
     /// Whether the user wants to use the legacy projection behavior.
     autoproject_scoring_columns: bool,
-}
-
-/// A lightweight item used during bin-packing in [`Scanner::plan_splits`].
-struct BinItem {
-    fragment_id: u32,
-    ranges: Vec<Range<u64>>,
-    row_count: u64,
 }
 
 /// Options for configuring split generation.
@@ -4096,37 +4090,13 @@ impl Scanner {
             }
         };
 
-        // Compute the max rows per split
-        const DEFAULT_SPLIT_SIZE: usize = 128 * 1024 * 1024;
-        const DEFAULT_VARIABLE_FIELD_SIZE: usize = 64;
-
         let options = options.unwrap_or_default();
-
-        // Helper to estimate row count from a byte size
-        let estimate_rows_from_bytes = |max_bytes: usize| -> Result<usize> {
-            let output_schema = self.projection_plan.output_schema()?;
-            let estimated_row_size: usize = output_schema
-                .fields()
-                .iter()
-                .map(|f| {
-                    f.data_type()
-                        .byte_width_opt()
-                        .unwrap_or(DEFAULT_VARIABLE_FIELD_SIZE)
-                })
-                .sum();
-            Ok(max_bytes / estimated_row_size.max(1))
-        };
-
-        let max_rows_per_split = match (options.max_row_count, options.max_size_bytes) {
-            (Some(max_rows), Some(max_bytes)) => {
-                // Use the minimum of both constraints
-                let rows_from_bytes = estimate_rows_from_bytes(max_bytes)?;
-                max_rows.min(rows_from_bytes)
-            }
-            (Some(max_rows), None) => max_rows,
-            (None, Some(max_bytes)) => estimate_rows_from_bytes(max_bytes)?,
-            (None, None) => estimate_rows_from_bytes(DEFAULT_SPLIT_SIZE)?,
-        };
+        let output_schema = self.projection_plan.output_schema()?;
+        let max_rows_per_split = max_rows_per_split(
+            options.max_row_count,
+            options.max_size_bytes,
+            &output_schema,
+        );
 
         // Create bin items where each item has <= max_rows_per_split rows
         let mut bin_items: Vec<BinItem> = Vec::new();
@@ -4301,44 +4271,6 @@ impl Scanner {
             },
         )?))
     }
-}
-
-/// Packs bin items into bins where each bin's total row count is at most `maximum_count`.
-///
-/// Uses a first-fit algorithm: each item is placed in the first bin that has room for it.
-/// For best results, the input should be sorted by row count in descending order.
-///
-/// Items that exceed `maximum_count` on their own are placed in their own bin.
-fn bin_pack(items: Vec<BinItem>, maximum_count: u64) -> Vec<Vec<BinItem>> {
-    let mut bins: Vec<(Vec<BinItem>, u64)> = Vec::new(); // (items, current_count)
-
-    for item in items {
-        let item_count = item.row_count;
-
-        // Items that exceed the maximum get their own bin
-        if item_count > maximum_count {
-            bins.push((vec![item], item_count));
-            continue;
-        }
-
-        // Find first bin with enough remaining capacity
-        let target_bin = bins
-            .iter()
-            .position(|(_, bin_count)| *bin_count + item_count <= maximum_count);
-
-        match target_bin {
-            Some(idx) => {
-                bins[idx].0.push(item);
-                bins[idx].1 += item_count;
-            }
-            None => {
-                // Create new bin if no existing bin has room
-                bins.push((vec![item], item_count));
-            }
-        }
-    }
-
-    bins.into_iter().map(|(items, _)| items).collect()
 }
 
 // Search over all indexed fields including nested ones, collecting columns that have an
@@ -9780,108 +9712,5 @@ mod test {
             }
             Splits::Fragments(_) => panic!("Expected FilteredReadPlans"),
         }
-    }
-
-    #[test]
-    fn test_bin_pack_empty() {
-        let bins = bin_pack(vec![], 100);
-        assert!(bins.is_empty());
-    }
-
-    #[test]
-    fn test_bin_pack_single_item_fits() {
-        let items = vec![BinItem {
-            fragment_id: 0,
-            ranges: vec![0..50],
-            row_count: 50,
-        }];
-        let bins = bin_pack(items, 100);
-        assert_eq!(bins.len(), 1);
-        assert_eq!(bins[0].len(), 1);
-        assert_eq!(bins[0][0].fragment_id, 0);
-    }
-
-    #[test]
-    fn test_bin_pack_single_item_exceeds_maximum() {
-        let items = vec![BinItem {
-            fragment_id: 0,
-            ranges: vec![0..200],
-            row_count: 200,
-        }];
-        let bins = bin_pack(items, 100);
-        assert_eq!(bins.len(), 1);
-        assert_eq!(bins[0].len(), 1);
-        assert_eq!(bins[0][0].row_count, 200);
-    }
-
-    #[test]
-    fn test_bin_pack_multiple_items_fit_single_bin() {
-        let items = vec![
-            BinItem {
-                fragment_id: 0,
-                ranges: vec![0..30],
-                row_count: 30,
-            },
-            BinItem {
-                fragment_id: 1,
-                ranges: vec![0..30],
-                row_count: 30,
-            },
-            BinItem {
-                fragment_id: 2,
-                ranges: vec![0..30],
-                row_count: 30,
-            },
-        ];
-        let bins = bin_pack(items, 100);
-        assert_eq!(bins.len(), 1);
-        assert_eq!(bins[0].len(), 3);
-    }
-
-    #[test]
-    fn test_bin_pack_items_split_across_bins() {
-        let items = vec![
-            BinItem {
-                fragment_id: 0,
-                ranges: vec![0..60],
-                row_count: 60,
-            },
-            BinItem {
-                fragment_id: 1,
-                ranges: vec![0..60],
-                row_count: 60,
-            },
-            BinItem {
-                fragment_id: 2,
-                ranges: vec![0..60],
-                row_count: 60,
-            },
-        ];
-        let bins = bin_pack(items, 100);
-        // 60+60 > 100, so each item needs its own bin
-        assert_eq!(bins.len(), 3);
-        for bin in &bins {
-            assert_eq!(bin.len(), 1);
-        }
-    }
-
-    #[test]
-    fn test_bin_pack_all_rows_preserved() {
-        let items: Vec<BinItem> = (0..10)
-            .map(|i| BinItem {
-                fragment_id: i,
-                ranges: vec![0..(i as u64 * 10 + 10)],
-                row_count: i as u64 * 10 + 10,
-            })
-            .collect();
-        let total_input: u64 = items.iter().map(|i| i.row_count).sum();
-
-        let bins = bin_pack(items, 75);
-        let total_output: u64 = bins
-            .iter()
-            .flat_map(|bin| bin.iter())
-            .map(|item| item.row_count)
-            .sum();
-        assert_eq!(total_input, total_output);
     }
 }
