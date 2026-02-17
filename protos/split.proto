@@ -1,0 +1,21 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+syntax = "proto3";
+
+package lance.datafusion;
+
+import "filtered_read.proto";
+
+// A single unit of work for distributed execution.
+// Each split is one of two variants: a FilteredReadPlan or a list of fragment IDs.
+message SplitProto {
+  oneof split {
+    FilteredReadPlanProto filtered_read_plan = 1;
+    FragmentIdList fragments = 2;
+  }
+}
+
+message FragmentIdList {
+  repeated uint32 fragment_ids = 1;
+}

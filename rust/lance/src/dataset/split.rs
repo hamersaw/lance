@@ -38,6 +38,60 @@ pub enum Split {
     Fragments(Vec<u32>),
 }
 
+#[cfg(feature = "substrait")]
+impl Split {
+    /// Serialize this split to a protobuf message.
+    ///
+    /// The `filter_schema` and `state` are needed to Substrait-encode any filter
+    /// expressions inside a [`FilteredReadPlan`]. For the `Fragments` variant they
+    /// are unused.
+    pub fn to_proto(
+        &self,
+        filter_schema: &std::sync::Arc<ArrowSchema>,
+        state: &datafusion::execution::SessionState,
+    ) -> lance_core::Result<lance_datafusion::pb::SplitProto> {
+        use crate::io::exec::filtered_read_proto::plan_to_proto;
+        use lance_datafusion::pb::split_proto;
+
+        let split = match self {
+            Self::FilteredReadPlan(plan) => {
+                split_proto::Split::FilteredReadPlan(plan_to_proto(plan, filter_schema, state)?)
+            }
+            Self::Fragments(ids) => {
+                split_proto::Split::Fragments(lance_datafusion::pb::FragmentIdList {
+                    fragment_ids: ids.clone(),
+                })
+            }
+        };
+
+        Ok(lance_datafusion::pb::SplitProto { split: Some(split) })
+    }
+
+    /// Deserialize a split from a protobuf message.
+    ///
+    /// The `dataset` and `state` are needed to reconstruct filter expressions
+    /// inside a [`FilteredReadPlan`]. For the `Fragments` variant they are unused.
+    pub async fn from_proto(
+        proto: lance_datafusion::pb::SplitProto,
+        dataset: &std::sync::Arc<crate::Dataset>,
+        state: &datafusion::execution::SessionState,
+    ) -> lance_core::Result<Self> {
+        use crate::io::exec::filtered_read_proto::plan_from_proto;
+        use lance_datafusion::pb::split_proto;
+
+        match proto.split.ok_or_else(|| lance_core::Error::InvalidInput {
+            source: "SplitProto has no split variant set".into(),
+            location: snafu::location!(),
+        })? {
+            split_proto::Split::FilteredReadPlan(plan_proto) => {
+                let plan = plan_from_proto(plan_proto, dataset, state).await?;
+                Ok(Self::FilteredReadPlan(plan))
+            }
+            split_proto::Split::Fragments(frag_list) => Ok(Self::Fragments(frag_list.fragment_ids)),
+        }
+    }
+}
+
 /// Computes the maximum number of rows per split from optional row-count and byte-size
 /// constraints.
 ///

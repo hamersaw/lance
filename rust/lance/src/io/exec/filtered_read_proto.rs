@@ -314,7 +314,7 @@ pub fn plan_to_proto(
     })
 }
 
-async fn plan_from_proto(
+pub async fn plan_from_proto(
     proto: pb::FilteredReadPlanProto,
     _dataset: &Arc<Dataset>,
     state: &SessionState,

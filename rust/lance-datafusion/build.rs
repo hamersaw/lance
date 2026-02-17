@@ -17,6 +17,7 @@ fn main() -> Result<()> {
         &[
             "./protos/table_identifier.proto",
             "./protos/filtered_read.proto",
+            "./protos/split.proto",
         ],
         &["./protos"],
     )?;
