@@ -210,6 +210,97 @@ mod test {
         }
     }
 
+    fn fixed_schema(field_sizes: &[i32]) -> ArrowSchema {
+        use arrow_schema::{DataType, Field};
+        ArrowSchema::new(
+            field_sizes
+                .iter()
+                .enumerate()
+                .map(|(i, &size)| {
+                    let dt = match size {
+                        4 => DataType::Int32,
+                        8 => DataType::Int64,
+                        _ => DataType::FixedSizeBinary(size),
+                    };
+                    Field::new(format!("f{i}"), dt, false)
+                })
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn variable_schema(n: usize) -> ArrowSchema {
+        use arrow_schema::{DataType, Field};
+        ArrowSchema::new(
+            (0..n)
+                .map(|i| Field::new(format!("s{i}"), DataType::Utf8, false))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    #[test]
+    fn test_max_rows_only_row_count() {
+        let schema = fixed_schema(&[4, 4]);
+        assert_eq!(max_rows_per_split(Some(500), None, &schema), 500);
+    }
+
+    #[test]
+    fn test_max_rows_only_bytes() {
+        // Two Int32 fields → 8 bytes/row, 800 bytes budget → 100 rows
+        let schema = fixed_schema(&[4, 4]);
+        assert_eq!(max_rows_per_split(None, Some(800), &schema), 100);
+    }
+
+    #[test]
+    fn test_max_rows_both_row_count_wins() {
+        // 8 bytes/row, 8000 bytes → 1000 rows from bytes; row_count = 50 wins
+        let schema = fixed_schema(&[4, 4]);
+        assert_eq!(max_rows_per_split(Some(50), Some(8000), &schema), 50);
+    }
+
+    #[test]
+    fn test_max_rows_both_bytes_wins() {
+        // 8 bytes/row, 80 bytes → 10 rows from bytes; row_count = 500 → bytes wins
+        let schema = fixed_schema(&[4, 4]);
+        assert_eq!(max_rows_per_split(Some(500), Some(80), &schema), 10);
+    }
+
+    #[test]
+    fn test_max_rows_neither_uses_default_split_size() {
+        // Two Int32 fields → 8 bytes/row, default 128 MiB → 128*1024*1024/8
+        let schema = fixed_schema(&[4, 4]);
+        let expected = DEFAULT_SPLIT_SIZE / 8;
+        assert_eq!(max_rows_per_split(None, None, &schema), expected);
+    }
+
+    #[test]
+    fn test_max_rows_variable_fields() {
+        // Variable-size fields estimated at DEFAULT_VARIABLE_FIELD_SIZE each
+        let schema = variable_schema(2);
+        // 2 * 64 = 128 bytes/row, 1280 bytes → 10 rows
+        assert_eq!(
+            max_rows_per_split(None, Some(1280), &schema),
+            1280 / (2 * DEFAULT_VARIABLE_FIELD_SIZE)
+        );
+    }
+
+    #[test]
+    fn test_max_rows_mixed_fields() {
+        use arrow_schema::{DataType, Field};
+        let schema = ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),  // 8 bytes
+            Field::new("name", DataType::Utf8, false), // 64 bytes (estimated)
+        ]);
+        let row_size = 8 + DEFAULT_VARIABLE_FIELD_SIZE; // 72
+        assert_eq!(max_rows_per_split(None, Some(720), &schema), 720 / row_size);
+    }
+
+    #[test]
+    fn test_max_rows_empty_schema() {
+        // Empty schema → 0 byte row size, clamped to 1 to avoid division by zero
+        let schema = ArrowSchema::empty();
+        assert_eq!(max_rows_per_split(None, Some(100), &schema), 100);
+    }
+
     #[test]
     fn test_bin_pack_all_rows_preserved() {
         let items: Vec<BinItem> = (0..10)
