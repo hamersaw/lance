@@ -28,14 +28,14 @@ pub struct SplittingOptions {
     pub max_row_count: Option<usize>,
 }
 
-/// Result of [`super::scanner::Scanner::plan_splits`], representing how to divide a scan
+/// Result of [`super::scanner::Scanner::plan_splits`], representing a single unit of work
 /// for distributed execution.
 #[derive(Debug, Clone)]
-pub enum Splits {
-    /// Detailed per-fragment read plans with row ranges and residual filters.
-    FilteredReadPlans(Vec<FilteredReadPlan>),
-    /// Fragment IDs only — each split is a collection of fragment IDs.
-    Fragments(Vec<Vec<u32>>),
+pub enum Split {
+    /// A detailed per-fragment read plan with row ranges and residual filters.
+    FilteredReadPlan(FilteredReadPlan),
+    /// Fragment IDs only — a collection of fragment IDs to scan.
+    Fragments(Vec<u32>),
 }
 
 /// Computes the maximum number of rows per split from optional row-count and byte-size

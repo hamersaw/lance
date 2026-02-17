@@ -17,7 +17,7 @@ import org.lance.ipc.ColumnOrdering;
 import org.lance.ipc.FilteredReadPlan;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
-import org.lance.ipc.Splits;
+import org.lance.ipc.Split;
 import org.lance.ipc.SplittingOptions;
 
 import org.apache.arrow.dataset.scanner.Scanner;
@@ -553,11 +553,13 @@ public class ScannerTest {
       try (Dataset dataset = testDataset.write(1, totalRows)) {
         try (LanceScanner scanner =
             dataset.newScan(new ScanOptions.Builder().batchSize(50).build())) {
-          Splits splits = scanner.planSplits(null);
-          // Should return either FilteredReadPlans or Fragments
-          assertTrue(
-              splits.getFilteredReadPlans().isPresent() || splits.getFragments().isPresent(),
-              "Splits should have either filteredReadPlans or fragments");
+          List<Split> splits = scanner.planSplits(null);
+          assertFalse(splits.isEmpty(), "Should have at least one split");
+          for (Split split : splits) {
+            assertTrue(
+                split.getFilteredReadPlan().isPresent() || split.getFragments().isPresent(),
+                "Each split should have either filteredReadPlan or fragments");
+          }
         }
       }
     }
@@ -575,9 +577,8 @@ public class ScannerTest {
         try (LanceScanner scanner =
             dataset.newScan(new ScanOptions.Builder().batchSize(50).build())) {
           SplittingOptions options = new SplittingOptions.Builder().maxRowCount(10).build();
-          Splits splits = scanner.planSplits(options);
-          assertTrue(
-              splits.getFilteredReadPlans().isPresent() || splits.getFragments().isPresent());
+          List<Split> splits = scanner.planSplits(options);
+          assertFalse(splits.isEmpty(), "Should have at least one split");
         }
       }
     }
@@ -594,11 +595,11 @@ public class ScannerTest {
       try (Dataset dataset = testDataset.write(1, totalRows)) {
         try (LanceScanner scanner =
             dataset.newScan(new ScanOptions.Builder().filter("id < 50").build())) {
-          Splits splits = scanner.planSplits(null);
-          if (splits.getFilteredReadPlans().isPresent()) {
-            List<FilteredReadPlan> plans = splits.getFilteredReadPlans().get();
-            int totalScannedRows = 0;
-            for (FilteredReadPlan p : plans) {
+          List<Split> splits = scanner.planSplits(null);
+          int totalScannedRows = 0;
+          for (Split split : splits) {
+            if (split.getFilteredReadPlan().isPresent()) {
+              FilteredReadPlan p = split.getFilteredReadPlan().get();
               try (LanceScanner splitScanner = scanner.withFilteredReadPlan(p);
                   ArrowReader reader = splitScanner.scanBatches()) {
                 while (reader.loadNextBatch()) {
@@ -606,8 +607,8 @@ public class ScannerTest {
                 }
               }
             }
-            assertEquals(50, totalScannedRows, "Filtered scan should return 50 rows");
           }
+          assertEquals(50, totalScannedRows, "Filtered scan should return 50 rows");
         }
       }
     }

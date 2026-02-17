@@ -21,7 +21,7 @@ use std::sync::Arc;
 use arrow::pyarrow::*;
 use arrow_array::RecordBatchReader;
 use lance::dataset::scanner::{
-    ExecutionSummaryCounts, Splits, SplittingOptions as LanceSplittingOptions,
+    ExecutionSummaryCounts, Split, SplittingOptions as LanceSplittingOptions,
 };
 use lance::io::exec::filtered_read::FilteredReadPlan;
 use pyo3::prelude::*;
@@ -159,7 +159,7 @@ impl Scanner {
         self_: PyRef<'_, Self>,
         max_size_bytes: Option<usize>,
         max_row_count: Option<usize>,
-    ) -> PyResult<PySplits> {
+    ) -> PyResult<Vec<PySplit>> {
         let scanner = self_.scanner.clone();
         let options = if max_size_bytes.is_some() || max_row_count.is_some() {
             Some(LanceSplittingOptions {
@@ -176,7 +176,7 @@ impl Scanner {
             })?
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
-        Ok(PySplits::from(splits))
+        Ok(splits.into_iter().map(PySplit::from).collect())
     }
 
     fn with_filtered_read_plan(&self, plan: PyFilteredReadPlan) -> Scanner {
@@ -186,30 +186,27 @@ impl Scanner {
     }
 }
 
-/// Result of [`Scanner::plan_splits`], representing how to divide a scan
-/// for distributed execution.
-#[pyclass(name = "Splits", module = "_lib")]
+/// A single unit of work from [`Scanner::plan_splits`] for distributed execution.
+#[pyclass(name = "Split", module = "_lib")]
 #[derive(Clone)]
-pub struct PySplits {
-    /// The filtered read plans, if this is a `FilteredReadPlans` variant.
+pub struct PySplit {
+    /// The filtered read plan, if this is a `FilteredReadPlan` variant.
     #[pyo3(get)]
-    pub filtered_read_plans: Option<Vec<PyFilteredReadPlan>>,
-    /// The fragment IDs per split, if this is a `Fragments` variant.
+    pub filtered_read_plan: Option<PyFilteredReadPlan>,
+    /// The fragment IDs, if this is a `Fragments` variant.
     #[pyo3(get)]
-    pub fragments: Option<Vec<Vec<u32>>>,
+    pub fragments: Option<Vec<u32>>,
 }
 
-impl From<Splits> for PySplits {
-    fn from(splits: Splits) -> Self {
-        match splits {
-            Splits::FilteredReadPlans(plans) => Self {
-                filtered_read_plans: Some(
-                    plans.into_iter().map(PyFilteredReadPlan::from).collect(),
-                ),
+impl From<Split> for PySplit {
+    fn from(split: Split) -> Self {
+        match split {
+            Split::FilteredReadPlan(plan) => Self {
+                filtered_read_plan: Some(PyFilteredReadPlan::from(plan)),
                 fragments: None,
             },
-            Splits::Fragments(fragment_ids) => Self {
-                filtered_read_plans: None,
+            Split::Fragments(fragment_ids) => Self {
+                filtered_read_plan: None,
                 fragments: Some(fragment_ids),
             },
         }
@@ -217,14 +214,14 @@ impl From<Splits> for PySplits {
 }
 
 #[pymethods]
-impl PySplits {
+impl PySplit {
     fn __repr__(&self) -> String {
-        if let Some(plans) = &self.filtered_read_plans {
-            format!("Splits(filtered_read_plans=[{} plans])", plans.len())
+        if let Some(plan) = &self.filtered_read_plan {
+            format!("Split(filtered_read_plan={:?})", plan.inner)
         } else if let Some(fragments) = &self.fragments {
-            format!("Splits(fragments={:?})", fragments)
+            format!("Split(fragments={:?})", fragments)
         } else {
-            "Splits()".to_string()
+            "Split()".to_string()
         }
     }
 }

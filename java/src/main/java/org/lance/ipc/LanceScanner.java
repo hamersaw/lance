@@ -170,13 +170,14 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
   /**
    * Plan splits for distributed execution.
    *
-   * <p>This method divides the scan into splits that can be processed in parallel. Returns a {@link
-   * Splits} object which is either a list of {@link FilteredReadPlan} or a list of fragment IDs.
+   * <p>This method divides the scan into splits that can be processed in parallel. Returns a list
+   * of {@link Split} objects, each representing a single unit of work that is either a {@link
+   * FilteredReadPlan} or a list of fragment IDs.
    *
    * @param options split options, or null to use defaults
-   * @return a {@link Splits} object describing how to divide the scan
+   * @return a list of {@link Split} objects describing how to divide the scan
    */
-  public Splits planSplits(SplittingOptions options) {
+  public List<Split> planSplits(SplittingOptions options) {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeScannerHandle != 0, "Scanner is closed");
       return nativePlanSplits(
@@ -185,7 +186,8 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
     }
   }
 
-  private native Splits nativePlanSplits(Optional<Long> maxSizeBytes, Optional<Long> maxRowCount);
+  private native List<Split> nativePlanSplits(
+      Optional<Long> maxSizeBytes, Optional<Long> maxRowCount);
 
   /**
    * Return a new scanner with a pre-computed {@link FilteredReadPlan} as its source.

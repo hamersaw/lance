@@ -30,7 +30,7 @@ from .lance import (
     FFILanceTableProvider,
     FilteredReadPlan,
     ScanStatistics,
-    Splits,
+    Split,
     bytes_read_counter,
     iops_counter,
 )
@@ -72,7 +72,7 @@ __all__ = [
     "LanceNamespaceStorageOptionsProvider",
     "MergeInsertBuilder",
     "ScanStatistics",
-    "Splits",
+    "Split",
     "Transaction",
     "__version__",
     "batch_udf",

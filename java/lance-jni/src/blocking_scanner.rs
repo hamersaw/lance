@@ -13,7 +13,7 @@ use jni::objects::{JObject, JString};
 use jni::sys::{jboolean, jint, JNI_TRUE};
 use jni::{sys::jlong, JNIEnv};
 use lance::dataset::scanner::{
-    AggregateExpr, ColumnOrdering, DatasetRecordBatchStream, Scanner, Splits, SplittingOptions,
+    AggregateExpr, ColumnOrdering, DatasetRecordBatchStream, Scanner, Split, SplittingOptions,
 };
 use lance::io::exec::filtered_read::FilteredReadPlan;
 use lance_index::scalar::inverted::query::{
@@ -60,7 +60,7 @@ impl BlockingScanner {
         Ok(res)
     }
 
-    pub fn plan_splits(&self, options: Option<SplittingOptions>) -> Result<Splits> {
+    pub fn plan_splits(&self, options: Option<SplittingOptions>) -> Result<Vec<Split>> {
         let res = RT.block_on(self.inner.plan_splits(options))?;
         Ok(res)
     }
@@ -546,70 +546,61 @@ fn inner_plan_splits<'local>(
         scanner_guard.plan_splits(options)?
     };
 
-    create_java_splits(env, splits)
+    create_java_split_list(env, splits)
 }
 
-fn create_java_splits<'a>(env: &mut JNIEnv<'a>, splits: Splits) -> Result<JObject<'a>> {
-    match splits {
-        Splits::FilteredReadPlans(plans) => {
-            // Create ArrayList<FilteredReadPlan>
-            let j_list = env.new_object(
-                "java/util/ArrayList",
-                "(I)V",
-                &[(plans.len() as jint).into()],
-            )?;
-            for plan in plans {
+fn create_java_split_list<'a>(env: &mut JNIEnv<'a>, splits: Vec<Split>) -> Result<JObject<'a>> {
+    let j_list = env.new_object(
+        "java/util/ArrayList",
+        "(I)V",
+        &[(splits.len() as jint).into()],
+    )?;
+
+    for split in splits {
+        let j_split = match split {
+            Split::FilteredReadPlan(plan) => {
                 let j_plan = create_java_filtered_read_plan(env, plan)?;
-                env.call_method(&j_list, "add", "(Ljava/lang/Object;)Z", &[(&j_plan).into()])?;
+                // new Split(filteredReadPlan, null)
+                env.new_object(
+                    "org/lance/ipc/Split",
+                    "(Lorg/lance/ipc/FilteredReadPlan;Ljava/util/List;)V",
+                    &[(&j_plan).into(), (&JObject::null()).into()],
+                )?
             }
-            // new Splits(filteredReadPlans, null)
-            let j_splits = env.new_object(
-                "org/lance/ipc/Splits",
-                "(Ljava/util/List;Ljava/util/List;)V",
-                &[(&j_list).into(), (&JObject::null()).into()],
-            )?;
-            Ok(j_splits)
-        }
-        Splits::Fragments(splits) => {
-            // Create ArrayList<List<Integer>> - outer list of splits
-            let j_list = env.new_object(
-                "java/util/ArrayList",
-                "(I)V",
-                &[(splits.len() as jint).into()],
-            )?;
-            for split in splits {
-                // Create inner ArrayList<Integer> for each split's fragment IDs
-                let j_inner_list = env.new_object(
+            Split::Fragments(frag_ids) => {
+                // Create ArrayList<Integer> for fragment IDs
+                let j_frag_list = env.new_object(
                     "java/util/ArrayList",
                     "(I)V",
-                    &[(split.len() as jint).into()],
+                    &[(frag_ids.len() as jint).into()],
                 )?;
-                for frag_id in split {
+                for frag_id in frag_ids {
                     let j_int =
                         env.new_object("java/lang/Integer", "(I)V", &[(frag_id as jint).into()])?;
                     env.call_method(
-                        &j_inner_list,
+                        &j_frag_list,
                         "add",
                         "(Ljava/lang/Object;)Z",
                         &[(&j_int).into()],
                     )?;
                 }
-                env.call_method(
-                    &j_list,
-                    "add",
-                    "(Ljava/lang/Object;)Z",
-                    &[(&j_inner_list).into()],
-                )?;
+                // new Split(null, fragments)
+                env.new_object(
+                    "org/lance/ipc/Split",
+                    "(Lorg/lance/ipc/FilteredReadPlan;Ljava/util/List;)V",
+                    &[(&JObject::null()).into(), (&j_frag_list).into()],
+                )?
             }
-            // new Splits(null, fragments)
-            let j_splits = env.new_object(
-                "org/lance/ipc/Splits",
-                "(Ljava/util/List;Ljava/util/List;)V",
-                &[(&JObject::null()).into(), (&j_list).into()],
-            )?;
-            Ok(j_splits)
-        }
+        };
+        env.call_method(
+            &j_list,
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[(&j_split).into()],
+        )?;
     }
+
+    Ok(j_list)
 }
 
 fn create_java_filtered_read_plan<'a>(

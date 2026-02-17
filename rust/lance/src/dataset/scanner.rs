@@ -99,7 +99,7 @@ use crate::{Error, Result};
 
 pub use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts};
 // Re-export for downstream consumers that import from scanner
-pub use super::split::{Splits, SplittingOptions};
+pub use super::split::{Split, SplittingOptions};
 #[cfg(feature = "substrait")]
 use lance_datafusion::substrait::parse_substrait;
 use snafu::location;
@@ -4507,7 +4507,7 @@ impl Scanner {
     /// [`FilteredReadPlan`]s, where each plan represents a split containing at most
     /// `max_rows_per_split` rows. Splits can be executed independently in parallel
     /// across distributed workers.
-    pub async fn plan_splits(&self, options: Option<SplittingOptions>) -> Result<Splits> {
+    pub async fn plan_splits(&self, options: Option<SplittingOptions>) -> Result<Vec<Split>> {
         // Attempt to use filtering to prune fragments / rows
         let use_scalar_index = self.use_scalar_index && (self.prefilter || self.nearest.is_none());
         let mut filter_plan = self.create_filter_plan(use_scalar_index).await?;
@@ -4519,18 +4519,23 @@ impl Scanner {
                 filtered_read_exec.get_or_create_plan(ctx).await?
             }
             None => {
-                let fragments: Vec<Vec<u32>> = self
+                let fragments: Vec<Split> = self
                     .fragments
                     .as_ref()
-                    .map(|frags| frags.iter().map(|f| vec![f.id as u32]).collect())
+                    .map(|frags| {
+                        frags
+                            .iter()
+                            .map(|f| Split::Fragments(vec![f.id as u32]))
+                            .collect()
+                    })
                     .unwrap_or_else(|| {
                         self.dataset
                             .fragments()
                             .iter()
-                            .map(|f| vec![f.id as u32])
+                            .map(|f| Split::Fragments(vec![f.id as u32]))
                             .collect()
                     });
-                return Ok(Splits::Fragments(fragments));
+                return Ok(fragments);
             }
         };
 
@@ -4591,7 +4596,7 @@ impl Scanner {
         bin_items.sort_by(|a, b| b.row_count.cmp(&a.row_count));
         let bins = bin_pack(bin_items, max_rows);
 
-        // Convert bins into Vec<FilteredReadPlan>
+        // Convert bins into Vec<Split>
         let splits = bins
             .into_iter()
             .map(|items| {
@@ -4611,15 +4616,15 @@ impl Scanner {
                     rows.insert_bitmap(frag_id, bitmap);
                 }
 
-                FilteredReadPlan {
+                Split::FilteredReadPlan(FilteredReadPlan {
                     rows,
                     filters,
                     scan_range_after_filter: filtered_read_plan.scan_range_after_filter.clone(),
-                }
+                })
             })
             .collect();
 
-        Ok(Splits::FilteredReadPlans(splits))
+        Ok(splits)
     }
 }
 
@@ -4960,6 +4965,17 @@ mod test {
     /// Count the number of fragments in a FilteredReadPlan.
     fn plan_fragment_count(plan: &FilteredReadPlan) -> usize {
         plan.rows.iter().count()
+    }
+
+    /// Extract FilteredReadPlans from a Vec<Split>, panicking if any split is not a FilteredReadPlan.
+    fn unwrap_plans(splits: Vec<Split>) -> Vec<FilteredReadPlan> {
+        splits
+            .into_iter()
+            .map(|s| match s {
+                Split::FilteredReadPlan(plan) => plan,
+                Split::Fragments(_) => panic!("Expected FilteredReadPlan"),
+            })
+            .collect()
     }
 
     #[test]
@@ -9686,16 +9702,12 @@ mod test {
             .unwrap();
 
         let splits = dataset.scan().plan_splits(None).await.unwrap();
+        let plans = unwrap_plans(splits);
 
-        match splits {
-            Splits::FilteredReadPlans(plans) => {
-                assert!(!plans.is_empty(), "Should have at least one plan");
-                // Verify all fragments are covered
-                let total_rows: u64 = plans.iter().map(plan_row_count).sum();
-                assert_eq!(total_rows, 400, "Should cover all 400 rows");
-            }
-            Splits::Fragments(_) => panic!("Expected FilteredReadPlans for basic scan"),
-        }
+        assert!(!plans.is_empty(), "Should have at least one plan");
+        // Verify all fragments are covered
+        let total_rows: u64 = plans.iter().map(plan_row_count).sum();
+        assert_eq!(total_rows, 400, "Should cover all 400 rows");
     }
 
     #[tokio::test]
@@ -9715,15 +9727,12 @@ mod test {
             .await
             .unwrap();
 
-        match splits {
-            Splits::FilteredReadPlans(plans) => {
-                assert!(!plans.is_empty(), "Should have at least one plan");
-                // Each plan should have filters for the fragments it covers
-                for plan in &plans {
-                    assert!(plan_row_count(plan) > 0, "Each plan should have rows");
-                }
-            }
-            Splits::Fragments(_) => panic!("Expected FilteredReadPlans for filtered scan"),
+        let plans = unwrap_plans(splits);
+
+        assert!(!plans.is_empty(), "Should have at least one plan");
+        // Each plan should have filters for the fragments it covers
+        for plan in &plans {
+            assert!(plan_row_count(plan) > 0, "Each plan should have rows");
         }
     }
 
@@ -9742,27 +9751,23 @@ mod test {
         };
 
         let splits = dataset.scan().plan_splits(Some(options)).await.unwrap();
+        let plans = unwrap_plans(splits);
 
-        match splits {
-            Splits::FilteredReadPlans(plans) => {
-                // With 400 rows and max 50 per split, we need at least 8 splits
-                assert!(
-                    plans.len() >= 8,
-                    "Should have at least 8 splits for 400 rows with max 50 per split, got {}",
-                    plans.len()
-                );
-                // Verify each split has at most 50 rows
-                for (i, plan) in plans.iter().enumerate() {
-                    let rows = plan_row_count(plan);
-                    assert!(
-                        rows <= 50,
-                        "Split {} has {} rows, expected at most 50",
-                        i,
-                        rows
-                    );
-                }
-            }
-            Splits::Fragments(_) => panic!("Expected FilteredReadPlans"),
+        // With 400 rows and max 50 per split, we need at least 8 splits
+        assert!(
+            plans.len() >= 8,
+            "Should have at least 8 splits for 400 rows with max 50 per split, got {}",
+            plans.len()
+        );
+        // Verify each split has at most 50 rows
+        for (i, plan) in plans.iter().enumerate() {
+            let rows = plan_row_count(plan);
+            assert!(
+                rows <= 50,
+                "Split {} has {} rows, expected at most 50",
+                i,
+                rows
+            );
         }
     }
 
@@ -9782,18 +9787,14 @@ mod test {
         };
 
         let splits = dataset.scan().plan_splits(Some(options)).await.unwrap();
+        let plans = unwrap_plans(splits);
 
-        match splits {
-            Splits::FilteredReadPlans(plans) => {
-                // With 400 rows and max ~10 per split, we need at least 40 splits
-                assert!(
-                    plans.len() >= 40,
-                    "Should have at least 40 splits, got {}",
-                    plans.len()
-                );
-            }
-            Splits::Fragments(_) => panic!("Expected FilteredReadPlans"),
-        }
+        // With 400 rows and max ~10 per split, we need at least 40 splits
+        assert!(
+            plans.len() >= 40,
+            "Should have at least 40 splits, got {}",
+            plans.len()
+        );
     }
 
     #[tokio::test]
@@ -9813,18 +9814,14 @@ mod test {
         };
 
         let splits = dataset.scan().plan_splits(Some(options)).await.unwrap();
+        let plans = unwrap_plans(splits);
 
-        match splits {
-            Splits::FilteredReadPlans(plans) => {
-                // Should use the byte constraint (~10 rows), not the row count (100 rows)
-                assert!(
-                    plans.len() >= 40,
-                    "Should have at least 40 splits when byte constraint is stricter, got {}",
-                    plans.len()
-                );
-            }
-            Splits::Fragments(_) => panic!("Expected FilteredReadPlans"),
-        }
+        // Should use the byte constraint (~10 rows), not the row count (100 rows)
+        assert!(
+            plans.len() >= 40,
+            "Should have at least 40 splits when byte constraint is stricter, got {}",
+            plans.len()
+        );
     }
 
     #[tokio::test]
@@ -9838,15 +9835,11 @@ mod test {
 
         // With default 128 MiB and small dataset, should get few splits
         let splits = dataset.scan().plan_splits(None).await.unwrap();
+        let plans = unwrap_plans(splits);
 
-        match splits {
-            Splits::FilteredReadPlans(plans) => {
-                // Small dataset should fit in very few splits with 128 MiB default
-                // Bin packing may combine fragments
-                assert!(!plans.is_empty(), "Should have at least one plan");
-            }
-            Splits::Fragments(_) => panic!("Expected FilteredReadPlans"),
-        }
+        // Small dataset should fit in very few splits with 128 MiB default
+        // Bin packing may combine fragments
+        assert!(!plans.is_empty(), "Should have at least one plan");
     }
 
     #[tokio::test]
@@ -9864,24 +9857,20 @@ mod test {
         };
 
         let splits = dataset.scan().plan_splits(Some(options)).await.unwrap();
+        let plans = unwrap_plans(splits);
 
-        match splits {
-            Splits::FilteredReadPlans(plans) => {
-                // Single fragment with 100 rows, max 25 per split -> 4 splits
-                assert!(
-                    plans.len() >= 4,
-                    "Should have at least 4 splits for 100 rows with max 25 per split, got {}",
-                    plans.len()
-                );
-                // All plans should reference fragment 0
-                for plan in &plans {
-                    assert!(
-                        plan.rows.iter().all(|(frag_id, _)| *frag_id == 0),
-                        "Single fragment dataset should only have fragment 0"
-                    );
-                }
-            }
-            Splits::Fragments(_) => panic!("Expected FilteredReadPlans"),
+        // Single fragment with 100 rows, max 25 per split -> 4 splits
+        assert!(
+            plans.len() >= 4,
+            "Should have at least 4 splits for 100 rows with max 25 per split, got {}",
+            plans.len()
+        );
+        // All plans should reference fragment 0
+        for plan in &plans {
+            assert!(
+                plan.rows.iter().all(|(frag_id, _)| *frag_id == 0),
+                "Single fragment dataset should only have fragment 0"
+            );
         }
     }
 
@@ -9900,27 +9889,23 @@ mod test {
         };
 
         let splits = dataset.scan().plan_splits(Some(options)).await.unwrap();
+        let plans = unwrap_plans(splits);
 
-        match splits {
-            Splits::FilteredReadPlans(plans) => {
-                // 100 rows with max 10 per split -> at least 10 splits
-                assert!(
-                    plans.len() >= 10,
-                    "Should have at least 10 splits, got {}",
-                    plans.len()
-                );
-                // Verify each split respects the max
-                for (i, plan) in plans.iter().enumerate() {
-                    let rows = plan_row_count(plan);
-                    assert!(
-                        rows <= 10,
-                        "Split {} has {} rows, expected at most 10",
-                        i,
-                        rows
-                    );
-                }
-            }
-            Splits::Fragments(_) => panic!("Expected FilteredReadPlans"),
+        // 100 rows with max 10 per split -> at least 10 splits
+        assert!(
+            plans.len() >= 10,
+            "Should have at least 10 splits, got {}",
+            plans.len()
+        );
+        // Verify each split respects the max
+        for (i, plan) in plans.iter().enumerate() {
+            let rows = plan_row_count(plan);
+            assert!(
+                rows <= 10,
+                "Split {} has {} rows, expected at most 10",
+                i,
+                rows
+            );
         }
     }
 
@@ -9938,20 +9923,16 @@ mod test {
             .await
             .unwrap();
 
-        match splits {
-            Splits::Fragments(frags) => {
-                assert!(!frags.is_empty(), "Should have fragment groups");
-                // Each fragment should be in its own group for vector search
-                for frag_group in &frags {
-                    assert_eq!(
-                        frag_group.len(),
-                        1,
-                        "Each fragment group should contain one fragment"
-                    );
+        assert!(!splits.is_empty(), "Should have fragment groups");
+        // Each split should be a Fragments variant with a single fragment
+        for split in &splits {
+            match split {
+                Split::Fragments(frag_ids) => {
+                    assert_eq!(frag_ids.len(), 1, "Each split should contain one fragment");
                 }
-            }
-            Splits::FilteredReadPlans(_) => {
-                panic!("Expected Fragments variant for vector search")
+                Split::FilteredReadPlan(_) => {
+                    panic!("Expected Fragments variant for vector search")
+                }
             }
         }
     }
@@ -9971,24 +9952,20 @@ mod test {
         };
 
         let splits = dataset.scan().plan_splits(Some(options)).await.unwrap();
+        let plans = unwrap_plans(splits);
 
-        match splits {
-            Splits::FilteredReadPlans(plans) => {
-                // 100 total rows, max 50 per split -> bin packing should give 2 splits
-                assert!(
-                    plans.len() <= 3,
-                    "Bin packing should combine small fragments, got {} splits",
-                    plans.len()
-                );
-                // Some plans should have multiple fragments
-                let multi_frag_plans = plans.iter().filter(|p| plan_fragment_count(p) > 1).count();
-                assert!(
-                    multi_frag_plans > 0,
-                    "At least one plan should combine multiple fragments"
-                );
-            }
-            Splits::Fragments(_) => panic!("Expected FilteredReadPlans"),
-        }
+        // 100 total rows, max 50 per split -> bin packing should give 2 splits
+        assert!(
+            plans.len() <= 3,
+            "Bin packing should combine small fragments, got {} splits",
+            plans.len()
+        );
+        // Some plans should have multiple fragments
+        let multi_frag_plans = plans.iter().filter(|p| plan_fragment_count(p) > 1).count();
+        assert!(
+            multi_frag_plans > 0,
+            "At least one plan should combine multiple fragments"
+        );
     }
 
     #[tokio::test]
@@ -10006,18 +9983,14 @@ mod test {
         };
 
         let splits = dataset.scan().plan_splits(Some(options)).await.unwrap();
+        let plans = unwrap_plans(splits);
 
-        match splits {
-            Splits::FilteredReadPlans(plans) => {
-                let total_rows: u64 = plans.iter().map(plan_row_count).sum();
-                assert_eq!(
-                    total_rows,
-                    5 * 73,
-                    "All rows should be accounted for in splits"
-                );
-            }
-            Splits::Fragments(_) => panic!("Expected FilteredReadPlans"),
-        }
+        let total_rows: u64 = plans.iter().map(plan_row_count).sum();
+        assert_eq!(
+            total_rows,
+            5 * 73,
+            "All rows should be accounted for in splits"
+        );
     }
 
     #[tokio::test]
@@ -10040,10 +10013,7 @@ mod test {
         };
         let splits = dataset.scan().plan_splits(Some(options)).await.unwrap();
 
-        let plans = match splits {
-            Splits::FilteredReadPlans(plans) => plans,
-            Splits::Fragments(_) => panic!("Expected FilteredReadPlans"),
-        };
+        let plans = unwrap_plans(splits);
 
         assert!(plans.len() > 1, "Should have multiple splits");
 
@@ -10093,10 +10063,7 @@ mod test {
             .await
             .unwrap();
 
-        let plans = match splits {
-            Splits::FilteredReadPlans(plans) => plans,
-            Splits::Fragments(_) => panic!("Expected FilteredReadPlans"),
-        };
+        let plans = unwrap_plans(splits);
 
         // Verify plans have filters
         for plan in &plans {

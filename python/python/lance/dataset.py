@@ -58,7 +58,7 @@ from .lance import (
     LanceSchema,
     PySearchFilter,
     ScanStatistics,
-    Splits,
+    Split,
     _Dataset,
     _MergeInsertBuilder,
     _Scanner,
@@ -5258,12 +5258,13 @@ class LanceScanner(pa.dataset.Scanner):
         *,
         max_size_bytes: Optional[int] = None,
         max_row_count: Optional[int] = None,
-    ) -> Splits:
+    ) -> List[Split]:
         """Plan splits for parallel scanning.
 
         This method divides the scan into splits that can be processed in parallel.
-        Returns a :class:`Splits` object which is either a list of
-        :class:`FilteredReadPlan` or a list of fragment IDs.
+        Returns a list of :class:`Split` objects, each representing a single unit
+        of work. Each split is either a :class:`FilteredReadPlan` or a list of
+        fragment IDs.
 
         Parameters
         ----------
@@ -5277,10 +5278,10 @@ class LanceScanner(pa.dataset.Scanner):
 
         Returns
         -------
-        Splits
-            A :class:`Splits` object with either:
-            - ``filtered_read_plans``: A list of opaque :class:`FilteredReadPlan`
-              objects, each passed to :meth:`with_filtered_read_plan`.
+        list[Split]
+            A list of :class:`Split` objects, where each split has either:
+            - ``filtered_read_plan``: An opaque :class:`FilteredReadPlan`
+              object to pass to :meth:`with_filtered_read_plan`.
             - ``fragments``: A list of fragment IDs.
 
         Examples
@@ -5292,9 +5293,9 @@ class LanceScanner(pa.dataset.Scanner):
         >>> dataset = lance.write_dataset(data, "memory://test")
         >>> scanner = dataset.scanner()
         >>> splits = scanner.plan_splits(max_row_count=2)
-        >>> if splits.filtered_read_plans is not None:
-        ...     for plan in splits.filtered_read_plans:
-        ...         print(plan)  # doctest: +SKIP
+        >>> for split in splits:
+        ...     if split.filtered_read_plan is not None:
+        ...         print(split)  # doctest: +SKIP
         """
         return self._scanner.plan_splits(
             max_size_bytes=max_size_bytes,
