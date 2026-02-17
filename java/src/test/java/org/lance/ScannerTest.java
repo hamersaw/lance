@@ -17,8 +17,8 @@ import org.lance.ipc.ColumnOrdering;
 import org.lance.ipc.FilteredReadPlan;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
-import org.lance.ipc.SplittingOptions;
 import org.lance.ipc.Splits;
+import org.lance.ipc.SplittingOptions;
 
 import org.apache.arrow.dataset.scanner.Scanner;
 import org.apache.arrow.memory.BufferAllocator;

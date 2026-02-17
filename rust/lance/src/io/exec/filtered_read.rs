@@ -1955,16 +1955,25 @@ impl ExecutionPlan for FilteredReadExec {
             ))
         } else {
             let index_input = children.into_iter().next();
+            // When there is no index child the plan is either externally
+            // provided (via with_plan) or computed solely from options /
+            // fragments.  In both cases it is independent of children, so
+            // preserve it.  When there IS an index child the plan is derived
+            // from that child's output, so if the optimizer rewrote the child
+            // we must recompute.
+            let plan = if index_input.is_none() {
+                self.plan.clone()
+            } else {
+                Arc::new(OnceCell::new())
+            };
             Ok(Arc::new(Self {
                 dataset: self.dataset.clone(),
                 options: self.options.clone(),
                 properties: self.properties.clone(),
                 metrics: self.metrics.clone(),
-                // Seems unlikely this would already be initialized but clear it
-                // out just in case
                 running_stream: Arc::new(AsyncMutex::new(None)),
                 index_input,
-                plan: Arc::new(OnceCell::new()),
+                plan,
             }))
         }
     }

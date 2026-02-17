@@ -575,6 +575,13 @@ pub struct Scanner {
     /// File reader options to use when reading data files.
     file_reader_options: Option<FileReaderOptions>,
 
+    /// Pre-computed filtered read plan from [`Self::plan_splits`].
+    ///
+    /// When set, [`Self::create_execution_plan`] uses this as the source
+    /// instead of building one from scratch. The downstream pipeline
+    /// (filter, sort, limit, projection) is still applied.
+    filtered_read_plan: Option<FilteredReadPlan>,
+
     // Legacy fields to help migrate some old projection behavior to new behavior
     //
     // There are two behaviors we are moving away from:
@@ -792,6 +799,7 @@ impl Scanner {
             scan_stats_callback: None,
             strict_batch_size: false,
             file_reader_options,
+            filtered_read_plan: None,
             legacy_with_row_addr: false,
             legacy_with_row_id: false,
             explicit_projection: false,
@@ -828,6 +836,16 @@ impl Scanner {
     /// If scan_in_order is set to true, the fragments will be scanned in the order of the vector.
     pub fn with_fragments(&mut self, fragments: Vec<Fragment>) -> &mut Self {
         self.fragments = Some(fragments);
+        self
+    }
+
+    /// Set a pre-computed [`FilteredReadPlan`] as the scan source.
+    ///
+    /// When set, [`Self::create_plan`] uses this plan instead of building a
+    /// source from scratch. The downstream pipeline (filter, sort, limit,
+    /// final projection) is still applied on top.
+    pub fn with_filtered_read_plan(&mut self, plan: FilteredReadPlan) -> &mut Self {
+        self.filtered_read_plan = Some(plan);
         self
     }
 
@@ -2141,49 +2159,59 @@ impl Scanner {
             (Some(_), None) => self.vector_search_source(filter_plan).await?,
             (None, Some(query)) => self.fts_search_source(filter_plan, query).await?,
             (None, None) => {
-                if self.projection_plan.has_output_cols()
-                    && self.projection_plan.physical_projection.is_empty()
-                {
-                    // This means the user is doing something like `SELECT 1 AS foo`.  We don't support this and
-                    // I'm not sure we should.  Users should use a full SQL API to do something like this.
-                    //
-                    // It's also possible we get here from `SELECT does_not_exist`
-
-                    // Note: even though we are just going to return an error we still want to calculate the
-                    // final projection here.  This lets us distinguish between a user doing something like:
-                    //
-                    // SELECT 1 FROM t (not supported error)
-                    // SELECT non_existent_column FROM t (column not found error)
-                    let output_expr = self.calculate_final_projection(&ArrowSchema::empty())?;
-                    return Err(Error::NotSupported {
-                        source: format!("Scans must request at least one column.  Received only dynamic expressions: {:?}", output_expr).into(),
-                        location: location!(),
-                    });
-                }
-
-                let take_op = filter_plan
-                    .expr_filter_plan
-                    .full_expr
-                    .as_ref()
-                    .and_then(TakeOperation::try_from_expr);
-                if let Some((take_op, remainder)) = take_op {
-                    // If there is any remainder use it as the filter (we don't even try and combine an indexed
-                    // search on the filter with a take as that seems excessive)
-                    filter_plan.expr_filter_plan = remainder
-                        .map(ExprFilterPlan::new_refine_only)
-                        .unwrap_or(ExprFilterPlan::default());
-                    self.take_source(take_op).await?
+                if let Some(plan) = self.filtered_read_plan.clone() {
+                    let has_scan_range = plan.scan_range_after_filter.is_some();
+                    let source = self.filtered_read_plan_source(plan).await?;
+                    filter_plan.disable_refine(); // filters baked into plan
+                    if has_scan_range {
+                        use_limit_node = false; // limit baked into plan
+                    }
+                    source
                 } else {
-                    let planned_read = self
-                        .filtered_read_source(&mut filter_plan.expr_filter_plan)
-                        .await?;
-                    if planned_read.limit_pushed_down {
-                        use_limit_node = false;
+                    if self.projection_plan.has_output_cols()
+                        && self.projection_plan.physical_projection.is_empty()
+                    {
+                        // This means the user is doing something like `SELECT 1 AS foo`.  We don't support this and
+                        // I'm not sure we should.  Users should use a full SQL API to do something like this.
+                        //
+                        // It's also possible we get here from `SELECT does_not_exist`
+
+                        // Note: even though we are just going to return an error we still want to calculate the
+                        // final projection here.  This lets us distinguish between a user doing something like:
+                        //
+                        // SELECT 1 FROM t (not supported error)
+                        // SELECT non_existent_column FROM t (column not found error)
+                        let output_expr = self.calculate_final_projection(&ArrowSchema::empty())?;
+                        return Err(Error::NotSupported {
+                            source: format!("Scans must request at least one column.  Received only dynamic expressions: {:?}", output_expr).into(),
+                            location: location!(),
+                        });
                     }
-                    if planned_read.filter_pushed_down {
-                        filter_plan.disable_refine();
+
+                    let take_op = filter_plan
+                        .expr_filter_plan
+                        .full_expr
+                        .as_ref()
+                        .and_then(TakeOperation::try_from_expr);
+                    if let Some((take_op, remainder)) = take_op {
+                        // If there is any remainder use it as the filter (we don't even try and combine an indexed
+                        // search on the filter with a take as that seems excessive)
+                        filter_plan.expr_filter_plan = remainder
+                            .map(ExprFilterPlan::new_refine_only)
+                            .unwrap_or(ExprFilterPlan::default());
+                        self.take_source(take_op).await?
+                    } else {
+                        let planned_read = self
+                            .filtered_read_source(&mut filter_plan.expr_filter_plan)
+                            .await?;
+                        if planned_read.limit_pushed_down {
+                            use_limit_node = false;
+                        }
+                        if planned_read.filter_pushed_down {
+                            filter_plan.disable_refine();
+                        }
+                        planned_read.plan
                     }
-                    planned_read.plan
                 }
             }
             _ => {
@@ -2480,6 +2508,60 @@ impl Scanner {
             /*is_prefilter= */ false,
         )
         .await
+    }
+
+    /// Build an execution plan from a pre-computed [`FilteredReadPlan`].
+    ///
+    /// Similar to [`Self::execute_filtered_read_plan`] but returns an
+    /// `Arc<dyn ExecutionPlan>` so it can be plugged into [`Self::create_plan`]'s
+    /// pipeline. Unlike `execute_filtered_read_plan` this does **not** add a
+    /// projection to strip filter-only columns — the downstream pipeline handles
+    /// that via Stage 5 take + Stage 7 final projection.
+    async fn filtered_read_plan_source(
+        &self,
+        plan: FilteredReadPlan,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        // Extend the physical projection with columns required by residual
+        // filters so the fragment reader loads them.
+        let mut read_projection = self.projection_plan.physical_projection.clone();
+
+        let mut filter_columns = Vec::new();
+        for filter_expr in plan.filters.values() {
+            filter_columns.extend(Planner::column_names_in_expr(filter_expr));
+        }
+        if !filter_columns.is_empty() {
+            read_projection = read_projection.union_columns(filter_columns, OnMissing::Ignore)?;
+        }
+
+        // Only include fragments referenced by this plan.
+        let split_fragment_ids: std::collections::HashSet<u32> =
+            plan.rows.iter().map(|(id, _)| *id).collect();
+
+        let fragments: Vec<Fragment> = self
+            .dataset
+            .fragments()
+            .iter()
+            .filter(|f| split_fragment_ids.contains(&(f.id as u32)))
+            .cloned()
+            .collect();
+
+        let mut read_options =
+            FilteredReadOptions::new(read_projection).with_fragments(Arc::new(fragments));
+
+        if let Some(batch_size) = self.batch_size {
+            read_options = read_options.with_batch_size(batch_size as u32);
+        }
+        if let Some(fragment_readahead) = self.fragment_readahead {
+            read_options = read_options.with_fragment_readahead(fragment_readahead);
+        }
+        if let Some(io_buffer_size) = self.io_buffer_size {
+            read_options = read_options.with_io_buffer_size(io_buffer_size);
+        }
+
+        let exec = FilteredReadExec::try_new(self.dataset.clone(), read_options, None)?;
+        let exec = exec.with_plan(plan).await?;
+
+        Ok(Arc::new(exec))
     }
 
     async fn fts_search_source(
@@ -9688,5 +9770,127 @@ mod test {
             }
             Splits::Fragments(_) => panic!("Expected FilteredReadPlans"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_scanner_with_filtered_read_plan() {
+        // Verify that plan_splits -> with_filtered_read_plan -> create_plan -> execute
+        // produces the same results as a direct scan.
+        let dataset = lance_datagen::gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(4), FragmentRowCount::from(100))
+            .await
+            .unwrap();
+
+        // Get the expected result from a direct scan.
+        let expected = dataset.scan().try_into_batch().await.unwrap();
+
+        // Plan splits and execute each via with_filtered_read_plan.
+        let options = SplittingOptions {
+            max_row_count: Some(150),
+            max_size_bytes: None,
+        };
+        let splits = dataset.scan().plan_splits(Some(options)).await.unwrap();
+
+        let plans = match splits {
+            Splits::FilteredReadPlans(plans) => plans,
+            Splits::Fragments(_) => panic!("Expected FilteredReadPlans"),
+        };
+
+        assert!(plans.len() > 1, "Should have multiple splits");
+
+        let mut total_rows = 0u64;
+        for plan in plans {
+            let mut scanner = dataset.scan();
+            scanner.with_filtered_read_plan(plan);
+            let batch = scanner.try_into_batch().await.unwrap();
+            assert!(batch.num_rows() > 0, "Each split should produce rows");
+            total_rows += batch.num_rows() as u64;
+
+            // Verify the schema matches the expected output.
+            assert_eq!(batch.schema(), expected.schema());
+        }
+
+        assert_eq!(
+            total_rows,
+            expected.num_rows() as u64,
+            "Total rows across splits should equal dataset row count"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scanner_with_filtered_read_plan_and_filter() {
+        // Verify that a filtered scan works with pre-computed plans.
+        let dataset = lance_datagen::gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(4), FragmentRowCount::from(100))
+            .await
+            .unwrap();
+
+        // Get the expected result from a direct filtered scan.
+        let expected = dataset
+            .scan()
+            .filter("id >= 200")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        // Plan splits with the same filter.
+        let splits = dataset
+            .scan()
+            .filter("id >= 200")
+            .unwrap()
+            .plan_splits(None)
+            .await
+            .unwrap();
+
+        let plans = match splits {
+            Splits::FilteredReadPlans(plans) => plans,
+            Splits::Fragments(_) => panic!("Expected FilteredReadPlans"),
+        };
+
+        // Verify plans have filters
+        for plan in &plans {
+            assert!(
+                !plan.filters.is_empty(),
+                "Plans from filtered scan should have filters"
+            );
+        }
+
+        // First verify execute_filtered_read_plan works
+        let mut exec_total = 0u64;
+        for plan in &plans {
+            let batch = dataset
+                .scan()
+                .execute_filtered_read_plan(plan.clone())
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            let rows: usize = batch.iter().map(|b| b.num_rows()).sum();
+            exec_total += rows as u64;
+        }
+        assert_eq!(
+            exec_total,
+            expected.num_rows() as u64,
+            "execute_filtered_read_plan total should match"
+        );
+
+        // Now verify with_filtered_read_plan + create_plan
+        let mut total_rows = 0u64;
+        for plan in plans {
+            let mut scanner = dataset.scan();
+            scanner.with_filtered_read_plan(plan);
+            let batch = scanner.try_into_batch().await.unwrap();
+            total_rows += batch.num_rows() as u64;
+        }
+
+        assert_eq!(
+            total_rows,
+            expected.num_rows() as u64,
+            "Total rows across splits should equal filtered row count"
+        );
     }
 }

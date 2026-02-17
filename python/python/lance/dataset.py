@@ -5320,6 +5320,25 @@ class LanceScanner(pa.dataset.Scanner):
         """
         return self._scanner.execute_filtered_read_plan(plan)
 
+    def with_filtered_read_plan(self, plan: FilteredReadPlan) -> "LanceScanner":
+        """Return a new scanner with a pre-computed FilteredReadPlan as its source.
+
+        Unlike :meth:`execute_filtered_read_plan`, which bypasses the scanner
+        pipeline, this method injects the plan into the scanner so that the
+        full downstream pipeline (filter, sort, limit, projection) is applied.
+
+        Parameters
+        ----------
+        plan : FilteredReadPlan
+            A plan obtained from :meth:`plan_splits`.
+
+        Returns
+        -------
+        LanceScanner
+            A new scanner configured with the given plan.
+        """
+        return LanceScanner(self._scanner.with_filtered_read_plan(plan), self._ds)
+
 
 class DatasetOptimizer:
     def __init__(self, dataset: LanceDataset):

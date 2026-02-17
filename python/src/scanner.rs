@@ -193,6 +193,12 @@ impl Scanner {
 
         Ok(PyArrowType(Box::new(LanceReader::from_stream(stream))))
     }
+
+    fn with_filtered_read_plan(&self, plan: PyFilteredReadPlan) -> Scanner {
+        let mut scanner = (*self.scanner).clone();
+        scanner.with_filtered_read_plan(plan.inner);
+        Scanner::new(Arc::new(scanner))
+    }
 }
 
 /// Result of [`Scanner::plan_splits`], representing how to divide a scan

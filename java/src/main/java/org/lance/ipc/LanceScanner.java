@@ -209,4 +209,28 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
 
   private native void nativeExecuteFilteredReadPlan(FilteredReadPlan plan, long streamAddress)
       throws IOException;
+
+  /**
+   * Return a new scanner with a pre-computed {@link FilteredReadPlan} as its source.
+   *
+   * <p>Unlike {@link #executeFilteredReadPlan}, which bypasses the scanner pipeline, this method
+   * injects the plan into the scanner so that the full downstream pipeline (filter, sort, limit,
+   * projection) is applied.
+   *
+   * @param plan a plan obtained from {@link #planSplits}
+   * @return a new scanner configured with the given plan
+   */
+  public LanceScanner withFilteredReadPlan(FilteredReadPlan plan) {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeScannerHandle != 0, "Scanner is closed");
+      Preconditions.checkNotNull(plan);
+      LanceScanner newScanner = nativeWithFilteredReadPlan(plan);
+      newScanner.allocator = this.allocator;
+      newScanner.dataset = this.dataset;
+      newScanner.options = this.options;
+      return newScanner;
+    }
+  }
+
+  private native LanceScanner nativeWithFilteredReadPlan(FilteredReadPlan plan);
 }
