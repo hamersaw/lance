@@ -791,12 +791,12 @@ pub struct Scanner {
     /// File reader options to use when reading data files.
     file_reader_options: Option<FileReaderOptions>,
 
-    /// Pre-computed filtered read plan from [`Self::plan_splits`].
+    /// Pre-computed filtered read exec from [`Self::plan_splits`].
     ///
-    /// When set, [`Self::create_execution_plan`] uses this as the source
-    /// instead of building one from scratch. The downstream pipeline
+    /// When set, [`Self::create_execution_plan`] uses this directly as the
+    /// source instead of building one from scratch. The downstream pipeline
     /// (filter, sort, limit, projection) is still applied.
-    filtered_read_plan: Option<FilteredReadPlan>,
+    filtered_read_exec: Option<Arc<FilteredReadExec>>,
 
     aggregate: Option<Aggregate>,
 
@@ -1017,7 +1017,7 @@ impl Scanner {
             scan_stats_callback: None,
             strict_batch_size: false,
             file_reader_options,
-            filtered_read_plan: None,
+            filtered_read_exec: None,
             aggregate: None,
             legacy_with_row_addr: false,
             legacy_with_row_id: false,
@@ -1058,13 +1058,17 @@ impl Scanner {
         self
     }
 
-    /// Set a pre-computed [`FilteredReadPlan`] as the scan source.
+    /// Set a pre-computed [`FilteredReadExec`] as the scan source.
     ///
-    /// When set, [`Self::create_plan`] uses this plan instead of building a
-    /// source from scratch. The downstream pipeline (filter, sort, limit,
-    /// final projection) is still applied on top.
-    pub fn with_filtered_read_plan(&mut self, plan: FilteredReadPlan) -> &mut Self {
-        self.filtered_read_plan = Some(plan);
+    /// When set, [`Self::create_plan`] uses this exec directly instead of
+    /// building a source from scratch. The downstream pipeline (filter, sort,
+    /// limit, final projection) is still applied on top.
+    ///
+    /// The caller should set the scanner's projection (via [`Self::project`])
+    /// to match the original scan's output columns. The split's
+    /// `output_columns` field captures those column names.
+    pub fn with_filtered_read_exec(&mut self, exec: Arc<FilteredReadExec>) -> &mut Self {
+        self.filtered_read_exec = Some(exec);
         self
     }
 
@@ -2527,14 +2531,9 @@ impl Scanner {
             (Some(_), None) => self.vector_search_source(filter_plan).await?,
             (None, Some(query)) => self.fts_search_source(filter_plan, query).await?,
             (None, None) => {
-                if let Some(plan) = self.filtered_read_plan.clone() {
-                    let has_scan_range = plan.scan_range_after_filter.is_some();
-                    let source = self.filtered_read_plan_source(plan).await?;
-                    filter_plan.disable_refine(); // filters baked into plan
-                    if has_scan_range {
-                        use_limit_node = false; // limit baked into plan
-                    }
-                    source
+                if let Some(exec) = self.filtered_read_exec.clone() {
+                    filter_plan.disable_refine(); // filters baked into exec
+                    exec as Arc<dyn ExecutionPlan>
                 } else {
                     if self.projection_plan.has_output_cols()
                         && self.projection_plan.physical_projection.is_empty()
@@ -2895,59 +2894,6 @@ impl Scanner {
             /*is_prefilter= */ false,
         )
         .await
-    }
-
-    /// Build an execution plan from a pre-computed [`FilteredReadPlan`].
-    ///
-    /// Returns an `Arc<dyn ExecutionPlan>` so it can be plugged into
-    /// [`Self::create_plan`]'s pipeline. This does **not** add a projection to
-    /// strip filter-only columns — the downstream pipeline handles that via
-    /// Stage 5 take + Stage 7 final projection.
-    async fn filtered_read_plan_source(
-        &self,
-        plan: FilteredReadPlan,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        // Extend the physical projection with columns required by residual
-        // filters so the fragment reader loads them.
-        let mut read_projection = self.projection_plan.physical_projection.clone();
-
-        let mut filter_columns = Vec::new();
-        for filter_expr in plan.filters.values() {
-            filter_columns.extend(Planner::column_names_in_expr(filter_expr));
-        }
-        if !filter_columns.is_empty() {
-            read_projection = read_projection.union_columns(filter_columns, OnMissing::Ignore)?;
-        }
-
-        // Only include fragments referenced by this plan.
-        let split_fragment_ids: std::collections::HashSet<u32> =
-            plan.rows.iter().map(|(id, _)| *id).collect();
-
-        let fragments: Vec<Fragment> = self
-            .dataset
-            .fragments()
-            .iter()
-            .filter(|f| split_fragment_ids.contains(&(f.id as u32)))
-            .cloned()
-            .collect();
-
-        let mut read_options =
-            FilteredReadOptions::new(read_projection).with_fragments(Arc::new(fragments));
-
-        if let Some(batch_size) = self.batch_size {
-            read_options = read_options.with_batch_size(batch_size as u32);
-        }
-        if let Some(fragment_readahead) = self.fragment_readahead {
-            read_options = read_options.with_fragment_readahead(fragment_readahead);
-        }
-        if let Some(io_buffer_size) = self.io_buffer_size {
-            read_options = read_options.with_io_buffer_size(io_buffer_size);
-        }
-
-        let exec = FilteredReadExec::try_new(self.dataset.clone(), read_options, None)?;
-        let exec = exec.with_plan(plan).await?;
-
-        Ok(Arc::new(exec))
     }
 
     async fn fts_search_source(
@@ -4504,20 +4450,17 @@ impl Scanner {
     /// Plan splits for distributed execution.
     ///
     /// This function takes the scanner configuration and returns a vector of
-    /// [`FilteredReadPlan`]s, where each plan represents a split containing at most
-    /// `max_rows_per_split` rows. Splits can be executed independently in parallel
-    /// across distributed workers.
+    /// [`Split`]s, where each split represents a self-contained unit of work
+    /// containing at most `max_rows_per_split` rows. Splits can be executed
+    /// independently in parallel across distributed workers.
     pub async fn plan_splits(&self, options: Option<SplittingOptions>) -> Result<Vec<Split>> {
         // Attempt to use filtering to prune fragments / rows
         let use_scalar_index = self.use_scalar_index && (self.prefilter || self.nearest.is_none());
         let mut filter_plan = self.create_filter_plan(use_scalar_index).await?;
 
         let (exec_plan, _) = self.create_execution_plan(&mut filter_plan).await?;
-        let filtered_read_plan = match exec_plan.as_any().downcast_ref::<FilteredReadExec>() {
-            Some(filtered_read_exec) => {
-                let ctx = Arc::new(TaskContext::default());
-                filtered_read_exec.get_or_create_plan(ctx).await?
-            }
+        let original_exec = match exec_plan.as_any().downcast_ref::<FilteredReadExec>() {
+            Some(filtered_read_exec) => filtered_read_exec,
             None => {
                 let fragments: Vec<Split> = self
                     .fragments
@@ -4538,6 +4481,10 @@ impl Scanner {
                 return Ok(fragments);
             }
         };
+
+        // Extract the plan from the original exec for bin-packing
+        let ctx = Arc::new(TaskContext::default());
+        let filtered_read_plan = original_exec.get_or_create_plan(ctx).await?;
 
         let options = options.unwrap_or_default();
         let output_schema = self.projection_plan.output_schema()?;
@@ -4596,33 +4543,61 @@ impl Scanner {
         bin_items.sort_by(|a, b| b.row_count.cmp(&a.row_count));
         let bins = bin_pack(bin_items, max_rows);
 
-        // Convert bins into Vec<Split>
-        let splits = bins
-            .into_iter()
-            .map(|items| {
-                let mut bitmap_map: BTreeMap<u32, RoaringBitmap> = BTreeMap::new();
-                let mut filters: HashMap<u32, Arc<Expr>> = HashMap::new();
+        // Convert bins into Vec<Split>, creating a new FilteredReadExec per split
+        // that reuses the original exec's options (projection, batch_size, etc.)
+        let original_options = original_exec.options().clone();
+        let mut splits = Vec::with_capacity(bins.len());
 
-                for item in items {
-                    *bitmap_map.entry(item.fragment_id).or_default() |= &item.bitmap;
+        for items in bins {
+            let mut bitmap_map: BTreeMap<u32, RoaringBitmap> = BTreeMap::new();
+            let mut filters: HashMap<u32, Arc<Expr>> = HashMap::new();
 
-                    if let Some(filter) = filtered_read_plan.filters.get(&item.fragment_id) {
-                        filters.insert(item.fragment_id, filter.clone());
-                    }
+            for item in items {
+                *bitmap_map.entry(item.fragment_id).or_default() |= &item.bitmap;
+
+                if let Some(filter) = filtered_read_plan.filters.get(&item.fragment_id) {
+                    filters.insert(item.fragment_id, filter.clone());
                 }
+            }
 
-                let mut rows = RowAddrTreeMap::new();
-                for (frag_id, bitmap) in bitmap_map {
-                    rows.insert_bitmap(frag_id, bitmap);
-                }
+            let mut rows = RowAddrTreeMap::new();
+            for (frag_id, bitmap) in bitmap_map {
+                rows.insert_bitmap(frag_id, bitmap);
+            }
 
-                Split::FilteredReadPlan(FilteredReadPlan {
-                    rows,
-                    filters,
-                    scan_range_after_filter: filtered_read_plan.scan_range_after_filter.clone(),
-                })
-            })
-            .collect();
+            let split_plan = FilteredReadPlan {
+                rows,
+                filters,
+                scan_range_after_filter: filtered_read_plan.scan_range_after_filter.clone(),
+            };
+
+            // Filter fragments to only those referenced in this split
+            let split_fragment_ids: std::collections::HashSet<u32> =
+                split_plan.rows.iter().map(|(id, _)| *id).collect();
+            let split_fragments: Vec<Fragment> = self
+                .dataset
+                .fragments()
+                .iter()
+                .filter(|f| split_fragment_ids.contains(&(f.id as u32)))
+                .cloned()
+                .collect();
+
+            let split_options = original_options
+                .clone()
+                .with_fragments(Arc::new(split_fragments));
+            let exec = FilteredReadExec::try_new(self.dataset.clone(), split_options, None)?;
+            let exec = exec.with_plan(split_plan).await?;
+
+            splits.push(Split::FilteredReadExec {
+                exec: Arc::new(exec),
+                output_columns: self
+                    .projection_plan
+                    .requested_output_expr
+                    .iter()
+                    .map(|c| c.name.clone())
+                    .collect(),
+            });
+        }
 
         Ok(splits)
     }
@@ -4951,8 +4926,9 @@ mod test {
         assert_plan_node_equals, DatagenExt, FragmentCount, FragmentRowCount, ThrottledStoreWrapper,
     };
 
-    /// Count the total number of rows in a FilteredReadPlan.
-    fn plan_row_count(plan: &FilteredReadPlan) -> u64 {
+    /// Count the total number of rows in a FilteredReadExec's plan.
+    fn exec_row_count(exec: &Arc<FilteredReadExec>) -> u64 {
+        let plan = exec.plan().expect("exec should have a plan");
         plan.rows
             .iter()
             .map(|(_, sel)| match sel {
@@ -4962,18 +4938,33 @@ mod test {
             .sum()
     }
 
-    /// Count the number of fragments in a FilteredReadPlan.
-    fn plan_fragment_count(plan: &FilteredReadPlan) -> usize {
+    /// Count the number of fragments in a FilteredReadExec's plan.
+    fn exec_fragment_count(exec: &Arc<FilteredReadExec>) -> usize {
+        let plan = exec.plan().expect("exec should have a plan");
         plan.rows.iter().count()
     }
 
-    /// Extract FilteredReadPlans from a Vec<Split>, panicking if any split is not a FilteredReadPlan.
-    fn unwrap_plans(splits: Vec<Split>) -> Vec<FilteredReadPlan> {
+    /// Extract FilteredReadExecs from a Vec<Split>, panicking if any split is not a FilteredReadExec.
+    fn unwrap_execs(splits: Vec<Split>) -> Vec<Arc<FilteredReadExec>> {
         splits
             .into_iter()
             .map(|s| match s {
-                Split::FilteredReadPlan(plan) => plan,
-                Split::Fragments(_) => panic!("Expected FilteredReadPlan"),
+                Split::FilteredReadExec { exec, .. } => exec,
+                Split::Fragments(_) => panic!("Expected FilteredReadExec"),
+            })
+            .collect()
+    }
+
+    /// Extract (exec, output_columns) pairs from a Vec<Split>.
+    fn unwrap_splits(splits: Vec<Split>) -> Vec<(Arc<FilteredReadExec>, Vec<String>)> {
+        splits
+            .into_iter()
+            .map(|s| match s {
+                Split::FilteredReadExec {
+                    exec,
+                    output_columns,
+                } => (exec, output_columns),
+                Split::Fragments(_) => panic!("Expected FilteredReadExec"),
             })
             .collect()
     }
@@ -9693,7 +9684,7 @@ mod test {
     // =========================================================================
 
     #[tokio::test]
-    async fn test_plan_splits_basic_returns_filtered_read_plans() {
+    async fn test_plan_splits_basic_returns_filtered_read_execs() {
         // Basic scan should return FilteredReadPlans variant
         let dataset = lance_datagen::gen_batch()
             .col("id", array::step::<Int32Type>())
@@ -9702,11 +9693,11 @@ mod test {
             .unwrap();
 
         let splits = dataset.scan().plan_splits(None).await.unwrap();
-        let plans = unwrap_plans(splits);
+        let plans = unwrap_execs(splits);
 
         assert!(!plans.is_empty(), "Should have at least one plan");
         // Verify all fragments are covered
-        let total_rows: u64 = plans.iter().map(plan_row_count).sum();
+        let total_rows: u64 = plans.iter().map(exec_row_count).sum();
         assert_eq!(total_rows, 400, "Should cover all 400 rows");
     }
 
@@ -9727,12 +9718,12 @@ mod test {
             .await
             .unwrap();
 
-        let plans = unwrap_plans(splits);
+        let plans = unwrap_execs(splits);
 
         assert!(!plans.is_empty(), "Should have at least one plan");
         // Each plan should have filters for the fragments it covers
         for plan in &plans {
-            assert!(plan_row_count(plan) > 0, "Each plan should have rows");
+            assert!(exec_row_count(plan) > 0, "Each plan should have rows");
         }
     }
 
@@ -9751,7 +9742,7 @@ mod test {
         };
 
         let splits = dataset.scan().plan_splits(Some(options)).await.unwrap();
-        let plans = unwrap_plans(splits);
+        let plans = unwrap_execs(splits);
 
         // With 400 rows and max 50 per split, we need at least 8 splits
         assert!(
@@ -9761,7 +9752,7 @@ mod test {
         );
         // Verify each split has at most 50 rows
         for (i, plan) in plans.iter().enumerate() {
-            let rows = plan_row_count(plan);
+            let rows = exec_row_count(plan);
             assert!(
                 rows <= 50,
                 "Split {} has {} rows, expected at most 50",
@@ -9787,7 +9778,7 @@ mod test {
         };
 
         let splits = dataset.scan().plan_splits(Some(options)).await.unwrap();
-        let plans = unwrap_plans(splits);
+        let plans = unwrap_execs(splits);
 
         // With 400 rows and max ~10 per split, we need at least 40 splits
         assert!(
@@ -9814,7 +9805,7 @@ mod test {
         };
 
         let splits = dataset.scan().plan_splits(Some(options)).await.unwrap();
-        let plans = unwrap_plans(splits);
+        let plans = unwrap_execs(splits);
 
         // Should use the byte constraint (~10 rows), not the row count (100 rows)
         assert!(
@@ -9835,7 +9826,7 @@ mod test {
 
         // With default 128 MiB and small dataset, should get few splits
         let splits = dataset.scan().plan_splits(None).await.unwrap();
-        let plans = unwrap_plans(splits);
+        let plans = unwrap_execs(splits);
 
         // Small dataset should fit in very few splits with 128 MiB default
         // Bin packing may combine fragments
@@ -9857,7 +9848,7 @@ mod test {
         };
 
         let splits = dataset.scan().plan_splits(Some(options)).await.unwrap();
-        let plans = unwrap_plans(splits);
+        let plans = unwrap_execs(splits);
 
         // Single fragment with 100 rows, max 25 per split -> 4 splits
         assert!(
@@ -9865,8 +9856,9 @@ mod test {
             "Should have at least 4 splits for 100 rows with max 25 per split, got {}",
             plans.len()
         );
-        // All plans should reference fragment 0
-        for plan in &plans {
+        // All execs should reference fragment 0
+        for exec in &plans {
+            let plan = exec.plan().expect("exec should have a plan");
             assert!(
                 plan.rows.iter().all(|(frag_id, _)| *frag_id == 0),
                 "Single fragment dataset should only have fragment 0"
@@ -9889,7 +9881,7 @@ mod test {
         };
 
         let splits = dataset.scan().plan_splits(Some(options)).await.unwrap();
-        let plans = unwrap_plans(splits);
+        let plans = unwrap_execs(splits);
 
         // 100 rows with max 10 per split -> at least 10 splits
         assert!(
@@ -9899,7 +9891,7 @@ mod test {
         );
         // Verify each split respects the max
         for (i, plan) in plans.iter().enumerate() {
-            let rows = plan_row_count(plan);
+            let rows = exec_row_count(plan);
             assert!(
                 rows <= 10,
                 "Split {} has {} rows, expected at most 10",
@@ -9930,7 +9922,7 @@ mod test {
                 Split::Fragments(frag_ids) => {
                     assert_eq!(frag_ids.len(), 1, "Each split should contain one fragment");
                 }
-                Split::FilteredReadPlan(_) => {
+                Split::FilteredReadExec { .. } => {
                     panic!("Expected Fragments variant for vector search")
                 }
             }
@@ -9952,7 +9944,7 @@ mod test {
         };
 
         let splits = dataset.scan().plan_splits(Some(options)).await.unwrap();
-        let plans = unwrap_plans(splits);
+        let plans = unwrap_execs(splits);
 
         // 100 total rows, max 50 per split -> bin packing should give 2 splits
         assert!(
@@ -9961,7 +9953,7 @@ mod test {
             plans.len()
         );
         // Some plans should have multiple fragments
-        let multi_frag_plans = plans.iter().filter(|p| plan_fragment_count(p) > 1).count();
+        let multi_frag_plans = plans.iter().filter(|p| exec_fragment_count(p) > 1).count();
         assert!(
             multi_frag_plans > 0,
             "At least one plan should combine multiple fragments"
@@ -9983,9 +9975,9 @@ mod test {
         };
 
         let splits = dataset.scan().plan_splits(Some(options)).await.unwrap();
-        let plans = unwrap_plans(splits);
+        let plans = unwrap_execs(splits);
 
-        let total_rows: u64 = plans.iter().map(plan_row_count).sum();
+        let total_rows: u64 = plans.iter().map(exec_row_count).sum();
         assert_eq!(
             total_rows,
             5 * 73,
@@ -9994,8 +9986,8 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_scanner_with_filtered_read_plan() {
-        // Verify that plan_splits -> with_filtered_read_plan -> create_plan -> execute
+    async fn test_scanner_with_filtered_read_exec() {
+        // Verify that plan_splits -> with_filtered_read_exec -> create_plan -> execute
         // produces the same results as a direct scan.
         let dataset = lance_datagen::gen_batch()
             .col("id", array::step::<Int32Type>())
@@ -10006,21 +9998,22 @@ mod test {
         // Get the expected result from a direct scan.
         let expected = dataset.scan().try_into_batch().await.unwrap();
 
-        // Plan splits and execute each via with_filtered_read_plan.
+        // Plan splits and execute each via with_filtered_read_exec.
         let options = SplittingOptions {
             max_row_count: Some(150),
             max_size_bytes: None,
         };
         let splits = dataset.scan().plan_splits(Some(options)).await.unwrap();
 
-        let plans = unwrap_plans(splits);
+        let split_pairs = unwrap_splits(splits);
 
-        assert!(plans.len() > 1, "Should have multiple splits");
+        assert!(split_pairs.len() > 1, "Should have multiple splits");
 
         let mut total_rows = 0u64;
-        for plan in plans {
+        for (exec, output_columns) in split_pairs {
             let mut scanner = dataset.scan();
-            scanner.with_filtered_read_plan(plan);
+            scanner.project(&output_columns).unwrap();
+            scanner.with_filtered_read_exec(exec);
             let batch = scanner.try_into_batch().await.unwrap();
             assert!(batch.num_rows() > 0, "Each split should produce rows");
             total_rows += batch.num_rows() as u64;
@@ -10037,7 +10030,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_scanner_with_filtered_read_plan_and_filter() {
+    async fn test_scanner_with_filtered_read_exec_and_filter() {
         // Verify that a filtered scan works with pre-computed plans.
         let dataset = lance_datagen::gen_batch()
             .col("id", array::step::<Int32Type>())
@@ -10063,22 +10056,92 @@ mod test {
             .await
             .unwrap();
 
-        let plans = unwrap_plans(splits);
+        let split_pairs = unwrap_splits(splits);
 
-        // Verify plans have filters
-        for plan in &plans {
+        // Verify execs have filters
+        for (exec, _) in &split_pairs {
+            let plan = exec.plan().expect("exec should have a plan");
             assert!(
                 !plan.filters.is_empty(),
-                "Plans from filtered scan should have filters"
+                "Execs from filtered scan should have filters"
             );
         }
 
-        // Verify with_filtered_read_plan + create_plan
+        // Verify with_filtered_read_exec + create_plan
         let mut total_rows = 0u64;
-        for plan in plans {
+        for (exec, output_columns) in split_pairs {
             let mut scanner = dataset.scan();
-            scanner.with_filtered_read_plan(plan);
+            scanner.project(&output_columns).unwrap();
+            scanner.with_filtered_read_exec(exec);
             let batch = scanner.try_into_batch().await.unwrap();
+            total_rows += batch.num_rows() as u64;
+        }
+
+        assert_eq!(
+            total_rows,
+            expected.num_rows() as u64,
+            "Total rows across splits should equal filtered row count"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scanner_with_filtered_read_exec_preserves_projection() {
+        // Verify that when a scanner selects a subset of columns and applies a
+        // filter, the output_projection from plan_splits ensures only the
+        // requested columns appear in the output — not the filter-only columns.
+        let dataset = lance_datagen::gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .col("value", array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(100))
+            .await
+            .unwrap();
+
+        // Direct scan: select only "value", filter on "id".
+        let expected = dataset
+            .scan()
+            .project(&["value"])
+            .unwrap()
+            .filter("id >= 100")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(
+            expected.schema().fields().len(),
+            1,
+            "Direct scan should produce only 'value'"
+        );
+        assert_eq!(expected.schema().field(0).name(), "value");
+
+        // Plan splits with the same projection + filter.
+        let mut planner = dataset.scan();
+        planner.project(&["value"]).unwrap();
+        planner.filter("id >= 100").unwrap();
+        let splits = planner.plan_splits(None).await.unwrap();
+
+        let split_pairs = unwrap_splits(splits);
+        assert!(!split_pairs.is_empty());
+
+        let mut total_rows = 0u64;
+        for (exec, output_columns) in split_pairs {
+            let mut scanner = dataset.scan();
+            scanner.project(&output_columns).unwrap();
+            scanner.with_filtered_read_exec(exec);
+            let batch = scanner.try_into_batch().await.unwrap();
+
+            // The output should contain only "value", not "id".
+            assert_eq!(
+                batch.schema().fields().len(),
+                1,
+                "Split output should have only the projected column, got: {:?}",
+                batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().as_str())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(batch.schema().field(0).name(), "value");
             total_rows += batch.num_rows() as u64;
         }
 

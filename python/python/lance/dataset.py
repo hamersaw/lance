@@ -53,7 +53,7 @@ from .lance import (
     Compaction,
     CompactionMetrics,
     DatasetBasePath,
-    FilteredReadPlan,
+    FilteredReadExec,
     IOStats,
     LanceSchema,
     PySearchFilter,
@@ -5263,7 +5263,7 @@ class LanceScanner(pa.dataset.Scanner):
 
         This method divides the scan into splits that can be processed in parallel.
         Returns a list of :class:`Split` objects, each representing a single unit
-        of work. Each split is either a :class:`FilteredReadPlan` or a list of
+        of work. Each split is either a :class:`FilteredReadExec` or a list of
         fragment IDs.
 
         Parameters
@@ -5280,8 +5280,8 @@ class LanceScanner(pa.dataset.Scanner):
         -------
         list[Split]
             A list of :class:`Split` objects, where each split has either:
-            - ``filtered_read_plan``: An opaque :class:`FilteredReadPlan`
-              object to pass to :meth:`with_filtered_read_plan`.
+            - ``filtered_read_exec``: An opaque :class:`FilteredReadExec`
+              object to pass to :meth:`with_filtered_read_exec`.
             - ``fragments``: A list of fragment IDs.
 
         Examples
@@ -5294,7 +5294,7 @@ class LanceScanner(pa.dataset.Scanner):
         >>> scanner = dataset.scanner()
         >>> splits = scanner.plan_splits(max_row_count=2)
         >>> for split in splits:
-        ...     if split.filtered_read_plan is not None:
+        ...     if split.filtered_read_exec is not None:
         ...         print(split)  # doctest: +SKIP
         """
         return self._scanner.plan_splits(
@@ -5302,23 +5302,23 @@ class LanceScanner(pa.dataset.Scanner):
             max_row_count=max_row_count,
         )
 
-    def with_filtered_read_plan(self, plan: FilteredReadPlan) -> "LanceScanner":
-        """Return a new scanner with a pre-computed FilteredReadPlan as its source.
+    def with_filtered_read_exec(self, exec: FilteredReadExec) -> "LanceScanner":
+        """Return a new scanner with a pre-computed FilteredReadExec as its source.
 
-        This method injects the plan into the scanner so that the full
+        This method injects the exec into the scanner so that the full
         downstream pipeline (filter, sort, limit, projection) is applied.
 
         Parameters
         ----------
-        plan : FilteredReadPlan
-            A plan obtained from :meth:`plan_splits`.
+        exec : FilteredReadExec
+            An exec obtained from :meth:`plan_splits`.
 
         Returns
         -------
         LanceScanner
-            A new scanner configured with the given plan.
+            A new scanner configured with the given exec.
         """
-        return LanceScanner(self._scanner.with_filtered_read_plan(plan), self._ds)
+        return LanceScanner(self._scanner.with_filtered_read_exec(exec), self._ds)
 
 
 class DatasetOptimizer:

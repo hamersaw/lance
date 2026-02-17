@@ -28,7 +28,7 @@ from .fragment import FragmentMetadata, LanceFragment
 from .lance import (
     DatasetBasePath,
     FFILanceTableProvider,
-    FilteredReadPlan,
+    FilteredReadExec,
     ScanStatistics,
     Split,
     bytes_read_counter,
@@ -62,7 +62,7 @@ __all__ = [
     "DatasetBasePath",
     "DataStatistics",
     "FieldStatistics",
-    "FilteredReadPlan",
+    "FilteredReadExec",
     "FragmentMetadata",
     "Index",
     "LanceDataset",

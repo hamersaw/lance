@@ -15,7 +15,7 @@ use jni::{sys::jlong, JNIEnv};
 use lance::dataset::scanner::{
     AggregateExpr, ColumnOrdering, DatasetRecordBatchStream, Scanner, Split, SplittingOptions,
 };
-use lance::io::exec::filtered_read::FilteredReadPlan;
+use lance::io::exec::filtered_read::FilteredReadExec;
 use lance_index::scalar::inverted::query::{
     BooleanQuery as FtsBooleanQuery, BoostQuery as FtsBoostQuery, FtsQuery,
     MatchQuery as FtsMatchQuery, MultiMatchQuery as FtsMultiMatchQuery, Occur as FtsOccur,
@@ -65,9 +65,9 @@ impl BlockingScanner {
         Ok(res)
     }
 
-    pub fn with_filtered_read_plan(&self, plan: FilteredReadPlan) -> BlockingScanner {
+    pub fn with_filtered_read_exec(&self, exec: Arc<FilteredReadExec>) -> BlockingScanner {
         let mut scanner = (*self.inner).clone();
-        scanner.with_filtered_read_plan(plan);
+        scanner.with_filtered_read_exec(exec);
         BlockingScanner {
             inner: Arc::new(scanner),
         }
@@ -558,13 +558,21 @@ fn create_java_split_list<'a>(env: &mut JNIEnv<'a>, splits: Vec<Split>) -> Resul
 
     for split in splits {
         let j_split = match split {
-            Split::FilteredReadPlan(plan) => {
-                let j_plan = create_java_filtered_read_plan(env, plan)?;
-                // new Split(filteredReadPlan, null)
+            Split::FilteredReadExec {
+                exec,
+                output_columns,
+            } => {
+                let j_exec = create_java_filtered_read_exec(env, exec)?;
+                let j_columns = create_java_string_list(env, &output_columns)?;
+                // new Split(filteredReadExec, null, outputColumns)
                 env.new_object(
                     "org/lance/ipc/Split",
-                    "(Lorg/lance/ipc/FilteredReadPlan;Ljava/util/List;)V",
-                    &[(&j_plan).into(), (&JObject::null()).into()],
+                    "(Lorg/lance/ipc/FilteredReadExec;Ljava/util/List;Ljava/util/List;)V",
+                    &[
+                        (&j_exec).into(),
+                        (&JObject::null()).into(),
+                        (&j_columns).into(),
+                    ],
                 )?
             }
             Split::Fragments(frag_ids) => {
@@ -584,11 +592,15 @@ fn create_java_split_list<'a>(env: &mut JNIEnv<'a>, splits: Vec<Split>) -> Resul
                         &[(&j_int).into()],
                     )?;
                 }
-                // new Split(null, fragments)
+                // new Split(null, fragments, null)
                 env.new_object(
                     "org/lance/ipc/Split",
-                    "(Lorg/lance/ipc/FilteredReadPlan;Ljava/util/List;)V",
-                    &[(&JObject::null()).into(), (&j_frag_list).into()],
+                    "(Lorg/lance/ipc/FilteredReadExec;Ljava/util/List;Ljava/util/List;)V",
+                    &[
+                        (&JObject::null()).into(),
+                        (&j_frag_list).into(),
+                        (&JObject::null()).into(),
+                    ],
                 )?
             }
         };
@@ -603,69 +615,82 @@ fn create_java_split_list<'a>(env: &mut JNIEnv<'a>, splits: Vec<Split>) -> Resul
     Ok(j_list)
 }
 
-fn create_java_filtered_read_plan<'a>(
+fn create_java_filtered_read_exec<'a>(
     env: &mut JNIEnv<'a>,
-    plan: FilteredReadPlan,
+    exec: Arc<FilteredReadExec>,
 ) -> Result<JObject<'a>> {
-    let j_plan = env.new_object("org/lance/ipc/FilteredReadPlan", "()V", &[])?;
+    let j_exec = env.new_object("org/lance/ipc/FilteredReadExec", "()V", &[])?;
 
-    // Box the plan and store the pointer as the nativeHandle field
-    let boxed = Box::new(plan);
+    // Box the Arc and store the pointer as the nativeHandle field
+    let boxed = Box::new(exec);
     let handle = Box::into_raw(boxed) as jlong;
-    env.set_field(&j_plan, "nativeHandle", "J", handle.into())?;
+    env.set_field(&j_exec, "nativeHandle", "J", handle.into())?;
 
-    Ok(j_plan)
+    Ok(j_exec)
+}
+
+fn create_java_string_list<'a>(env: &mut JNIEnv<'a>, strings: &[String]) -> Result<JObject<'a>> {
+    let j_list = env.new_object(
+        "java/util/ArrayList",
+        "(I)V",
+        &[(strings.len() as jint).into()],
+    )?;
+    for s in strings {
+        let j_str = env.new_string(s)?;
+        env.call_method(&j_list, "add", "(Ljava/lang/Object;)Z", &[(&j_str).into()])?;
+    }
+    Ok(j_list)
 }
 
 /////////////////////////////////////
-// with_filtered_read_plan         //
+// with_filtered_read_exec         //
 /////////////////////////////////////
 #[no_mangle]
-pub extern "system" fn Java_org_lance_ipc_LanceScanner_nativeWithFilteredReadPlan<'local>(
+pub extern "system" fn Java_org_lance_ipc_LanceScanner_nativeWithFilteredReadExec<'local>(
     mut env: JNIEnv<'local>,
     j_scanner: JObject,
-    j_plan: JObject,
+    j_exec: JObject,
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
-        inner_with_filtered_read_plan(&mut env, j_scanner, j_plan)
+        inner_with_filtered_read_exec(&mut env, j_scanner, j_exec)
     )
 }
 
-fn inner_with_filtered_read_plan<'local>(
+fn inner_with_filtered_read_exec<'local>(
     env: &mut JNIEnv<'local>,
     j_scanner: JObject,
-    j_plan: JObject,
+    j_exec: JObject,
 ) -> Result<JObject<'local>> {
-    let handle = env.get_field(&j_plan, "nativeHandle", "J")?.j()?;
+    let handle = env.get_field(&j_exec, "nativeHandle", "J")?.j()?;
     if handle == 0 {
         return Err(Error::input_error(
-            "FilteredReadPlan has been closed".to_string(),
+            "FilteredReadExec has been closed".to_string(),
         ));
     }
-    // Clone the plan (do NOT take ownership — user may reuse it)
-    let plan = unsafe { &*(handle as *const FilteredReadPlan) }.clone();
+    // Clone the Arc (do NOT take ownership — user may reuse it)
+    let exec = unsafe { &*(handle as *const Arc<FilteredReadExec>) }.clone();
 
     let new_scanner = {
         let scanner_guard =
             unsafe { env.get_rust_field::<_, _, BlockingScanner>(&j_scanner, NATIVE_SCANNER) }?;
-        scanner_guard.with_filtered_read_plan(plan)
+        scanner_guard.with_filtered_read_exec(exec)
     };
     new_scanner.into_java(env)
 }
 
 ///////////////////////////////////
-// FilteredReadPlan native free  //
+// FilteredReadExec native free  //
 ///////////////////////////////////
 #[no_mangle]
-pub extern "system" fn Java_org_lance_ipc_FilteredReadPlan_releaseNativePlan(
+pub extern "system" fn Java_org_lance_ipc_FilteredReadExec_releaseNativeExec(
     _env: JNIEnv,
     _class: JObject,
     handle: jlong,
 ) {
     if handle != 0 {
         unsafe {
-            drop(Box::from_raw(handle as *mut FilteredReadPlan));
+            drop(Box::from_raw(handle as *mut Arc<FilteredReadExec>));
         }
     }
 }

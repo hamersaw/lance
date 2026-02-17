@@ -14,7 +14,7 @@
 package org.lance;
 
 import org.lance.ipc.ColumnOrdering;
-import org.lance.ipc.FilteredReadPlan;
+import org.lance.ipc.FilteredReadExec;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
 import org.lance.ipc.Split;
@@ -557,8 +557,8 @@ public class ScannerTest {
           assertFalse(splits.isEmpty(), "Should have at least one split");
           for (Split split : splits) {
             assertTrue(
-                split.getFilteredReadPlan().isPresent() || split.getFragments().isPresent(),
-                "Each split should have either filteredReadPlan or fragments");
+                split.getFilteredReadExec().isPresent() || split.getFragments().isPresent(),
+                "Each split should have either filteredReadExec or fragments");
           }
         }
       }
@@ -598,9 +598,9 @@ public class ScannerTest {
           List<Split> splits = scanner.planSplits(null);
           int totalScannedRows = 0;
           for (Split split : splits) {
-            if (split.getFilteredReadPlan().isPresent()) {
-              FilteredReadPlan p = split.getFilteredReadPlan().get();
-              try (LanceScanner splitScanner = scanner.withFilteredReadPlan(p);
+            if (split.getFilteredReadExec().isPresent()) {
+              FilteredReadExec e = split.getFilteredReadExec().get();
+              try (LanceScanner splitScanner = scanner.withFilteredReadExec(e);
                   ArrowReader reader = splitScanner.scanBatches()) {
                 while (reader.loadNextBatch()) {
                   totalScannedRows += reader.getVectorSchemaRoot().getRowCount();

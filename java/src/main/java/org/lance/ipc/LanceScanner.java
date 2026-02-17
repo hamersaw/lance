@@ -172,7 +172,7 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
    *
    * <p>This method divides the scan into splits that can be processed in parallel. Returns a list
    * of {@link Split} objects, each representing a single unit of work that is either a {@link
-   * FilteredReadPlan} or a list of fragment IDs.
+   * FilteredReadExec} or a list of fragment IDs.
    *
    * @param options split options, or null to use defaults
    * @return a list of {@link Split} objects describing how to divide the scan
@@ -190,19 +190,19 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
       Optional<Long> maxSizeBytes, Optional<Long> maxRowCount);
 
   /**
-   * Return a new scanner with a pre-computed {@link FilteredReadPlan} as its source.
+   * Return a new scanner with a pre-computed {@link FilteredReadExec} as its source.
    *
-   * <p>This method injects the plan into the scanner so that the full downstream pipeline (filter,
+   * <p>This method injects the exec into the scanner so that the full downstream pipeline (filter,
    * sort, limit, projection) is applied.
    *
-   * @param plan a plan obtained from {@link #planSplits}
-   * @return a new scanner configured with the given plan
+   * @param exec an exec obtained from {@link #planSplits}
+   * @return a new scanner configured with the given exec
    */
-  public LanceScanner withFilteredReadPlan(FilteredReadPlan plan) {
+  public LanceScanner withFilteredReadExec(FilteredReadExec exec) {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeScannerHandle != 0, "Scanner is closed");
-      Preconditions.checkNotNull(plan);
-      LanceScanner newScanner = nativeWithFilteredReadPlan(plan);
+      Preconditions.checkNotNull(exec);
+      LanceScanner newScanner = nativeWithFilteredReadExec(exec);
       newScanner.allocator = this.allocator;
       newScanner.dataset = this.dataset;
       newScanner.options = this.options;
@@ -210,5 +210,5 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
     }
   }
 
-  private native LanceScanner nativeWithFilteredReadPlan(FilteredReadPlan plan);
+  private native LanceScanner nativeWithFilteredReadExec(FilteredReadExec exec);
 }

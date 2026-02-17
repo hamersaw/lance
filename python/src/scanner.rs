@@ -23,7 +23,8 @@ use arrow_array::RecordBatchReader;
 use lance::dataset::scanner::{
     ExecutionSummaryCounts, Split, SplittingOptions as LanceSplittingOptions,
 };
-use lance::io::exec::filtered_read::FilteredReadPlan;
+use lance::io::exec::filtered_read::FilteredReadExec;
+
 use pyo3::prelude::*;
 use pyo3::pyclass;
 
@@ -179,9 +180,9 @@ impl Scanner {
         Ok(splits.into_iter().map(PySplit::from).collect())
     }
 
-    fn with_filtered_read_plan(&self, plan: PyFilteredReadPlan) -> Scanner {
+    fn with_filtered_read_exec(&self, exec: PyFilteredReadExec) -> Scanner {
         let mut scanner = (*self.scanner).clone();
-        scanner.with_filtered_read_plan(plan.inner);
+        scanner.with_filtered_read_exec(exec.inner);
         Scanner::new(Arc::new(scanner))
     }
 }
@@ -190,24 +191,33 @@ impl Scanner {
 #[pyclass(name = "Split", module = "_lib")]
 #[derive(Clone)]
 pub struct PySplit {
-    /// The filtered read plan, if this is a `FilteredReadPlan` variant.
+    /// The filtered read exec, if this is a `FilteredReadExec` variant.
     #[pyo3(get)]
-    pub filtered_read_plan: Option<PyFilteredReadPlan>,
+    pub filtered_read_exec: Option<PyFilteredReadExec>,
     /// The fragment IDs, if this is a `Fragments` variant.
     #[pyo3(get)]
     pub fragments: Option<Vec<u32>>,
+    /// Ordered output column names from the original scan, including metadata
+    /// columns like `_rowid`. Only set for the `FilteredReadExec` variant.
+    #[pyo3(get)]
+    pub output_columns: Option<Vec<String>>,
 }
 
 impl From<Split> for PySplit {
     fn from(split: Split) -> Self {
         match split {
-            Split::FilteredReadPlan(plan) => Self {
-                filtered_read_plan: Some(PyFilteredReadPlan::from(plan)),
+            Split::FilteredReadExec {
+                exec,
+                output_columns,
+            } => Self {
+                filtered_read_exec: Some(PyFilteredReadExec { inner: exec }),
                 fragments: None,
+                output_columns: Some(output_columns),
             },
             Split::Fragments(fragment_ids) => Self {
-                filtered_read_plan: None,
+                filtered_read_exec: None,
                 fragments: Some(fragment_ids),
+                output_columns: None,
             },
         }
     }
@@ -216,8 +226,8 @@ impl From<Split> for PySplit {
 #[pymethods]
 impl PySplit {
     fn __repr__(&self) -> String {
-        if let Some(plan) = &self.filtered_read_plan {
-            format!("Split(filtered_read_plan={:?})", plan.inner)
+        if self.filtered_read_exec.is_some() {
+            "Split(filtered_read_exec=<FilteredReadExec>)".to_string()
         } else if let Some(fragments) = &self.fragments {
             format!("Split(fragments={:?})", fragments)
         } else {
@@ -226,24 +236,18 @@ impl PySplit {
     }
 }
 
-/// An opaque wrapper around a Rust [`FilteredReadPlan`].
+/// An opaque wrapper around a Rust [`FilteredReadExec`].
 ///
 /// Created by :meth:`Scanner.plan_splits` and consumed by
-/// :meth:`Scanner.with_filtered_read_plan`.
-#[pyclass(name = "FilteredReadPlan", module = "_lib")]
+/// :meth:`Scanner.with_filtered_read_exec`.
+#[pyclass(name = "FilteredReadExec", module = "_lib")]
 #[derive(Clone)]
-pub struct PyFilteredReadPlan {
-    pub(crate) inner: FilteredReadPlan,
-}
-
-impl From<FilteredReadPlan> for PyFilteredReadPlan {
-    fn from(plan: FilteredReadPlan) -> Self {
-        Self { inner: plan }
-    }
+pub struct PyFilteredReadExec {
+    pub(crate) inner: Arc<FilteredReadExec>,
 }
 
 #[pymethods]
-impl PyFilteredReadPlan {
+impl PyFilteredReadExec {
     fn __repr__(&self) -> String {
         format!("{:?}", self.inner)
     }

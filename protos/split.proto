@@ -8,12 +8,19 @@ package lance.datafusion;
 import "filtered_read.proto";
 
 // A single unit of work for distributed execution.
-// Each split is one of two variants: a FilteredReadPlan or a list of fragment IDs.
+// Each split is one of two variants: a FilteredReadExec or a list of fragment IDs.
 message SplitProto {
   oneof split {
-    FilteredReadPlanProto filtered_read_plan = 1;
+    FilteredReadExecProto filtered_read_exec = 3;
     FragmentIdList fragments = 2;
   }
+
+  // Ordered column names of the user's originally requested output projection.
+  // Only used for the FilteredReadExec variant. The exec's own projection may
+  // include additional filter-only columns; these names capture the columns
+  // the user originally selected, in order, including metadata columns like
+  // _rowid and _rowaddr.
+  repeated string output_columns = 4;
 }
 
 message FragmentIdList {

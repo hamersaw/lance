@@ -54,7 +54,7 @@ use log::Level;
 use pyo3::exceptions::PyIOError;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyAnyMethods, PyCapsule};
-use scanner::{PyFilteredReadPlan, PySplit, ScanStatistics};
+use scanner::{PyFilteredReadExec, PySplit, ScanStatistics};
 use session::Session;
 
 pub(crate) mod arrow;
@@ -271,7 +271,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRewriteResult>()?;
     m.add_class::<PyCompactionMetrics>()?;
     m.add_class::<ScanStatistics>()?;
-    m.add_class::<PyFilteredReadPlan>()?;
+    m.add_class::<PyFilteredReadExec>()?;
     m.add_class::<PySplit>()?;
     m.add_class::<Session>()?;
     m.add_class::<PyTraceEvent>()?;

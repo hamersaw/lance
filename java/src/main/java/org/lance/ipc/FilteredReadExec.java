@@ -14,36 +14,36 @@
 package org.lance.ipc;
 
 /**
- * An opaque handle to a native Rust {@code FilteredReadPlan}.
+ * An opaque handle to a native Rust {@code FilteredReadExec}.
  *
  * <p>Instances are created by {@link LanceScanner#planSplits} and consumed by {@link
- * LanceScanner#withFilteredReadPlan}. The plan is stored in native memory and must be freed by
+ * LanceScanner#withFilteredReadExec}. The exec is stored in native memory and must be freed by
  * calling {@link #close()}.
  */
-public class FilteredReadPlan implements AutoCloseable {
+public class FilteredReadExec implements AutoCloseable {
   private long nativeHandle;
 
-  private FilteredReadPlan() {}
+  private FilteredReadExec() {}
 
   /**
-   * Release the native memory associated with this plan.
+   * Release the native memory associated with this exec.
    *
-   * <p>After calling this method, the plan can no longer be executed.
+   * <p>After calling this method, the exec can no longer be executed.
    */
   @Override
   public void close() {
     if (nativeHandle != 0) {
-      releaseNativePlan(nativeHandle);
+      releaseNativeExec(nativeHandle);
       nativeHandle = 0;
     }
   }
 
   long getNativeHandle() {
     if (nativeHandle == 0) {
-      throw new IllegalStateException("FilteredReadPlan has been closed");
+      throw new IllegalStateException("FilteredReadExec has been closed");
     }
     return nativeHandle;
   }
 
-  private static native void releaseNativePlan(long handle);
+  private static native void releaseNativeExec(long handle);
 }
