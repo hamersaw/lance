@@ -994,6 +994,23 @@ pub extern "system" fn Java_org_lance_namespace_RestNamespace_declareTableNative
 }
 
 #[no_mangle]
+pub extern "system" fn Java_org_lance_namespace_RestNamespace_renameTableNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_rest_namespace_method(&mut env, handle, request_json, |ns, req| {
+            RT.block_on(ns.inner.rename_table(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[no_mangle]
 pub extern "system" fn Java_org_lance_namespace_RestNamespace_insertIntoTableNative(
     mut env: JNIEnv,
     _obj: JObject,

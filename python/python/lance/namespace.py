@@ -42,6 +42,8 @@ from lance_namespace import (
     NamespaceExistsRequest,
     RegisterTableRequest,
     RegisterTableResponse,
+    RenameTableRequest,
+    RenameTableResponse,
     TableExistsRequest,
 )
 
@@ -535,6 +537,10 @@ class RestNamespace(LanceNamespace):
     def declare_table(self, request: DeclareTableRequest) -> DeclareTableResponse:
         response_dict = self._inner.declare_table(request.model_dump())
         return DeclareTableResponse.from_dict(response_dict)
+
+    def rename_table(self, request: RenameTableRequest) -> RenameTableResponse:
+        response_dict = self._inner.rename_table(request.model_dump())
+        return RenameTableResponse.from_dict(response_dict)
 
 
 class RestAdapter:

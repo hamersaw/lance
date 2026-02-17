@@ -244,6 +244,14 @@ public class RestNamespace implements LanceNamespace, Closeable {
   }
 
   @Override
+  public RenameTableResponse renameTable(RenameTableRequest request) {
+    ensureInitialized();
+    String requestJson = toJson(request);
+    String responseJson = renameTableNative(nativeRestNamespaceHandle, requestJson);
+    return fromJson(responseJson, RenameTableResponse.class);
+  }
+
+  @Override
   public InsertIntoTableResponse insertIntoTable(
       InsertIntoTableRequest request, byte[] requestData) {
     ensureInitialized();
@@ -396,6 +404,8 @@ public class RestNamespace implements LanceNamespace, Closeable {
   private native String createEmptyTableNative(long handle, String requestJson);
 
   private native String declareTableNative(long handle, String requestJson);
+
+  private native String renameTableNative(long handle, String requestJson);
 
   private native String insertIntoTableNative(long handle, String requestJson, byte[] requestData);
 

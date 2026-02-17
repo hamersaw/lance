@@ -548,6 +548,18 @@ impl PyRestNamespace {
             .infer_error()?;
         Ok(pythonize(py, &response)?.into())
     }
+
+    fn rename_table<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.rename_table(request))?
+            .infer_error()?;
+        Ok(pythonize(py, &response)?.into())
+    }
 }
 
 /// Python wrapper for REST adapter server

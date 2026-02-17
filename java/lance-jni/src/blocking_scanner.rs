@@ -13,7 +13,7 @@ use jni::objects::{JObject, JString};
 use jni::sys::{jboolean, jint, JNI_TRUE};
 use jni::{sys::jlong, JNIEnv};
 use lance::dataset::scanner::{
-    ColumnOrdering, DatasetRecordBatchStream, Scanner, Splits, SplittingOptions,
+    AggregateExpr, ColumnOrdering, DatasetRecordBatchStream, Scanner, Splits, SplittingOptions,
 };
 use lance::io::exec::filtered_read::FilteredReadPlan;
 use lance_index::scalar::inverted::query::{
@@ -217,19 +217,20 @@ pub extern "system" fn Java_org_lance_ipc_LanceScanner_createScanner<'local>(
     mut env: JNIEnv<'local>,
     _reader: JObject,
     jdataset: JObject,
-    fragment_ids_obj: JObject,     // Optional<List<Integer>>
-    columns_obj: JObject,          // Optional<List<String>>
-    substrait_filter_obj: JObject, // Optional<ByteBuffer>
-    filter_obj: JObject,           // Optional<String>
-    batch_size_obj: JObject,       // Optional<Long>
-    limit_obj: JObject,            // Optional<Integer>
-    offset_obj: JObject,           // Optional<Integer>
-    query_obj: JObject,            // Optional<Query>
-    fts_query_obj: JObject,        // Optional<FullTextQuery>
-    with_row_id: jboolean,         // boolean
-    with_row_address: jboolean,    // boolean
-    batch_readahead: jint,         // int
-    column_orderings: JObject,     // Optional<List<ColumnOrdering>>
+    fragment_ids_obj: JObject,        // Optional<List<Integer>>
+    columns_obj: JObject,             // Optional<List<String>>
+    substrait_filter_obj: JObject,    // Optional<ByteBuffer>
+    filter_obj: JObject,              // Optional<String>
+    batch_size_obj: JObject,          // Optional<Long>
+    limit_obj: JObject,               // Optional<Integer>
+    offset_obj: JObject,              // Optional<Integer>
+    query_obj: JObject,               // Optional<Query>
+    fts_query_obj: JObject,           // Optional<FullTextQuery>
+    with_row_id: jboolean,            // boolean
+    with_row_address: jboolean,       // boolean
+    batch_readahead: jint,            // int
+    column_orderings: JObject,        // Optional<List<ColumnOrdering>>
+    substrait_aggregate_obj: JObject, // Optional<ByteBuffer>
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -248,7 +249,8 @@ pub extern "system" fn Java_org_lance_ipc_LanceScanner_createScanner<'local>(
             with_row_id,
             with_row_address,
             batch_readahead,
-            column_orderings
+            column_orderings,
+            substrait_aggregate_obj
         )
     )
 }
@@ -270,6 +272,7 @@ fn inner_create_scanner<'local>(
     with_row_address: jboolean,
     batch_readahead: jint,
     column_orderings: JObject,
+    substrait_aggregate_obj: JObject,
 ) -> Result<JObject<'local>> {
     let fragment_ids_opt = env.get_ints_opt(&fragment_ids_obj)?;
     let dataset_guard =
@@ -391,6 +394,11 @@ fn inner_create_scanner<'local>(
         scanner.order_by(Some(results))?;
         Ok(())
     })?;
+
+    let substrait_aggregate_opt = env.get_bytes_opt(&substrait_aggregate_obj)?;
+    if let Some(substrait_aggregate) = substrait_aggregate_opt {
+        scanner.aggregate(AggregateExpr::substrait(substrait_aggregate))?;
+    }
 
     let scanner = BlockingScanner::create(scanner);
     scanner.into_java(env)

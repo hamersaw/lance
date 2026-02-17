@@ -3,6 +3,7 @@
 
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
+use crate::session::{handle_from_session, session_from_handle};
 use crate::storage_options::JavaStorageOptionsProvider;
 use crate::traits::{export_vec, import_vec, FromJObjectWithEnv, FromJString};
 use crate::utils::{
@@ -35,6 +36,7 @@ use lance::dataset::{
     Version, WriteParams,
 };
 use lance::io::{ObjectStore, ObjectStoreParams};
+use lance::session::Session as LanceSession;
 use lance::table::format::IndexMetadata;
 use lance::table::format::{BasePath, Fragment};
 use lance_core::datatypes::Schema as LanceSchema;
@@ -125,13 +127,14 @@ impl BlockingDataset {
     #[allow(clippy::too_many_arguments)]
     pub fn open(
         uri: &str,
-        version: Option<i32>,
+        version: Option<u64>,
         block_size: Option<i32>,
         index_cache_size_bytes: i64,
         metadata_cache_size_bytes: i64,
         storage_options: HashMap<String, String>,
         serialized_manifest: Option<&[u8]>,
         storage_options_provider: Option<Arc<dyn StorageOptionsProvider>>,
+        session: Option<Arc<LanceSession>>,
     ) -> Result<Self> {
         // Create storage options accessor from storage_options and provider
         let accessor = match (storage_options.is_empty(), storage_options_provider) {
@@ -159,13 +162,14 @@ impl BlockingDataset {
             index_cache_size_bytes: index_cache_size_bytes as usize,
             metadata_cache_size_bytes: metadata_cache_size_bytes as usize,
             store_options: Some(store_params),
+            session,
             ..Default::default()
         };
 
         let mut builder = DatasetBuilder::from_uri(uri).with_read_params(params);
 
         if let Some(ver) = version {
-            builder = builder.with_version(ver as u64);
+            builder = builder.with_version(ver);
         }
 
         if let Some(serialized_manifest) = serialized_manifest {
@@ -244,12 +248,12 @@ impl BlockingDataset {
     }
 
     pub fn list_branches(&self) -> Result<HashMap<String, lance::dataset::refs::BranchContents>> {
-        let branches = RT.block_on(self.inner.list_branches())?;
+        let branches = RT.block_on(self.inner.branches().list())?;
         Ok(branches)
     }
 
     pub fn delete_branch(&mut self, branch: &str) -> Result<()> {
-        RT.block_on(self.inner.delete_branch(branch))?;
+        RT.block_on(self.inner.branches().delete(branch, true))?;
         Ok(())
     }
 
@@ -1038,13 +1042,14 @@ pub extern "system" fn Java_org_lance_Dataset_openNative<'local>(
     mut env: JNIEnv<'local>,
     _obj: JObject,
     path: JString,
-    version_obj: JObject,    // Optional<Integer>
+    version_obj: JObject,    // Optional<Long>
     block_size_obj: JObject, // Optional<Integer>
     index_cache_size_bytes: jlong,
     metadata_cache_size_bytes: jlong,
     storage_options_obj: JObject,          // Map<String, String>
     serialized_manifest: JObject,          // Optional<ByteBuffer>
     storage_options_provider_obj: JObject, // Optional<StorageOptionsProvider>
+    session_handle: jlong,                 // Session handle, 0 means no session
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -1058,6 +1063,7 @@ pub extern "system" fn Java_org_lance_Dataset_openNative<'local>(
             storage_options_obj,
             serialized_manifest,
             storage_options_provider_obj,
+            session_handle,
         )
     )
 }
@@ -1066,16 +1072,17 @@ pub extern "system" fn Java_org_lance_Dataset_openNative<'local>(
 fn inner_open_native<'local>(
     env: &mut JNIEnv<'local>,
     path: JString,
-    version_obj: JObject,    // Optional<Integer>
+    version_obj: JObject,    // Optional<Long>
     block_size_obj: JObject, // Optional<Integer>
     index_cache_size_bytes: jlong,
     metadata_cache_size_bytes: jlong,
     storage_options_obj: JObject,          // Map<String, String>
     serialized_manifest: JObject,          // Optional<ByteBuffer>
     storage_options_provider_obj: JObject, // Optional<StorageOptionsProvider>
+    session_handle: jlong,                 // Session handle, 0 means no session
 ) -> Result<JObject<'local>> {
     let path_str: String = path.extract(env)?;
-    let version = env.get_int_opt(&version_obj)?;
+    let version = env.get_u64_opt(&version_obj)?;
     let block_size = env.get_int_opt(&block_size_obj)?;
     let jmap = JMap::from_env(env, &storage_options_obj)?;
     let storage_options = to_rust_map(env, &jmap)?;
@@ -1090,6 +1097,10 @@ fn inner_open_native<'local>(
         storage_options_provider.map(|v| Arc::new(v) as Arc<dyn StorageOptionsProvider>);
 
     let serialized_manifest = env.get_bytes_opt(&serialized_manifest)?;
+
+    // Convert session handle to Arc<LanceSession> if provided
+    let session = session_from_handle(session_handle);
+
     let dataset = BlockingDataset::open(
         &path_str,
         version,
@@ -1099,6 +1110,7 @@ fn inner_open_native<'local>(
         storage_options,
         serialized_manifest,
         storage_options_provider_arc,
+        session,
     )?;
     dataset.into_java(env)
 }
@@ -2463,11 +2475,18 @@ fn inner_cleanup_with_policy<'local>(
         })?
         .unwrap_or(true);
 
+    let clean_referenced_branches = env
+        .get_optional_from_method(&jpolicy, "getCleanReferencedBranches", |env, obj| {
+            Ok(env.call_method(obj, "booleanValue", "()Z", &[])?.z()?)
+        })?
+        .unwrap_or(false);
+
     let policy = CleanupPolicy {
         before_timestamp,
         before_version,
         delete_unverified,
         error_if_tagged_old_versions,
+        clean_referenced_branches,
     };
 
     let stats = {
@@ -2680,4 +2699,25 @@ fn inner_count_indexed_rows(
     };
 
     Ok(count)
+}
+
+//////////////////////////////
+// Session Methods          //
+//////////////////////////////
+
+/// Returns the session handle from a dataset.
+/// The returned handle can be used to create a Java Session object.
+#[no_mangle]
+pub extern "system" fn Java_org_lance_Dataset_nativeGetSessionHandle(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+) -> jlong {
+    ok_or_throw_with_return!(env, inner_get_session_handle(&mut env, java_dataset), 0)
+}
+
+fn inner_get_session_handle(env: &mut JNIEnv, java_dataset: JObject) -> Result<jlong> {
+    let dataset_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+    let session = dataset_guard.inner.session();
+    Ok(handle_from_session(session))
 }
