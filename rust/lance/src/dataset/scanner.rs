@@ -2512,11 +2512,10 @@ impl Scanner {
 
     /// Build an execution plan from a pre-computed [`FilteredReadPlan`].
     ///
-    /// Similar to [`Self::execute_filtered_read_plan`] but returns an
-    /// `Arc<dyn ExecutionPlan>` so it can be plugged into [`Self::create_plan`]'s
-    /// pipeline. Unlike `execute_filtered_read_plan` this does **not** add a
-    /// projection to strip filter-only columns — the downstream pipeline handles
-    /// that via Stage 5 take + Stage 7 final projection.
+    /// Returns an `Arc<dyn ExecutionPlan>` so it can be plugged into
+    /// [`Self::create_plan`]'s pipeline. This does **not** add a projection to
+    /// strip filter-only columns — the downstream pipeline handles that via
+    /// Stage 5 take + Stage 7 final projection.
     async fn filtered_read_plan_source(
         &self,
         plan: FilteredReadPlan,
@@ -4234,94 +4233,6 @@ impl Scanner {
             .collect();
 
         Ok(Splits::FilteredReadPlans(splits))
-    }
-
-    /// Execute a single [`FilteredReadPlan`].
-    ///
-    /// This takes a [`FilteredReadPlan`] and executes it, returning a stream
-    /// of [`RecordBatch`]es. Each plan can be executed independently, potentially
-    /// on different workers.
-    ///
-    /// The returned stream applies any per-fragment residual filters and
-    /// `scan_range_after_filter` that are part of the plan.
-    pub async fn execute_filtered_read_plan(
-        &self,
-        split: FilteredReadPlan,
-    ) -> Result<DatasetRecordBatchStream> {
-        // 1. Compute the read projection, extending it with columns needed by
-        //    residual filters so the fragment reader loads them.
-        let output_projection = self.projection_plan.physical_projection.clone();
-        let output_schema = output_projection.to_arrow_schema();
-        let mut read_projection = output_projection;
-
-        let mut filter_columns = Vec::new();
-        for filter_expr in split.filters.values() {
-            filter_columns.extend(Planner::column_names_in_expr(filter_expr));
-        }
-        if !filter_columns.is_empty() {
-            read_projection = read_projection.union_columns(filter_columns, OnMissing::Ignore)?;
-        }
-
-        let read_schema = read_projection.to_arrow_schema();
-        let projection_extended = read_schema != output_schema;
-
-        // 2. Build FilteredReadOptions with only the fragments referenced by
-        //    this split.
-        let split_fragment_ids: std::collections::HashSet<u32> =
-            split.rows.iter().map(|(id, _)| *id).collect();
-
-        let fragments: Vec<Fragment> = self
-            .dataset
-            .fragments()
-            .iter()
-            .filter(|f| split_fragment_ids.contains(&(f.id as u32)))
-            .cloned()
-            .collect();
-
-        let mut read_options =
-            FilteredReadOptions::new(read_projection).with_fragments(Arc::new(fragments));
-
-        if let Some(batch_size) = self.batch_size {
-            read_options = read_options.with_batch_size(batch_size as u32);
-        }
-        if let Some(fragment_readahead) = self.fragment_readahead {
-            read_options = read_options.with_fragment_readahead(fragment_readahead);
-        }
-        if let Some(io_buffer_size) = self.io_buffer_size {
-            read_options = read_options.with_io_buffer_size(io_buffer_size);
-        }
-
-        // 4. Create FilteredReadExec and apply the pre-computed plan.
-        let exec = FilteredReadExec::try_new(self.dataset.clone(), read_options, None)?;
-        let exec = exec.with_plan(split).await?;
-
-        // 5. If the read projection was extended with filter-only columns, add a
-        //    final projection to drop them from the output.
-        let plan: Arc<dyn ExecutionPlan> = if projection_extended {
-            let projection_exprs: Vec<(Arc<dyn PhysicalExpr>, String)> = output_schema
-                .fields()
-                .iter()
-                .map(|field| {
-                    Ok((
-                        expressions::col(field.name(), exec.schema().as_ref())?
-                            as Arc<dyn PhysicalExpr>,
-                        field.name().clone(),
-                    ))
-                })
-                .collect::<Result<_>>()?;
-            Arc::new(DFProjectionExec::try_new(projection_exprs, Arc::new(exec))?)
-        } else {
-            Arc::new(exec)
-        };
-
-        // 6. Execute and return the stream.
-        Ok(DatasetRecordBatchStream::new(execute_plan(
-            plan,
-            LanceExecutionOptions {
-                batch_size: self.batch_size,
-                ..Default::default()
-            },
-        )?))
     }
 }
 
@@ -9858,27 +9769,7 @@ mod test {
             );
         }
 
-        // First verify execute_filtered_read_plan works
-        let mut exec_total = 0u64;
-        for plan in &plans {
-            let batch = dataset
-                .scan()
-                .execute_filtered_read_plan(plan.clone())
-                .await
-                .unwrap()
-                .try_collect::<Vec<_>>()
-                .await
-                .unwrap();
-            let rows: usize = batch.iter().map(|b| b.num_rows()).sum();
-            exec_total += rows as u64;
-        }
-        assert_eq!(
-            exec_total,
-            expected.num_rows() as u64,
-            "execute_filtered_read_plan total should match"
-        );
-
-        // Now verify with_filtered_read_plan + create_plan
+        // Verify with_filtered_read_plan + create_plan
         let mut total_rows = 0u64;
         for plan in plans {
             let mut scanner = dataset.scan();

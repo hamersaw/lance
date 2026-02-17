@@ -179,21 +179,6 @@ impl Scanner {
         Ok(PySplits::from(splits))
     }
 
-    fn execute_filtered_read_plan(
-        self_: PyRef<'_, Self>,
-        split: PyFilteredReadPlan,
-    ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
-        let scanner = self_.scanner.clone();
-        let inner = split.inner;
-        let stream = rt()
-            .spawn(Some(self_.py()), async move {
-                scanner.execute_filtered_read_plan(inner).await
-            })?
-            .map_err(|err| PyValueError::new_err(err.to_string()))?;
-
-        Ok(PyArrowType(Box::new(LanceReader::from_stream(stream))))
-    }
-
     fn with_filtered_read_plan(&self, plan: PyFilteredReadPlan) -> Scanner {
         let mut scanner = (*self.scanner).clone();
         scanner.with_filtered_read_plan(plan.inner);
@@ -247,7 +232,7 @@ impl PySplits {
 /// An opaque wrapper around a Rust [`FilteredReadPlan`].
 ///
 /// Created by :meth:`Scanner.plan_splits` and consumed by
-/// :meth:`Scanner.execute_filtered_read_plan`.
+/// :meth:`Scanner.with_filtered_read_plan`.
 #[pyclass(name = "FilteredReadPlan", module = "_lib")]
 #[derive(Clone)]
 pub struct PyFilteredReadPlan {

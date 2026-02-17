@@ -5278,7 +5278,7 @@ class LanceScanner(pa.dataset.Scanner):
         Splits
             A :class:`Splits` object with either:
             - ``filtered_read_plans``: A list of opaque :class:`FilteredReadPlan`
-              objects, each passed to :meth:`execute_filtered_read_plan`.
+              objects, each passed to :meth:`with_filtered_read_plan`.
             - ``fragments``: A list of fragment IDs.
 
         Examples
@@ -5299,33 +5299,11 @@ class LanceScanner(pa.dataset.Scanner):
             max_row_count=max_row_count,
         )
 
-    def execute_filtered_read_plan(
-        self, plan: FilteredReadPlan
-    ) -> pa.RecordBatchReader:
-        """Execute a single :class:`FilteredReadPlan`.
-
-        Each plan can be executed independently, potentially on different
-        workers. The returned reader applies any per-fragment residual filters
-        and ``scan_range_after_filter`` that are part of the plan.
-
-        Parameters
-        ----------
-        plan : FilteredReadPlan
-            The plan to execute.
-
-        Returns
-        -------
-        pa.RecordBatchReader
-            A reader that yields record batches for the plan.
-        """
-        return self._scanner.execute_filtered_read_plan(plan)
-
     def with_filtered_read_plan(self, plan: FilteredReadPlan) -> "LanceScanner":
         """Return a new scanner with a pre-computed FilteredReadPlan as its source.
 
-        Unlike :meth:`execute_filtered_read_plan`, which bypasses the scanner
-        pipeline, this method injects the plan into the scanner so that the
-        full downstream pipeline (filter, sort, limit, projection) is applied.
+        This method injects the plan into the scanner so that the full
+        downstream pipeline (filter, sort, limit, projection) is applied.
 
         Parameters
         ----------

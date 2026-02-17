@@ -40,7 +40,6 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.List;
-import java.util.Map;
 import java.util.Optional;
 import java.util.stream.Collectors;
 
@@ -585,45 +584,6 @@ public class ScannerTest {
   }
 
   @Test
-  void testExecuteFilteredReadPlan(@TempDir Path tempDir) throws Exception {
-    String datasetPath = tempDir.resolve("execute_filtered_read_plan").toString();
-    try (BufferAllocator allocator = new RootAllocator()) {
-      TestUtils.SimpleTestDataset testDataset =
-          new TestUtils.SimpleTestDataset(allocator, datasetPath);
-      testDataset.createEmptyDataset().close();
-      int totalRows = 100;
-      try (Dataset dataset = testDataset.write(1, totalRows)) {
-        try (LanceScanner scanner =
-            dataset.newScan(new ScanOptions.Builder().batchSize(50).build())) {
-          Splits splits = scanner.planSplits(null);
-          if (splits.getFilteredReadPlans().isPresent()) {
-            List<FilteredReadPlan> plans = splits.getFilteredReadPlans().get();
-            assertFalse(plans.isEmpty(), "Should have at least one plan");
-
-            // Verify plan has fragment ranges
-            FilteredReadPlan plan = plans.get(0);
-            Map<Integer, List<long[]>> ranges = plan.getFragmentRanges();
-            assertNotNull(ranges);
-            assertFalse(ranges.isEmpty(), "Plan should have fragment ranges");
-
-            // Execute each plan and collect total rows
-            int totalScannedRows = 0;
-            for (FilteredReadPlan p : plans) {
-              try (ArrowReader reader = scanner.executeFilteredReadPlan(p)) {
-                while (reader.loadNextBatch()) {
-                  totalScannedRows += reader.getVectorSchemaRoot().getRowCount();
-                }
-              }
-            }
-            assertEquals(
-                totalRows, totalScannedRows, "Total scanned rows should match total dataset rows");
-          }
-        }
-      }
-    }
-  }
-
-  @Test
   void testPlanSplitsWithFilter(@TempDir Path tempDir) throws Exception {
     String datasetPath = tempDir.resolve("plan_splits_filter").toString();
     try (BufferAllocator allocator = new RootAllocator()) {
@@ -639,7 +599,8 @@ public class ScannerTest {
             List<FilteredReadPlan> plans = splits.getFilteredReadPlans().get();
             int totalScannedRows = 0;
             for (FilteredReadPlan p : plans) {
-              try (ArrowReader reader = scanner.executeFilteredReadPlan(p)) {
+              try (LanceScanner splitScanner = scanner.withFilteredReadPlan(p);
+                  ArrowReader reader = splitScanner.scanBatches()) {
                 while (reader.loadNextBatch()) {
                   totalScannedRows += reader.getVectorSchemaRoot().getRowCount();
                 }

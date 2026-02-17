@@ -65,14 +65,6 @@ impl BlockingScanner {
         Ok(res)
     }
 
-    pub fn execute_filtered_read_plan(
-        &self,
-        plan: FilteredReadPlan,
-    ) -> Result<DatasetRecordBatchStream> {
-        let res = RT.block_on(self.inner.execute_filtered_read_plan(plan))?;
-        Ok(res)
-    }
-
     pub fn with_filtered_read_plan(&self, plan: FilteredReadPlan) -> BlockingScanner {
         let mut scanner = (*self.inner).clone();
         scanner.with_filtered_read_plan(plan);
@@ -624,49 +616,6 @@ fn create_java_filtered_read_plan<'a>(
     env.set_field(&j_plan, "nativeHandle", "J", handle.into())?;
 
     Ok(j_plan)
-}
-
-/////////////////////////////////////
-// execute_filtered_read_plan      //
-/////////////////////////////////////
-#[no_mangle]
-pub extern "system" fn Java_org_lance_ipc_LanceScanner_nativeExecuteFilteredReadPlan(
-    mut env: JNIEnv,
-    j_scanner: JObject,
-    j_plan: JObject,
-    stream_addr: jlong,
-) {
-    ok_or_throw_without_return!(
-        env,
-        inner_execute_filtered_read_plan(&mut env, j_scanner, j_plan, stream_addr)
-    );
-}
-
-fn inner_execute_filtered_read_plan(
-    env: &mut JNIEnv,
-    j_scanner: JObject,
-    j_plan: JObject,
-    stream_addr: jlong,
-) -> Result<()> {
-    // Read the native handle and take ownership of the boxed plan
-    let handle = env.get_field(&j_plan, "nativeHandle", "J")?.j()?;
-    if handle == 0 {
-        return Err(Error::input_error(
-            "FilteredReadPlan has been closed or already consumed".to_string(),
-        ));
-    }
-    // Take ownership: reconstruct the Box and zero the handle in Java
-    let plan = unsafe { *Box::from_raw(handle as *mut FilteredReadPlan) };
-    env.set_field(&j_plan, "nativeHandle", "J", 0i64.into())?;
-
-    let record_batch_stream = {
-        let scanner_guard =
-            unsafe { env.get_rust_field::<_, _, BlockingScanner>(&j_scanner, NATIVE_SCANNER) }?;
-        scanner_guard.execute_filtered_read_plan(plan)?
-    };
-    let ffi_stream = to_ffi_arrow_array_stream(record_batch_stream, RT.handle().clone())?;
-    unsafe { std::ptr::write_unaligned(stream_addr as *mut FFI_ArrowArrayStream, ffi_stream) }
-    Ok(())
 }
 
 /////////////////////////////////////

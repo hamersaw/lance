@@ -17,7 +17,7 @@ package org.lance.ipc;
  * An opaque handle to a native Rust {@code FilteredReadPlan}.
  *
  * <p>Instances are created by {@link LanceScanner#planSplits} and consumed by {@link
- * LanceScanner#executeFilteredReadPlan}. The plan is stored in native memory and must be freed by
+ * LanceScanner#withFilteredReadPlan}. The plan is stored in native memory and must be freed by
  * calling {@link #close()}.
  */
 public class FilteredReadPlan implements AutoCloseable {
