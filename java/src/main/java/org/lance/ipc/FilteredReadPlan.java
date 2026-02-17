@@ -13,84 +13,37 @@
  */
 package org.lance.ipc;
 
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
-
 /**
- * A filtered read plan represents a unit of work for scanning a dataset.
+ * An opaque handle to a native Rust {@code FilteredReadPlan}.
  *
- * <p>It specifies which fragment row ranges to read, any residual filters to apply (encoded as
- * Substrait), and an optional post-filter scan range. Plans are created by {@link
- * LanceScanner#planSplits} and executed by {@link LanceScanner#executeFilteredReadPlan}.
- *
- * <p>This class is a pure data object that is fully serializable for distributed execution.
+ * <p>Instances are created by {@link LanceScanner#planSplits} and consumed by {@link
+ * LanceScanner#executeFilteredReadPlan}. The plan is stored in native memory and must be freed by
+ * calling {@link #close()}.
  */
-public class FilteredReadPlan {
-  /**
-   * Per-fragment row ranges: maps fragment ID to a list of [start, end) ranges.
-   *
-   * <p>Each inner long array has exactly two elements: {@code [start, end)}.
-   */
-  private Map<Integer, List<long[]>> fragmentRanges;
-
-  /**
-   * Row offset range to apply after filtering, or null if not needed.
-   *
-   * <p>The array has two elements: {@code [start, end)}.
-   */
-  private long[] scanRangeAfterFilter;
-
-  /**
-   * Deduplicated list of Substrait-encoded filter expressions.
-   *
-   * <p>Each element is a serialized Substrait ExtendedExpression message. Multiple fragments may
-   * share the same filter; this list stores each unique filter exactly once.
-   */
-  private List<byte[]> filterExpressions;
-
-  /**
-   * Maps fragment ID to an index in {@link #filterExpressions}.
-   *
-   * <p>Fragments that do not require filtering are absent from this map.
-   */
-  private Map<Integer, Integer> fragmentFilterIndex;
+public class FilteredReadPlan implements AutoCloseable {
+  private long nativeHandle;
 
   private FilteredReadPlan() {}
 
   /**
-   * Get the per-fragment row ranges.
+   * Release the native memory associated with this plan.
    *
-   * @return a map from fragment ID to a list of [start, end) ranges.
+   * <p>After calling this method, the plan can no longer be executed.
    */
-  public Map<Integer, List<long[]>> getFragmentRanges() {
-    return fragmentRanges;
+  @Override
+  public void close() {
+    if (nativeHandle != 0) {
+      releaseNativePlan(nativeHandle);
+      nativeHandle = 0;
+    }
   }
 
-  /**
-   * Get the row offset range applied after filtering.
-   *
-   * @return Optional containing a [start, end) range, or empty if not needed.
-   */
-  public Optional<long[]> getScanRangeAfterFilter() {
-    return Optional.ofNullable(scanRangeAfterFilter);
+  long getNativeHandle() {
+    if (nativeHandle == 0) {
+      throw new IllegalStateException("FilteredReadPlan has been closed");
+    }
+    return nativeHandle;
   }
 
-  /**
-   * Get the deduplicated Substrait-encoded filter expressions.
-   *
-   * @return list of serialized Substrait ExtendedExpression messages.
-   */
-  public List<byte[]> getFilterExpressions() {
-    return filterExpressions;
-  }
-
-  /**
-   * Get the mapping from fragment ID to filter expression index.
-   *
-   * @return map from fragment ID to index in {@link #getFilterExpressions()}.
-   */
-  public Map<Integer, Integer> getFragmentFilterIndex() {
-    return fragmentFilterIndex;
-  }
+  private static native void releaseNativePlan(long handle);
 }

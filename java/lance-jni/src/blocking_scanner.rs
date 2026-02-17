@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::{BTreeMap, HashMap};
-use std::ops::Range;
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
@@ -10,17 +8,14 @@ use crate::ffi::JNIEnvExt;
 use crate::traits::{import_vec_from_method, import_vec_to_rust};
 use arrow::array::Float32Array;
 use arrow::{ffi::FFI_ArrowSchema, ffi_stream::FFI_ArrowArrayStream};
-use arrow_schema::{Schema as ArrowSchema, SchemaRef};
-use jni::objects::{JByteArray, JLongArray, JObject, JString};
+use arrow_schema::SchemaRef;
+use jni::objects::{JObject, JString};
 use jni::sys::{jboolean, jint, JNI_TRUE};
 use jni::{sys::jlong, JNIEnv};
 use lance::dataset::scanner::{
     ColumnOrdering, DatasetRecordBatchStream, Scanner, Splits, SplittingOptions,
 };
-use lance::deps::datafusion::prelude::Expr;
 use lance::io::exec::filtered_read::FilteredReadPlan;
-use lance_datafusion::exec::{get_session_context, LanceExecutionOptions};
-use lance_datafusion::substrait::{encode_substrait, parse_substrait};
 use lance_index::scalar::inverted::query::{
     BooleanQuery as FtsBooleanQuery, BoostQuery as FtsBoostQuery, FtsQuery,
     MatchQuery as FtsMatchQuery, MultiMatchQuery as FtsMultiMatchQuery, Occur as FtsOccur,
@@ -537,22 +532,16 @@ fn inner_plan_splits<'local>(
         None
     };
 
-    let (splits, dataset_schema) = {
+    let splits = {
         let scanner_guard =
             unsafe { env.get_rust_field::<_, _, BlockingScanner>(j_scanner, NATIVE_SCANNER) }?;
-        let splits = scanner_guard.plan_splits(options)?;
-        let schema = scanner_guard.inner.dataset_schema().clone();
-        (splits, schema)
+        scanner_guard.plan_splits(options)?
     };
 
-    create_java_splits(env, splits, &dataset_schema)
+    create_java_splits(env, splits)
 }
 
-fn create_java_splits<'a>(
-    env: &mut JNIEnv<'a>,
-    splits: Splits,
-    dataset_schema: &lance_core::datatypes::Schema,
-) -> Result<JObject<'a>> {
+fn create_java_splits<'a>(env: &mut JNIEnv<'a>, splits: Splits) -> Result<JObject<'a>> {
     match splits {
         Splits::FilteredReadPlans(plans) => {
             // Create ArrayList<FilteredReadPlan>
@@ -562,7 +551,7 @@ fn create_java_splits<'a>(
                 &[(plans.len() as jint).into()],
             )?;
             for plan in plans {
-                let j_plan = create_java_filtered_read_plan(env, plan, dataset_schema)?;
+                let j_plan = create_java_filtered_read_plan(env, plan)?;
                 env.call_method(&j_list, "add", "(Ljava/lang/Object;)Z", &[(&j_plan).into()])?;
             }
             // new Splits(filteredReadPlans, null)
@@ -618,117 +607,13 @@ fn create_java_splits<'a>(
 fn create_java_filtered_read_plan<'a>(
     env: &mut JNIEnv<'a>,
     plan: FilteredReadPlan,
-    dataset_schema: &lance_core::datatypes::Schema,
 ) -> Result<JObject<'a>> {
     let j_plan = env.new_object("org/lance/ipc/FilteredReadPlan", "()V", &[])?;
 
-    // Create HashMap<Integer, List<long[]>> for fragmentRanges
-    let j_map = env.new_object("java/util/HashMap", "()V", &[])?;
-    for (frag_id, ranges) in &plan.rows {
-        let j_key = env.new_object("java/lang/Integer", "(I)V", &[(*frag_id as jint).into()])?;
-        let j_range_list = env.new_object(
-            "java/util/ArrayList",
-            "(I)V",
-            &[(ranges.len() as jint).into()],
-        )?;
-        for range in ranges {
-            let j_arr = env.new_long_array(2)?;
-            env.set_long_array_region(&j_arr, 0, &[range.start as jlong, range.end as jlong])?;
-            env.call_method(
-                &j_range_list,
-                "add",
-                "(Ljava/lang/Object;)Z",
-                &[(&j_arr).into()],
-            )?;
-        }
-        env.call_method(
-            &j_map,
-            "put",
-            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-            &[(&j_key).into(), (&j_range_list).into()],
-        )?;
-    }
-    env.set_field(
-        &j_plan,
-        "fragmentRanges",
-        "Ljava/util/Map;",
-        (&j_map).into(),
-    )?;
-
-    // Set scanRangeAfterFilter if present
-    if let Some(ref scan_range) = plan.scan_range_after_filter {
-        let j_arr = env.new_long_array(2)?;
-        env.set_long_array_region(
-            &j_arr,
-            0,
-            &[scan_range.start as jlong, scan_range.end as jlong],
-        )?;
-        env.set_field(&j_plan, "scanRangeAfterFilter", "[J", (&j_arr).into())?;
-    }
-
-    // Encode filters as Substrait — deduplicate by Arc pointer
-    let arrow_schema = Arc::new(ArrowSchema::from(dataset_schema));
-    let ctx = get_session_context(&LanceExecutionOptions::default());
-    let state = ctx.state();
-
-    // Deduplicate filters by Arc pointer identity
-    let mut unique_filters: Vec<(*const Expr, Vec<u8>)> = Vec::new();
-    let mut filter_index_map: HashMap<u32, usize> = HashMap::new();
-
-    for (frag_id, filter_arc) in &plan.filters {
-        let ptr = Arc::as_ptr(filter_arc);
-        if let Some(idx) = unique_filters.iter().position(|(p, _)| *p == ptr) {
-            filter_index_map.insert(*frag_id, idx);
-        } else {
-            let encoded =
-                encode_substrait(filter_arc.as_ref().clone(), arrow_schema.clone(), &state)?;
-            let idx = unique_filters.len();
-            unique_filters.push((ptr, encoded));
-            filter_index_map.insert(*frag_id, idx);
-        }
-    }
-
-    // Create List<byte[]> for filterExpressions
-    let j_filter_list = env.new_object(
-        "java/util/ArrayList",
-        "(I)V",
-        &[(unique_filters.len() as jint).into()],
-    )?;
-    for (_, encoded) in &unique_filters {
-        let j_bytes = env.byte_array_from_slice(encoded)?;
-        env.call_method(
-            &j_filter_list,
-            "add",
-            "(Ljava/lang/Object;)Z",
-            &[(&j_bytes).into()],
-        )?;
-    }
-    env.set_field(
-        &j_plan,
-        "filterExpressions",
-        "Ljava/util/List;",
-        (&j_filter_list).into(),
-    )?;
-
-    // Create Map<Integer, Integer> for fragmentFilterIndex
-    let j_filter_index_map = env.new_object("java/util/HashMap", "()V", &[])?;
-    for (frag_id, idx) in &filter_index_map {
-        let j_frag_key =
-            env.new_object("java/lang/Integer", "(I)V", &[(*frag_id as jint).into()])?;
-        let j_idx_val = env.new_object("java/lang/Integer", "(I)V", &[(*idx as jint).into()])?;
-        env.call_method(
-            &j_filter_index_map,
-            "put",
-            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-            &[(&j_frag_key).into(), (&j_idx_val).into()],
-        )?;
-    }
-    env.set_field(
-        &j_plan,
-        "fragmentFilterIndex",
-        "Ljava/util/Map;",
-        (&j_filter_index_map).into(),
-    )?;
+    // Box the plan and store the pointer as the nativeHandle field
+    let boxed = Box::new(plan);
+    let handle = Box::into_raw(boxed) as jlong;
+    env.set_field(&j_plan, "nativeHandle", "J", handle.into())?;
 
     Ok(j_plan)
 }
@@ -755,104 +640,16 @@ fn inner_execute_filtered_read_plan(
     j_plan: JObject,
     stream_addr: jlong,
 ) -> Result<()> {
-    // Get dataset schema from scanner for Substrait decoding
-    let dataset_schema = {
-        let scanner_guard =
-            unsafe { env.get_rust_field::<_, _, BlockingScanner>(&j_scanner, NATIVE_SCANNER) }?;
-        scanner_guard.inner.dataset_schema().clone()
-    };
-    let arrow_schema = Arc::new(ArrowSchema::from(&dataset_schema));
-    let ctx = get_session_context(&LanceExecutionOptions::default());
-    let state = ctx.state();
-
-    // Read filterExpressions (List<byte[]>)
-    let j_filter_exprs = env
-        .get_field(&j_plan, "filterExpressions", "Ljava/util/List;")
-        .map_err(|e| Error::input_error(format!("Failed to get filterExpressions: {e}")))?
-        .l()?;
-    let mut decoded_filters: Vec<Expr> = Vec::new();
-    if !j_filter_exprs.is_null() {
-        let filter_list = env.get_list(&j_filter_exprs)?;
-        let size = filter_list.size(env)? as usize;
-        decoded_filters.reserve(size);
-        let mut iter = filter_list.iter(env)?;
-        while let Some(elem) = iter.next(env)? {
-            let j_byte_array: JByteArray = elem.into();
-            let len = env.get_array_length(&j_byte_array)? as usize;
-            let mut buf = vec![0i8; len];
-            env.get_byte_array_region(&j_byte_array, 0, &mut buf)?;
-            let bytes: Vec<u8> = buf.into_iter().map(|b| b as u8).collect();
-            let expr = RT.block_on(parse_substrait(&bytes, arrow_schema.clone(), &state))?;
-            decoded_filters.push(expr);
-        }
+    // Read the native handle and take ownership of the boxed plan
+    let handle = env.get_field(&j_plan, "nativeHandle", "J")?.j()?;
+    if handle == 0 {
+        return Err(Error::input_error(
+            "FilteredReadPlan has been closed or already consumed".to_string(),
+        ));
     }
-
-    // Read fragmentFilterIndex (Map<Integer, Integer>)
-    let j_filter_index = env
-        .get_field(&j_plan, "fragmentFilterIndex", "Ljava/util/Map;")
-        .map_err(|e| Error::input_error(format!("Failed to get fragmentFilterIndex: {e}")))?
-        .l()?;
-    let mut filters: HashMap<u32, Arc<Expr>> = HashMap::new();
-    if !j_filter_index.is_null() {
-        let j_map = env.get_map(&j_filter_index)?;
-        let mut iter = j_map.iter(env)?;
-        while let Some((key, value)) = iter.next(env)? {
-            let frag_id = env.call_method(&key, "intValue", "()I", &[])?.i()? as u32;
-            let idx = env.call_method(&value, "intValue", "()I", &[])?.i()? as usize;
-            if idx >= decoded_filters.len() {
-                return Err(Error::input_error(format!(
-                    "Filter index {idx} out of range (have {} filters)",
-                    decoded_filters.len()
-                )));
-            }
-            filters.insert(frag_id, Arc::new(decoded_filters[idx].clone()));
-        }
-    }
-
-    // Read fragmentRanges (Map<Integer, List<long[]>>)
-    let j_frag_ranges = env
-        .get_field(&j_plan, "fragmentRanges", "Ljava/util/Map;")
-        .map_err(|e| Error::input_error(format!("Failed to get fragmentRanges: {e}")))?
-        .l()?;
-    let mut rows: BTreeMap<u32, Vec<Range<u64>>> = BTreeMap::new();
-    if !j_frag_ranges.is_null() {
-        let j_map = env.get_map(&j_frag_ranges)?;
-        let mut iter = j_map.iter(env)?;
-        while let Some((key, value)) = iter.next(env)? {
-            let frag_id = env.call_method(&key, "intValue", "()I", &[])?.i()? as u32;
-            let range_list = env.get_list(&value)?;
-            let mut ranges = Vec::new();
-            let mut range_iter = range_list.iter(env)?;
-            while let Some(range_elem) = range_iter.next(env)? {
-                let j_arr: JLongArray = range_elem.into();
-                let mut buf = [0i64; 2];
-                env.get_long_array_region(&j_arr, 0, &mut buf)?;
-                ranges.push(buf[0] as u64..buf[1] as u64);
-            }
-            rows.insert(frag_id, ranges);
-        }
-    }
-
-    // Read scanRangeAfterFilter (long[] or null)
-    let j_scan_range = env
-        .get_field(&j_plan, "scanRangeAfterFilter", "[J")
-        .map_err(|e| Error::input_error(format!("Failed to get scanRangeAfterFilter: {e}")))?
-        .l()?;
-    let scan_range_after_filter = if j_scan_range.is_null() {
-        None
-    } else {
-        let mut buf = [0i64; 2];
-        let j_scan_arr: JLongArray = j_scan_range.into();
-        env.get_long_array_region(&j_scan_arr, 0, &mut buf)?;
-        Some(buf[0] as u64..buf[1] as u64)
-    };
-
-    // Build the FilteredReadPlan and execute
-    let plan = FilteredReadPlan {
-        rows,
-        filters,
-        scan_range_after_filter,
-    };
+    // Take ownership: reconstruct the Box and zero the handle in Java
+    let plan = unsafe { *Box::from_raw(handle as *mut FilteredReadPlan) };
+    env.set_field(&j_plan, "nativeHandle", "J", 0i64.into())?;
 
     let record_batch_stream = {
         let scanner_guard =
@@ -862,4 +659,20 @@ fn inner_execute_filtered_read_plan(
     let ffi_stream = to_ffi_arrow_array_stream(record_batch_stream, RT.handle().clone())?;
     unsafe { std::ptr::write_unaligned(stream_addr as *mut FFI_ArrowArrayStream, ffi_stream) }
     Ok(())
+}
+
+///////////////////////////////////
+// FilteredReadPlan native free  //
+///////////////////////////////////
+#[no_mangle]
+pub extern "system" fn Java_org_lance_ipc_FilteredReadPlan_releaseNativePlan(
+    _env: JNIEnv,
+    _class: JObject,
+    handle: jlong,
+) {
+    if handle != 0 {
+        unsafe {
+            drop(Box::from_raw(handle as *mut FilteredReadPlan));
+        }
+    }
 }

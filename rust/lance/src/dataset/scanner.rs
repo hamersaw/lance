@@ -52,7 +52,7 @@ use lance_core::datatypes::{
 };
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::address::RowAddress;
-use lance_core::utils::mask::{RowAddrMask, RowAddrTreeMap};
+use lance_core::utils::mask::{RowAddrMask, RowAddrSelection, RowAddrTreeMap};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR, ROW_ID, ROW_OFFSET};
 use lance_datafusion::exec::{
@@ -79,7 +79,7 @@ use tracing::{info_span, instrument, Span};
 
 use super::Dataset;
 use crate::dataset::row_offsets_to_row_addresses;
-use crate::dataset::split::{bin_pack, max_rows_per_split, BinItem, Splits, SplittingOptions};
+use crate::dataset::split::{bin_pack, max_rows_per_split, BinItem};
 use crate::dataset::utils::SchemaAdapter;
 use crate::index::vector::utils::{
     default_distance_type_for, get_vector_dim, get_vector_type, validate_distance_type_for,
@@ -99,6 +99,8 @@ use crate::{datatypes::Schema, io::exec::fts::BooleanQueryExec};
 use crate::{Error, Result};
 
 pub use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts};
+// Re-export for downstream consumers that import from scanner
+pub use super::split::{Splits, SplittingOptions};
 #[cfg(feature = "substrait")]
 use lance_datafusion::substrait::parse_substrait;
 use snafu::location;
@@ -4076,52 +4078,43 @@ impl Scanner {
         let mut bin_items: Vec<BinItem> = Vec::new();
         let max_rows = max_rows_per_split as u64;
 
-        for (frag_id, frag_ranges) in &filtered_read_plan.rows {
-            let total_rows: u64 = frag_ranges.iter().map(|r| r.end - r.start).sum();
+        for (frag_id, selection) in filtered_read_plan.rows.iter() {
+            let (bitmap, total_rows) = match selection {
+                RowAddrSelection::Partial(bitmap) => (bitmap.clone(), bitmap.len()),
+                RowAddrSelection::Full => {
+                    // get_or_create_plan always returns Partial, but handle Full defensively
+                    let fragment =
+                        self.dataset
+                            .get_fragment(*frag_id as usize)
+                            .ok_or_else(|| Error::InvalidInput {
+                                source: format!("Fragment {} not found", frag_id).into(),
+                                location: location!(),
+                            })?;
+                    let num_rows = fragment.physical_rows().await? as u64;
+                    let bm = RoaringBitmap::from_sorted_iter(0..num_rows as u32).unwrap();
+                    (bm, num_rows)
+                }
+            };
+            let fragment_id = *frag_id;
 
             if total_rows <= max_rows {
-                // Fragment fits in one item
                 bin_items.push(BinItem {
-                    fragment_id: *frag_id,
-                    ranges: frag_ranges.clone(),
+                    fragment_id,
+                    bitmap,
                     row_count: total_rows,
                 });
                 continue;
             }
 
-            // Split ranges into chunks of at most max_rows
-            let mut current_ranges: Vec<Range<u64>> = Vec::new();
-            let mut current_count: u64 = 0;
-
-            for range in frag_ranges {
-                let mut remaining = range.clone();
-                while !remaining.is_empty() {
-                    let room = max_rows - current_count;
-                    let range_len = remaining.end - remaining.start;
-                    if range_len <= room {
-                        current_ranges.push(remaining.clone());
-                        current_count += range_len;
-                        break;
-                    } else {
-                        // Take what fits and flush
-                        current_ranges.push(remaining.start..remaining.start + room);
-                        current_count += room;
-                        remaining.start += room;
-
-                        bin_items.push(BinItem {
-                            fragment_id: *frag_id,
-                            ranges: std::mem::take(&mut current_ranges),
-                            row_count: current_count,
-                        });
-                        current_count = 0;
-                    }
-                }
-            }
-            if !current_ranges.is_empty() {
+            // Split bitmap into chunks of at most max_rows
+            let mut iter = bitmap.iter().peekable();
+            while iter.peek().is_some() {
+                let chunk: RoaringBitmap = iter.by_ref().take(max_rows as usize).collect();
+                let chunk_len = chunk.len();
                 bin_items.push(BinItem {
-                    fragment_id: *frag_id,
-                    ranges: current_ranges,
-                    row_count: current_count,
+                    fragment_id,
+                    bitmap: chunk,
+                    row_count: chunk_len,
                 });
             }
         }
@@ -4134,17 +4127,20 @@ impl Scanner {
         let splits = bins
             .into_iter()
             .map(|items| {
-                let mut rows: BTreeMap<u32, Vec<Range<u64>>> = BTreeMap::new();
+                let mut bitmap_map: BTreeMap<u32, RoaringBitmap> = BTreeMap::new();
                 let mut filters: HashMap<u32, Arc<Expr>> = HashMap::new();
 
                 for item in items {
-                    rows.entry(item.fragment_id)
-                        .or_default()
-                        .extend(item.ranges);
+                    *bitmap_map.entry(item.fragment_id).or_default() |= &item.bitmap;
 
                     if let Some(filter) = filtered_read_plan.filters.get(&item.fragment_id) {
                         filters.insert(item.fragment_id, filter.clone());
                     }
+                }
+
+                let mut rows = RowAddrTreeMap::new();
+                for (frag_id, bitmap) in bitmap_map {
+                    rows.insert_bitmap(frag_id, bitmap);
                 }
 
                 FilteredReadPlan {
@@ -4190,7 +4186,7 @@ impl Scanner {
         // 2. Build FilteredReadOptions with only the fragments referenced by
         //    this split.
         let split_fragment_ids: std::collections::HashSet<u32> =
-            split.rows.keys().copied().collect();
+            split.rows.iter().map(|(id, _)| *id).collect();
 
         let fragments: Vec<Fragment> = self
             .dataset
@@ -4215,7 +4211,7 @@ impl Scanner {
 
         // 4. Create FilteredReadExec and apply the pre-computed plan.
         let exec = FilteredReadExec::try_new(self.dataset.clone(), read_options, None)?;
-        let exec = exec.with_plan(split);
+        let exec = exec.with_plan(split).await?;
 
         // 5. If the read projection was extended with filter-only columns, add a
         //    final projection to drop them from the output.
@@ -4569,6 +4565,22 @@ mod test {
     use crate::utils::test::{
         assert_plan_node_equals, DatagenExt, FragmentCount, FragmentRowCount, ThrottledStoreWrapper,
     };
+
+    /// Count the total number of rows in a FilteredReadPlan.
+    fn plan_row_count(plan: &FilteredReadPlan) -> u64 {
+        plan.rows
+            .iter()
+            .map(|(_, sel)| match sel {
+                RowAddrSelection::Partial(bitmap) => bitmap.len(),
+                RowAddrSelection::Full => 0, // shouldn't happen in practice
+            })
+            .sum()
+    }
+
+    /// Count the number of fragments in a FilteredReadPlan.
+    fn plan_fragment_count(plan: &FilteredReadPlan) -> usize {
+        plan.rows.iter().count()
+    }
 
     #[test]
     fn test_env_var_parsing() {
@@ -9349,12 +9361,7 @@ mod test {
             Splits::FilteredReadPlans(plans) => {
                 assert!(!plans.is_empty(), "Should have at least one plan");
                 // Verify all fragments are covered
-                let total_rows: u64 = plans
-                    .iter()
-                    .flat_map(|p| p.rows.values())
-                    .flatten()
-                    .map(|r| r.end - r.start)
-                    .sum();
+                let total_rows: u64 = plans.iter().map(plan_row_count).sum();
                 assert_eq!(total_rows, 400, "Should cover all 400 rows");
             }
             Splits::Fragments(_) => panic!("Expected FilteredReadPlans for basic scan"),
@@ -9383,7 +9390,7 @@ mod test {
                 assert!(!plans.is_empty(), "Should have at least one plan");
                 // Each plan should have filters for the fragments it covers
                 for plan in &plans {
-                    assert!(!plan.rows.is_empty(), "Each plan should have rows");
+                    assert!(plan_row_count(plan) > 0, "Each plan should have rows");
                 }
             }
             Splits::Fragments(_) => panic!("Expected FilteredReadPlans for filtered scan"),
@@ -9416,7 +9423,7 @@ mod test {
                 );
                 // Verify each split has at most 50 rows
                 for (i, plan) in plans.iter().enumerate() {
-                    let rows: u64 = plan.rows.values().flatten().map(|r| r.end - r.start).sum();
+                    let rows = plan_row_count(plan);
                     assert!(
                         rows <= 50,
                         "Split {} has {} rows, expected at most 50",
@@ -9539,7 +9546,7 @@ mod test {
                 // All plans should reference fragment 0
                 for plan in &plans {
                     assert!(
-                        plan.rows.keys().all(|&frag_id| frag_id == 0),
+                        plan.rows.iter().all(|(frag_id, _)| *frag_id == 0),
                         "Single fragment dataset should only have fragment 0"
                     );
                 }
@@ -9574,7 +9581,7 @@ mod test {
                 );
                 // Verify each split respects the max
                 for (i, plan) in plans.iter().enumerate() {
-                    let rows: u64 = plan.rows.values().flatten().map(|r| r.end - r.start).sum();
+                    let rows = plan_row_count(plan);
                     assert!(
                         rows <= 10,
                         "Split {} has {} rows, expected at most 10",
@@ -9644,7 +9651,7 @@ mod test {
                     plans.len()
                 );
                 // Some plans should have multiple fragments
-                let multi_frag_plans = plans.iter().filter(|p| p.rows.len() > 1).count();
+                let multi_frag_plans = plans.iter().filter(|p| plan_fragment_count(p) > 1).count();
                 assert!(
                     multi_frag_plans > 0,
                     "At least one plan should combine multiple fragments"
@@ -9672,12 +9679,7 @@ mod test {
 
         match splits {
             Splits::FilteredReadPlans(plans) => {
-                let total_rows: u64 = plans
-                    .iter()
-                    .flat_map(|p| p.rows.values())
-                    .flatten()
-                    .map(|r| r.end - r.start)
-                    .sum();
+                let total_rows: u64 = plans.iter().map(plan_row_count).sum();
                 assert_eq!(
                     total_rows,
                     5 * 73,

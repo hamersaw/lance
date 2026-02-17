@@ -238,63 +238,25 @@ impl PySplits {
     }
 }
 
-/// A filtered read plan represents a unit of work for scanning a dataset.
-/// It specifies which fragment row ranges to read and any residual filters to apply.
+/// An opaque wrapper around a Rust [`FilteredReadPlan`].
+///
+/// Created by :meth:`Scanner.plan_splits` and consumed by
+/// :meth:`Scanner.execute_filtered_read_plan`.
 #[pyclass(name = "FilteredReadPlan", module = "_lib")]
 #[derive(Clone)]
 pub struct PyFilteredReadPlan {
-    /// Per-fragment row ranges as `(fragment_id, [(start, end), ...])` pairs.
-    #[pyo3(get)]
-    pub fragment_ranges: Vec<(u32, Vec<(u64, u64)>)>,
-    /// Row offset range to apply after filtering (skip N rows, take M rows).
-    #[pyo3(get)]
-    pub scan_range_after_filter: Option<(u64, u64)>,
-    /// The inner Rust FilteredReadPlan, retained for execute_filtered_read_plan.
     pub(crate) inner: FilteredReadPlan,
 }
 
 impl From<FilteredReadPlan> for PyFilteredReadPlan {
     fn from(plan: FilteredReadPlan) -> Self {
-        let fragment_ranges = plan
-            .rows
-            .iter()
-            .map(|(frag_id, ranges)| {
-                let py_ranges: Vec<(u64, u64)> = ranges.iter().map(|r| (r.start, r.end)).collect();
-                (*frag_id, py_ranges)
-            })
-            .collect();
-        let scan_range_after_filter = plan
-            .scan_range_after_filter
-            .as_ref()
-            .map(|r| (r.start, r.end));
-        Self {
-            fragment_ranges,
-            scan_range_after_filter,
-            inner: plan,
-        }
+        Self { inner: plan }
     }
 }
 
 #[pymethods]
 impl PyFilteredReadPlan {
     fn __repr__(&self) -> String {
-        let fragments_str = self
-            .fragment_ranges
-            .iter()
-            .map(|(frag_id, ranges)| {
-                let row_count: u64 = ranges.iter().map(|(s, e)| e - s).sum();
-                format!(
-                    "(fragment_id={}, ranges={}, rows={})",
-                    frag_id,
-                    ranges.len(),
-                    row_count
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!(
-            "FilteredReadPlan(fragments=[{}], scan_range_after_filter={:?})",
-            fragments_str, self.scan_range_after_filter,
-        )
+        format!("{:?}", self.inner)
     }
 }

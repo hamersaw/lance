@@ -2,10 +2,10 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::VecDeque;
-use std::ops::Range;
 
 use arrow_schema::Schema as ArrowSchema;
 use lance_arrow::DataTypeExt;
+use roaring::RoaringBitmap;
 
 use crate::io::exec::filtered_read::FilteredReadPlan;
 
@@ -78,7 +78,7 @@ fn estimate_rows_from_bytes(schema: &ArrowSchema, max_bytes: usize) -> usize {
 /// A lightweight item used during bin-packing in [`super::scanner::Scanner::plan_splits`].
 pub(crate) struct BinItem {
     pub fragment_id: u32,
-    pub ranges: Vec<Range<u64>>,
+    pub bitmap: RoaringBitmap,
     pub row_count: u64,
 }
 
@@ -123,6 +123,10 @@ pub(crate) fn bin_pack(items: Vec<BinItem>, maximum_count: u64) -> Vec<Vec<BinIt
 mod test {
     use super::*;
 
+    fn bitmap_from_range(range: std::ops::Range<u32>) -> RoaringBitmap {
+        RoaringBitmap::from_sorted_iter(range).unwrap()
+    }
+
     #[test]
     fn test_bin_pack_empty() {
         let bins = bin_pack(vec![], 100);
@@ -133,7 +137,7 @@ mod test {
     fn test_bin_pack_single_item_fits() {
         let items = vec![BinItem {
             fragment_id: 0,
-            ranges: vec![0..50],
+            bitmap: bitmap_from_range(0..50),
             row_count: 50,
         }];
         let bins = bin_pack(items, 100);
@@ -146,7 +150,7 @@ mod test {
     fn test_bin_pack_single_item_exceeds_maximum() {
         let items = vec![BinItem {
             fragment_id: 0,
-            ranges: vec![0..200],
+            bitmap: bitmap_from_range(0..200),
             row_count: 200,
         }];
         let bins = bin_pack(items, 100);
@@ -160,17 +164,17 @@ mod test {
         let items = vec![
             BinItem {
                 fragment_id: 0,
-                ranges: vec![0..30],
+                bitmap: bitmap_from_range(0..30),
                 row_count: 30,
             },
             BinItem {
                 fragment_id: 1,
-                ranges: vec![0..30],
+                bitmap: bitmap_from_range(0..30),
                 row_count: 30,
             },
             BinItem {
                 fragment_id: 2,
-                ranges: vec![0..30],
+                bitmap: bitmap_from_range(0..30),
                 row_count: 30,
             },
         ];
@@ -184,17 +188,17 @@ mod test {
         let items = vec![
             BinItem {
                 fragment_id: 0,
-                ranges: vec![0..60],
+                bitmap: bitmap_from_range(0..60),
                 row_count: 60,
             },
             BinItem {
                 fragment_id: 1,
-                ranges: vec![0..60],
+                bitmap: bitmap_from_range(0..60),
                 row_count: 60,
             },
             BinItem {
                 fragment_id: 2,
-                ranges: vec![0..60],
+                bitmap: bitmap_from_range(0..60),
                 row_count: 60,
             },
         ];
@@ -209,10 +213,13 @@ mod test {
     #[test]
     fn test_bin_pack_all_rows_preserved() {
         let items: Vec<BinItem> = (0..10)
-            .map(|i| BinItem {
-                fragment_id: i,
-                ranges: vec![0..(i as u64 * 10 + 10)],
-                row_count: i as u64 * 10 + 10,
+            .map(|i| {
+                let count = i * 10 + 10;
+                BinItem {
+                    fragment_id: i,
+                    bitmap: bitmap_from_range(0..count),
+                    row_count: count as u64,
+                }
             })
             .collect();
         let total_input: u64 = items.iter().map(|i| i.row_count).sum();

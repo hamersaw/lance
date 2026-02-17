@@ -5277,8 +5277,8 @@ class LanceScanner(pa.dataset.Scanner):
         -------
         Splits
             A :class:`Splits` object with either:
-            - ``filtered_read_plans``: A list of :class:`FilteredReadPlan`,
-              each containing fragment_ranges and scan_range_after_filter.
+            - ``filtered_read_plans``: A list of opaque :class:`FilteredReadPlan`
+              objects, each passed to :meth:`execute_filtered_read_plan`.
             - ``fragments``: A list of fragment IDs.
 
         Examples
@@ -5292,11 +5292,7 @@ class LanceScanner(pa.dataset.Scanner):
         >>> splits = scanner.plan_splits(max_row_count=2)
         >>> if splits.filtered_read_plans is not None:
         ...     for plan in splits.filtered_read_plans:
-        ...         for frag_id, ranges in plan.fragment_ranges:
-        ...             row_count = sum(end - start for start, end in ranges)
-        ...             print(f"Fragment {frag_id}: {row_count} rows")
-        Fragment 0: 2 rows
-        Fragment 0: 1 rows
+        ...         print(plan)  # doctest: +SKIP
         """
         return self._scanner.plan_splits(
             max_size_bytes=max_size_bytes,
