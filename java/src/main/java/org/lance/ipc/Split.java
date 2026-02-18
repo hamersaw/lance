@@ -14,6 +14,7 @@
 package org.lance.ipc;
 
 import java.util.List;
+import org.lance.Dataset;
 
 /**
  * A single unit of work from {@link LanceScanner#planSplits}, representing one split for
@@ -51,4 +52,31 @@ public class Split {
   public List<String> getOutputColumns() {
     return outputColumns;
   }
+
+  /**
+   * Serialize this split to bytes.
+   *
+   * <p>The returned byte array can be sent over the wire and later deserialized with {@link
+   * #fromBytes(byte[], Dataset)}.
+   *
+   * @return The serialized split as a byte array.
+   */
+  public byte[] toBytes() {
+    return nativeToBytes();
+  }
+
+  /**
+   * Deserialize a split from bytes.
+   *
+   * @param bytes The serialized split bytes produced by {@link #toBytes()}.
+   * @param dataset The dataset that the split belongs to.
+   * @return The deserialized split.
+   */
+  public static Split fromBytes(byte[] bytes, Dataset dataset) {
+    return nativeFromBytes(bytes, dataset);
+  }
+
+  private native byte[] nativeToBytes();
+
+  private static native Split nativeFromBytes(byte[] bytes, Dataset dataset);
 }

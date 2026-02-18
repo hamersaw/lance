@@ -614,6 +614,56 @@ public class ScannerTest {
     }
   }
 
+  @Test
+  void testSplitRoundtripBytes(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("split_bytes").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      int totalRows = 100;
+      try (Dataset dataset = testDataset.write(1, totalRows)) {
+        try (LanceScanner scanner =
+            dataset.newScan(new ScanOptions.Builder().batchSize(50).build())) {
+          SplittingOptions options = new SplittingOptions.Builder().maxRowCount(30).build();
+          List<Split> splits = scanner.planSplits(options);
+          assertFalse(splits.isEmpty(), "Should have at least one split");
+
+          int totalOriginal = 0;
+          int totalRestored = 0;
+          for (Split split : splits) {
+            byte[] bytes = split.toBytes();
+            assertNotNull(bytes);
+            assertTrue(bytes.length > 0);
+
+            Split restored = Split.fromBytes(bytes, dataset);
+            assertEquals(
+                split.getOutputColumns(), restored.getOutputColumns(),
+                "Output columns should match after roundtrip");
+
+            try (LanceScanner origScanner =
+                    scanner.withFilteredReadExec(split.getFilteredReadExec());
+                ArrowReader origReader = origScanner.scanBatches()) {
+              while (origReader.loadNextBatch()) {
+                totalOriginal += origReader.getVectorSchemaRoot().getRowCount();
+              }
+            }
+            try (LanceScanner restoredScanner =
+                    scanner.withFilteredReadExec(restored.getFilteredReadExec());
+                ArrowReader restoredReader = restoredScanner.scanBatches()) {
+              while (restoredReader.loadNextBatch()) {
+                totalRestored += restoredReader.getVectorSchemaRoot().getRowCount();
+              }
+            }
+            restored.getFilteredReadExec().close();
+          }
+          assertEquals(totalRows, totalOriginal, "All original rows should be scanned");
+          assertEquals(totalRows, totalRestored, "All restored rows should be scanned");
+        }
+      }
+    }
+  }
+
   private void validScanResult(Dataset dataset, int fragmentId, int rowCount) throws Exception {
     try (Scanner scanner =
         dataset.newScan(

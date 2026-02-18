@@ -214,6 +214,45 @@ impl PySplit {
     fn __repr__(&self) -> String {
         "Split(filtered_read_exec=<FilteredReadExec>)".to_string()
     }
+
+    /// Serialize this split to bytes.
+    ///
+    /// Returns a bytes object that can be sent over the wire and later
+    /// deserialized with :meth:`Split.from_bytes`.
+    fn to_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
+        let split = lance::dataset::split::Split {
+            exec: self.filtered_read_exec.inner.clone(),
+            output_columns: self.output_columns.clone(),
+        };
+        let bytes = split
+            .to_bytes()
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(pyo3::types::PyBytes::new(py, &bytes))
+    }
+
+    /// Deserialize a split from bytes.
+    ///
+    /// Parameters
+    /// ----------
+    /// data : bytes
+    ///     The serialized split bytes produced by :meth:`to_bytes`.
+    /// dataset : Dataset
+    ///     The dataset that the split belongs to (the native ``_Dataset``).
+    #[staticmethod]
+    fn from_bytes(
+        py: Python<'_>,
+        data: &[u8],
+        dataset: &crate::dataset::Dataset,
+    ) -> PyResult<Self> {
+        let ds = dataset.ds.clone();
+        let bytes = data.to_vec();
+        let split = rt()
+            .spawn(Some(py), async move {
+                lance::dataset::split::Split::from_bytes(&bytes, &ds).await
+            })?
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(PySplit::from(split))
+    }
 }
 
 /// An opaque wrapper around a Rust [`FilteredReadExec`].

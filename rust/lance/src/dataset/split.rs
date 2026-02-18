@@ -63,6 +63,42 @@ impl Split {
         })
     }
 
+    /// Serialize this split to bytes using a default session state.
+    ///
+    /// This is a convenience wrapper around [`Self::to_proto`] that creates a
+    /// default [`datafusion::prelude::SessionContext`] internally, then encodes
+    /// the resulting protobuf to bytes via [`prost::Message`].
+    pub fn to_bytes(&self) -> lance_core::Result<Vec<u8>> {
+        use datafusion::prelude::SessionContext;
+        use prost::Message;
+
+        let state = SessionContext::new().state();
+        let proto = self.to_proto(&state)?;
+        Ok(proto.encode_to_vec())
+    }
+
+    /// Deserialize a split from bytes using a default session state.
+    ///
+    /// This is a convenience wrapper around [`Self::from_proto`] that creates a
+    /// default [`datafusion::prelude::SessionContext`] internally, then decodes
+    /// the bytes into a [`lance_datafusion::pb::SplitProto`] via [`prost::Message`].
+    pub async fn from_bytes(
+        bytes: &[u8],
+        dataset: &Arc<crate::Dataset>,
+    ) -> lance_core::Result<Self> {
+        use datafusion::prelude::SessionContext;
+        use prost::Message;
+
+        let state = SessionContext::new().state();
+        let proto = lance_datafusion::pb::SplitProto::decode(bytes).map_err(|e| {
+            lance_core::Error::InvalidInput {
+                source: format!("Failed to decode SplitProto: {e}").into(),
+                location: snafu::location!(),
+            }
+        })?;
+        Self::from_proto(proto, dataset, &state).await
+    }
+
     /// Deserialize a split from a protobuf message.
     ///
     /// The `dataset` and `state` are needed to reconstruct a [`FilteredReadExec`]
@@ -169,6 +205,55 @@ pub(crate) fn bin_pack(items: Vec<BinItem>, maximum_count: u64) -> Vec<Vec<BinIt
     }
 
     bins
+}
+
+#[cfg(all(test, feature = "substrait"))]
+mod test_serde {
+    use std::sync::Arc;
+
+    use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+
+    use crate::dataset::split::SplittingOptions;
+    use crate::dataset::WriteParams;
+
+    #[tokio::test]
+    async fn test_split_roundtrip_bytes() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("val", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..100)),
+                Arc::new(Int32Array::from_iter_values(100..200)),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let dataset = Arc::new(
+            crate::Dataset::write(reader, "memory://split_roundtrip", None)
+                .await
+                .unwrap(),
+        );
+
+        let splits = dataset
+            .scan()
+            .plan_splits(Some(SplittingOptions {
+                max_row_count: Some(30),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        assert!(!splits.is_empty());
+
+        for original in &splits {
+            let bytes = original.to_bytes().unwrap();
+            let restored = super::Split::from_bytes(&bytes, &dataset).await.unwrap();
+            assert_eq!(original.output_columns, restored.output_columns);
+        }
+    }
 }
 
 #[cfg(test)]

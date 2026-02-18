@@ -9,8 +9,8 @@ use crate::traits::{import_vec_from_method, import_vec_to_rust};
 use arrow::array::Float32Array;
 use arrow::{ffi::FFI_ArrowSchema, ffi_stream::FFI_ArrowArrayStream};
 use arrow_schema::SchemaRef;
-use jni::objects::{JObject, JString};
-use jni::sys::{jboolean, jint, JNI_TRUE};
+use jni::objects::{JByteArray, JObject, JString};
+use jni::sys::{jboolean, jbyteArray, jint, JNI_TRUE};
 use jni::{sys::jlong, JNIEnv};
 use lance::dataset::scanner::{
     AggregateExpr, ColumnOrdering, DatasetRecordBatchStream, Scanner, Split, SplittingOptions,
@@ -653,4 +653,102 @@ pub extern "system" fn Java_org_lance_ipc_FilteredReadExec_releaseNativeExec(
             drop(Box::from_raw(handle as *mut Arc<FilteredReadExec>));
         }
     }
+}
+
+///////////////////////////////////
+// Split toBytes / fromBytes     //
+///////////////////////////////////
+#[no_mangle]
+pub extern "system" fn Java_org_lance_ipc_Split_nativeToBytes<'local>(
+    mut env: JNIEnv<'local>,
+    j_split: JObject,
+) -> jbyteArray {
+    ok_or_throw_with_return!(
+        env,
+        inner_split_to_bytes(&mut env, j_split).map(|arr| arr.into_raw()),
+        std::ptr::null_mut()
+    )
+}
+
+fn inner_split_to_bytes<'local>(
+    env: &mut JNIEnv<'local>,
+    j_split: JObject,
+) -> Result<JByteArray<'local>> {
+    // Get the FilteredReadExec native handle from the Java Split
+    let j_exec = env
+        .call_method(
+            &j_split,
+            "getFilteredReadExec",
+            "()Lorg/lance/ipc/FilteredReadExec;",
+            &[],
+        )?
+        .l()?;
+
+    let handle = env.get_field(&j_exec, "nativeHandle", "J")?.j()?;
+    if handle == 0 {
+        return Err(Error::input_error(
+            "FilteredReadExec has been closed".to_string(),
+        ));
+    }
+    let exec = unsafe { &*(handle as *const Arc<FilteredReadExec>) }.clone();
+
+    // Get outputColumns from the Java Split
+    let j_columns = env
+        .call_method(&j_split, "getOutputColumns", "()Ljava/util/List;", &[])?
+        .l()?;
+    let list = env.get_list(&j_columns)?;
+    let size = list.size(env)? as usize;
+    let mut output_columns = Vec::with_capacity(size);
+    let mut iter = list.iter(env)?;
+    while let Some(elem) = iter.next(env)? {
+        let jstr = JString::from(elem);
+        let value: String = env.get_string(&jstr)?.into();
+        output_columns.push(value);
+    }
+
+    // Build the Rust Split and serialize
+    let split = Split {
+        exec,
+        output_columns,
+    };
+    let bytes = split.to_bytes()?;
+    let arr = env.new_byte_array(bytes.len() as jint)?;
+    let i8_slice: &[i8] = unsafe { std::mem::transmute(bytes.as_slice()) };
+    env.set_byte_array_region(&arr, 0, i8_slice)?;
+    Ok(arr)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_ipc_Split_nativeFromBytes<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JObject,
+    j_bytes: JByteArray<'local>,
+    j_dataset: JObject,
+) -> JObject<'local> {
+    ok_or_throw!(env, inner_split_from_bytes(&mut env, j_bytes, j_dataset))
+}
+
+fn inner_split_from_bytes<'local>(
+    env: &mut JNIEnv<'local>,
+    j_bytes: JByteArray<'local>,
+    j_dataset: JObject,
+) -> Result<JObject<'local>> {
+    let bytes = env.convert_byte_array(j_bytes)?;
+
+    let dataset_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingDataset>(j_dataset, NATIVE_DATASET) }?;
+    let ds = Arc::new(dataset_guard.inner.clone());
+    drop(dataset_guard);
+
+    let split = RT.block_on(Split::from_bytes(&bytes, &ds))?;
+
+    // Convert back to Java objects
+    let j_exec = create_java_filtered_read_exec(env, split.exec)?;
+    let j_columns = create_java_string_list(env, &split.output_columns)?;
+    let j_split = env.new_object(
+        "org/lance/ipc/Split",
+        "(Lorg/lance/ipc/FilteredReadExec;Ljava/util/List;)V",
+        &[(&j_exec).into(), (&j_columns).into()],
+    )?;
+    Ok(j_split)
 }

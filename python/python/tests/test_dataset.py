@@ -5280,3 +5280,39 @@ def test_default_scan_options_nearest(tmp_path: Path) -> None:
     assert distances == sorted(distances)
 
     assert "id" in result.column_names
+
+
+def test_split_roundtrip_bytes(tmp_path: Path):
+    table = pa.table({"id": range(100), "val": range(100, 200)})
+    dataset = lance.write_dataset(table, tmp_path / "split_bytes")
+
+    scanner = dataset.scanner()
+    splits = scanner.plan_splits(max_row_count=30)
+    assert len(splits) > 0
+
+    total_original = 0
+    total_restored = 0
+    for split in splits:
+        data = split.to_bytes()
+        assert isinstance(data, bytes)
+        assert len(data) > 0
+
+        restored = lance.Split.from_bytes(data, dataset._ds)
+        assert split.output_columns == restored.output_columns
+
+        original_rows = (
+            scanner.with_filtered_read_exec(split.filtered_read_exec)
+            .to_table()
+            .num_rows
+        )
+        restored_rows = (
+            scanner.with_filtered_read_exec(restored.filtered_read_exec)
+            .to_table()
+            .num_rows
+        )
+        assert original_rows == restored_rows
+        total_original += original_rows
+        total_restored += restored_rows
+
+    assert total_original == 100
+    assert total_restored == 100
