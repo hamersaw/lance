@@ -4489,13 +4489,6 @@ impl Scanner {
     /// containing at most `max_rows_per_split` rows. Splits can be executed
     /// independently in parallel across distributed workers.
     pub async fn plan_splits(&self, options: Option<SplittingOptions>) -> Result<Vec<Split>> {
-        if self.offset.is_some() {
-            return Err(Error::NotSupported {
-                source: "plan_splits does not support offset; apply offset on the consuming scanner instead".into(),
-                location: location!(),
-            });
-        }
-
         // Attempt to use filtering to prune fragments / rows
         let use_scalar_index = self.use_scalar_index && (self.prefilter || self.nearest.is_none());
         let mut filter_plan = self.create_filter_plan(use_scalar_index).await?;
@@ -9940,48 +9933,6 @@ mod test {
             "Error should mention 'not supported', got: {}",
             err
         );
-    }
-
-    #[tokio::test]
-    async fn test_plan_splits_with_offset_returns_not_supported() {
-        let dataset = lance_datagen::gen_batch()
-            .col("id", array::step::<Int32Type>())
-            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(100))
-            .await
-            .unwrap();
-
-        let result = dataset
-            .scan()
-            .limit(Some(10), Some(5))
-            .unwrap()
-            .plan_splits(None)
-            .await;
-
-        assert!(result.is_err(), "plan_splits should fail with offset");
-        let err = result.unwrap_err().to_string().to_lowercase();
-        assert!(
-            err.contains("not supported"),
-            "Error should mention 'not supported', got: {}",
-            err
-        );
-    }
-
-    #[tokio::test]
-    async fn test_plan_splits_with_limit_only_succeeds() {
-        let dataset = lance_datagen::gen_batch()
-            .col("id", array::step::<Int32Type>())
-            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(100))
-            .await
-            .unwrap();
-
-        let result = dataset
-            .scan()
-            .limit(Some(50), None)
-            .unwrap()
-            .plan_splits(None)
-            .await;
-
-        assert!(result.is_ok(), "plan_splits should succeed with limit only");
     }
 
     #[tokio::test]
