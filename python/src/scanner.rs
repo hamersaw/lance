@@ -180,10 +180,10 @@ impl Scanner {
         Ok(splits.into_iter().map(PySplit::from).collect())
     }
 
-    fn with_filtered_read_exec(&self, exec: PyFilteredReadExec) -> Scanner {
+    fn with_filtered_read_exec(&self, exec: PyFilteredReadExec) -> Self {
         let mut scanner = (*self.scanner).clone();
         scanner.with_filtered_read_exec(exec.inner);
-        Scanner::new(Arc::new(scanner))
+        Self::new(Arc::new(scanner))
     }
 }
 
@@ -251,7 +251,7 @@ impl PySplit {
                 lance::dataset::split::Split::from_bytes(&bytes, &ds).await
             })?
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(PySplit::from(split))
+        Ok(Self::from(split))
     }
 }
 

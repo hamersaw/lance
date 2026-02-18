@@ -215,7 +215,6 @@ mod test_serde {
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 
     use crate::dataset::split::SplittingOptions;
-    use crate::dataset::WriteParams;
 
     #[tokio::test]
     async fn test_split_roundtrip_bytes() {
