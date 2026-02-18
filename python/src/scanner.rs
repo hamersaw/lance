@@ -191,34 +191,20 @@ impl Scanner {
 #[pyclass(name = "Split", module = "_lib")]
 #[derive(Clone)]
 pub struct PySplit {
-    /// The filtered read exec, if this is a `FilteredReadExec` variant.
+    /// The filtered read exec for this split.
     #[pyo3(get)]
-    pub filtered_read_exec: Option<PyFilteredReadExec>,
-    /// The fragment IDs, if this is a `Fragments` variant.
-    #[pyo3(get)]
-    pub fragments: Option<Vec<u32>>,
+    pub filtered_read_exec: PyFilteredReadExec,
     /// Ordered output column names from the original scan, including metadata
-    /// columns like `_rowid`. Only set for the `FilteredReadExec` variant.
+    /// columns like `_rowid`.
     #[pyo3(get)]
-    pub output_columns: Option<Vec<String>>,
+    pub output_columns: Vec<String>,
 }
 
 impl From<Split> for PySplit {
     fn from(split: Split) -> Self {
-        match split {
-            Split::FilteredReadExec {
-                exec,
-                output_columns,
-            } => Self {
-                filtered_read_exec: Some(PyFilteredReadExec { inner: exec }),
-                fragments: None,
-                output_columns: Some(output_columns),
-            },
-            Split::Fragments(fragment_ids) => Self {
-                filtered_read_exec: None,
-                fragments: Some(fragment_ids),
-                output_columns: None,
-            },
+        Self {
+            filtered_read_exec: PyFilteredReadExec { inner: split.exec },
+            output_columns: split.output_columns,
         }
     }
 }
@@ -226,13 +212,7 @@ impl From<Split> for PySplit {
 #[pymethods]
 impl PySplit {
     fn __repr__(&self) -> String {
-        if self.filtered_read_exec.is_some() {
-            "Split(filtered_read_exec=<FilteredReadExec>)".to_string()
-        } else if let Some(fragments) = &self.fragments {
-            format!("Split(fragments={:?})", fragments)
-        } else {
-            "Split()".to_string()
-        }
+        "Split(filtered_read_exec=<FilteredReadExec>)".to_string()
     }
 }
 

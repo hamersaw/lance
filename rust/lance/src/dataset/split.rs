@@ -31,20 +31,16 @@ pub struct SplittingOptions {
 
 /// Result of [`super::scanner::Scanner::plan_splits`], representing a single unit of work
 /// for distributed execution.
+///
+/// Contains a fully-configured execution node with row selections, filters, and read options.
+/// `output_columns` captures the user's originally requested columns in order so
+/// that a consuming scanner can restrict its output accordingly. The exec's own
+/// projection may include additional filter-only columns. Metadata columns like
+/// `_rowid` and `_rowaddr` are included when the original scanner requested them.
 #[derive(Debug, Clone)]
-pub enum Split {
-    /// A fully-configured execution node with row selections, filters, and read options.
-    ///
-    /// `output_columns` captures the user's originally requested columns in order so
-    /// that a consuming scanner can restrict its output accordingly. The exec's own
-    /// projection may include additional filter-only columns. Metadata columns like
-    /// `_rowid` and `_rowaddr` are included when the original scanner requested them.
-    FilteredReadExec {
-        exec: Arc<FilteredReadExec>,
-        output_columns: Vec<String>,
-    },
-    /// Fragment IDs only — a collection of fragment IDs to scan.
-    Fragments(Vec<u32>),
+pub struct Split {
+    pub exec: Arc<FilteredReadExec>,
+    pub output_columns: Vec<String>,
 }
 
 #[cfg(feature = "substrait")]
@@ -52,63 +48,45 @@ impl Split {
     /// Serialize this split to a protobuf message.
     ///
     /// The `state` is needed to Substrait-encode any filter expressions inside a
-    /// [`FilteredReadExec`]. For the `Fragments` variant it is unused.
+    /// [`FilteredReadExec`].
     pub fn to_proto(
         &self,
         state: &datafusion::execution::SessionState,
     ) -> lance_core::Result<lance_datafusion::pb::SplitProto> {
         use crate::io::exec::filtered_read_proto::filtered_read_exec_to_proto;
-        use lance_datafusion::pb::split_proto;
 
-        let (split, columns) = match self {
-            Self::FilteredReadExec {
-                exec,
-                output_columns,
-            } => {
-                let proto =
-                    split_proto::Split::FilteredReadExec(filtered_read_exec_to_proto(exec, state)?);
-                (proto, output_columns.clone())
-            }
-            Self::Fragments(ids) => (
-                split_proto::Split::Fragments(lance_datafusion::pb::FragmentIdList {
-                    fragment_ids: ids.clone(),
-                }),
-                Vec::new(),
-            ),
-        };
+        let exec_proto = filtered_read_exec_to_proto(&self.exec, state)?;
 
         Ok(lance_datafusion::pb::SplitProto {
-            split: Some(split),
-            output_columns: columns,
+            filtered_read_exec: Some(exec_proto),
+            output_columns: self.output_columns.clone(),
         })
     }
 
     /// Deserialize a split from a protobuf message.
     ///
     /// The `dataset` and `state` are needed to reconstruct a [`FilteredReadExec`]
-    /// from the proto. For the `Fragments` variant they are unused.
+    /// from the proto.
     pub async fn from_proto(
         proto: lance_datafusion::pb::SplitProto,
         dataset: &Arc<crate::Dataset>,
         state: &datafusion::execution::SessionState,
     ) -> lance_core::Result<Self> {
         use crate::io::exec::filtered_read_proto::filtered_read_exec_from_proto;
-        use lance_datafusion::pb::split_proto;
 
-        match proto.split.ok_or_else(|| lance_core::Error::InvalidInput {
-            source: "SplitProto has no split variant set".into(),
-            location: snafu::location!(),
-        })? {
-            split_proto::Split::FilteredReadExec(exec_proto) => {
-                let exec =
-                    filtered_read_exec_from_proto(exec_proto, dataset.clone(), None, state).await?;
-                Ok(Self::FilteredReadExec {
-                    exec: Arc::new(exec),
-                    output_columns: proto.output_columns,
-                })
-            }
-            split_proto::Split::Fragments(frag_list) => Ok(Self::Fragments(frag_list.fragment_ids)),
-        }
+        let exec_proto =
+            proto
+                .filtered_read_exec
+                .ok_or_else(|| lance_core::Error::InvalidInput {
+                    source: "SplitProto has no filtered_read_exec set".into(),
+                    location: snafu::location!(),
+                })?;
+
+        let exec = filtered_read_exec_from_proto(exec_proto, dataset.clone(), None, state).await?;
+        Ok(Self {
+            exec: Arc::new(exec),
+            output_columns: proto.output_columns,
+        })
     }
 }
 

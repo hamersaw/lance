@@ -557,53 +557,13 @@ fn create_java_split_list<'a>(env: &mut JNIEnv<'a>, splits: Vec<Split>) -> Resul
     )?;
 
     for split in splits {
-        let j_split = match split {
-            Split::FilteredReadExec {
-                exec,
-                output_columns,
-            } => {
-                let j_exec = create_java_filtered_read_exec(env, exec)?;
-                let j_columns = create_java_string_list(env, &output_columns)?;
-                // new Split(filteredReadExec, null, outputColumns)
-                env.new_object(
-                    "org/lance/ipc/Split",
-                    "(Lorg/lance/ipc/FilteredReadExec;Ljava/util/List;Ljava/util/List;)V",
-                    &[
-                        (&j_exec).into(),
-                        (&JObject::null()).into(),
-                        (&j_columns).into(),
-                    ],
-                )?
-            }
-            Split::Fragments(frag_ids) => {
-                // Create ArrayList<Integer> for fragment IDs
-                let j_frag_list = env.new_object(
-                    "java/util/ArrayList",
-                    "(I)V",
-                    &[(frag_ids.len() as jint).into()],
-                )?;
-                for frag_id in frag_ids {
-                    let j_int =
-                        env.new_object("java/lang/Integer", "(I)V", &[(frag_id as jint).into()])?;
-                    env.call_method(
-                        &j_frag_list,
-                        "add",
-                        "(Ljava/lang/Object;)Z",
-                        &[(&j_int).into()],
-                    )?;
-                }
-                // new Split(null, fragments, null)
-                env.new_object(
-                    "org/lance/ipc/Split",
-                    "(Lorg/lance/ipc/FilteredReadExec;Ljava/util/List;Ljava/util/List;)V",
-                    &[
-                        (&JObject::null()).into(),
-                        (&j_frag_list).into(),
-                        (&JObject::null()).into(),
-                    ],
-                )?
-            }
-        };
+        let j_exec = create_java_filtered_read_exec(env, split.exec)?;
+        let j_columns = create_java_string_list(env, &split.output_columns)?;
+        let j_split = env.new_object(
+            "org/lance/ipc/Split",
+            "(Lorg/lance/ipc/FilteredReadExec;Ljava/util/List;)V",
+            &[(&j_exec).into(), (&j_columns).into()],
+        )?;
         env.call_method(
             &j_list,
             "add",

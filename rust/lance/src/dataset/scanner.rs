@@ -4459,27 +4459,11 @@ impl Scanner {
         let mut filter_plan = self.create_filter_plan(use_scalar_index).await?;
 
         let (exec_plan, _) = self.create_execution_plan(&mut filter_plan).await?;
-        let original_exec = match exec_plan.as_any().downcast_ref::<FilteredReadExec>() {
-            Some(filtered_read_exec) => filtered_read_exec,
-            None => {
-                let fragments: Vec<Split> = self
-                    .fragments
-                    .as_ref()
-                    .map(|frags| {
-                        frags
-                            .iter()
-                            .map(|f| Split::Fragments(vec![f.id as u32]))
-                            .collect()
-                    })
-                    .unwrap_or_else(|| {
-                        self.dataset
-                            .fragments()
-                            .iter()
-                            .map(|f| Split::Fragments(vec![f.id as u32]))
-                            .collect()
-                    });
-                return Ok(fragments);
-            }
+        let Some(original_exec) = exec_plan.as_any().downcast_ref::<FilteredReadExec>() else {
+            return Err(Error::NotSupported {
+                source: "plan_splits requires a FilteredReadExec plan; vector search and other non-standard plans are not supported".into(),
+                location: location!(),
+            });
         };
 
         // Extract the plan from the original exec for bin-packing
@@ -4588,7 +4572,7 @@ impl Scanner {
             let exec = FilteredReadExec::try_new(self.dataset.clone(), split_options, None)?;
             let exec = exec.with_plan(split_plan).await?;
 
-            splits.push(Split::FilteredReadExec {
+            splits.push(Split {
                 exec: Arc::new(exec),
                 output_columns: self
                     .projection_plan
@@ -4944,28 +4928,16 @@ mod test {
         plan.rows.iter().count()
     }
 
-    /// Extract FilteredReadExecs from a Vec<Split>, panicking if any split is not a FilteredReadExec.
+    /// Extract FilteredReadExecs from a Vec<Split>.
     fn unwrap_execs(splits: Vec<Split>) -> Vec<Arc<FilteredReadExec>> {
-        splits
-            .into_iter()
-            .map(|s| match s {
-                Split::FilteredReadExec { exec, .. } => exec,
-                Split::Fragments(_) => panic!("Expected FilteredReadExec"),
-            })
-            .collect()
+        splits.into_iter().map(|s| s.exec).collect()
     }
 
     /// Extract (exec, output_columns) pairs from a Vec<Split>.
     fn unwrap_splits(splits: Vec<Split>) -> Vec<(Arc<FilteredReadExec>, Vec<String>)> {
         splits
             .into_iter()
-            .map(|s| match s {
-                Split::FilteredReadExec {
-                    exec,
-                    output_columns,
-                } => (exec, output_columns),
-                Split::Fragments(_) => panic!("Expected FilteredReadExec"),
-            })
+            .map(|s| (s.exec, s.output_columns))
             .collect()
     }
 
@@ -9902,31 +9874,25 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_plan_splits_vector_search_returns_fragments() {
-        // Vector search should return Fragments variant, not FilteredReadPlans
+    async fn test_plan_splits_vector_search_returns_not_supported() {
+        // Vector search is not supported by plan_splits
         let (_tmp_dir, dataset) = make_binary_vector_dataset().await.unwrap();
 
         let query = UInt8Array::from(vec![0b0000_1111u8, 0, 0, 0]);
-        let splits = dataset
+        let result = dataset
             .scan()
             .nearest("bin", &query, 2)
             .unwrap()
             .plan_splits(None)
-            .await
-            .unwrap();
+            .await;
 
-        assert!(!splits.is_empty(), "Should have fragment groups");
-        // Each split should be a Fragments variant with a single fragment
-        for split in &splits {
-            match split {
-                Split::Fragments(frag_ids) => {
-                    assert_eq!(frag_ids.len(), 1, "Each split should contain one fragment");
-                }
-                Split::FilteredReadExec { .. } => {
-                    panic!("Expected Fragments variant for vector search")
-                }
-            }
-        }
+        assert!(result.is_err(), "plan_splits should fail for vector search");
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("not supported"),
+            "Error should mention 'not supported', got: {}",
+            err
+        );
     }
 
     #[tokio::test]
