@@ -13,8 +13,9 @@
  */
 package org.lance.ipc;
 
-import java.util.List;
 import org.lance.Dataset;
+
+import java.util.List;
 
 /**
  * A single unit of work from {@link LanceScanner#planSplits}, representing one split for
@@ -43,8 +44,8 @@ public class Split {
   /**
    * Get the ordered output column names from the original scan.
    *
-   * <p>Includes metadata columns like {@code _rowid} when the original scanner requested them.
-   * Use these column names when configuring the scanner's projection before calling {@link
+   * <p>Includes metadata columns like {@code _rowid} when the original scanner requested them. Use
+   * these column names when configuring the scanner's projection before calling {@link
    * LanceScanner#withFilteredReadExec}.
    *
    * @return The ordered list of column names.

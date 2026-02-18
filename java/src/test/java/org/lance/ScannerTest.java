@@ -14,7 +14,6 @@
 package org.lance;
 
 import org.lance.ipc.ColumnOrdering;
-import org.lance.ipc.FilteredReadExec;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
 import org.lance.ipc.Split;
@@ -556,9 +555,7 @@ public class ScannerTest {
           List<Split> splits = scanner.planSplits(null);
           assertFalse(splits.isEmpty(), "Should have at least one split");
           for (Split split : splits) {
-            assertTrue(
-                split.getFilteredReadExec().isPresent() || split.getFragments().isPresent(),
-                "Each split should have either filteredReadExec or fragments");
+            assertNotNull(split.getFilteredReadExec(), "Each split should have a filteredReadExec");
           }
         }
       }
@@ -598,13 +595,11 @@ public class ScannerTest {
           List<Split> splits = scanner.planSplits(null);
           int totalScannedRows = 0;
           for (Split split : splits) {
-            if (split.getFilteredReadExec().isPresent()) {
-              FilteredReadExec e = split.getFilteredReadExec().get();
-              try (LanceScanner splitScanner = scanner.withFilteredReadExec(e);
-                  ArrowReader reader = splitScanner.scanBatches()) {
-                while (reader.loadNextBatch()) {
-                  totalScannedRows += reader.getVectorSchemaRoot().getRowCount();
-                }
+            try (LanceScanner splitScanner =
+                    scanner.withFilteredReadExec(split.getFilteredReadExec());
+                ArrowReader reader = splitScanner.scanBatches()) {
+              while (reader.loadNextBatch()) {
+                totalScannedRows += reader.getVectorSchemaRoot().getRowCount();
               }
             }
           }
@@ -638,7 +633,8 @@ public class ScannerTest {
 
             Split restored = Split.fromBytes(bytes, dataset);
             assertEquals(
-                split.getOutputColumns(), restored.getOutputColumns(),
+                split.getOutputColumns(),
+                restored.getOutputColumns(),
                 "Output columns should match after roundtrip");
 
             try (LanceScanner origScanner =
