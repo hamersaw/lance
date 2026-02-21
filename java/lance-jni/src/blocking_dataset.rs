@@ -575,34 +575,11 @@ fn inner_create_with_ffi_stream<'local>(
     namespace_obj: JObject,                // LanceNamespace (can be null)
     table_id_obj: JObject,                 // List<String> (can be null)
 ) -> Result<JObject<'local>> {
-    use crate::namespace::{
-        create_java_lance_namespace, BlockingDirectoryNamespace, BlockingRestNamespace,
-    };
-
     let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
     let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }?;
 
     // Create the namespace wrapper for commit handling (if provided)
-    let namespace_info = if namespace_obj.is_null() {
-        None
-    } else {
-        let namespace: Arc<dyn LanceNamespace> = if is_directory_namespace(env, &namespace_obj)? {
-            let native_handle = get_native_namespace_handle(env, &namespace_obj)?;
-            let ns = unsafe { &*(native_handle as *const BlockingDirectoryNamespace) };
-            ns.inner.clone()
-        } else if is_rest_namespace(env, &namespace_obj)? {
-            let native_handle = get_native_namespace_handle(env, &namespace_obj)?;
-            let ns = unsafe { &*(native_handle as *const BlockingRestNamespace) };
-            ns.inner.clone()
-        } else {
-            // Custom Java implementation, create a Java bridge wrapper
-            create_java_lance_namespace(env, &namespace_obj)?
-        };
-
-        // Extract table_id from Java List<String>
-        let table_id = env.get_strings(&table_id_obj)?;
-        Some((namespace, table_id))
-    };
+    let namespace_info = extract_namespace_info(env, &namespace_obj, &table_id_obj)?;
 
     create_dataset(
         env,
@@ -1150,10 +1127,6 @@ fn inner_open_native<'local>(
     namespace_obj: JObject,                // LanceNamespace object, null if no namespace
     table_id_obj: JObject,                 // List<String>, null if no namespace
 ) -> Result<JObject<'local>> {
-    use crate::namespace::{
-        create_java_lance_namespace, BlockingDirectoryNamespace, BlockingRestNamespace,
-    };
-
     let path_str: String = path.extract(env)?;
     let version = env.get_u64_opt(&version_obj)?;
     let block_size = env.get_int_opt(&block_size_obj)?;
@@ -1170,31 +1143,10 @@ fn inner_open_native<'local>(
         storage_options_provider.map(|v| Arc::new(v) as Arc<dyn StorageOptionsProvider>);
 
     // Extract namespace and table_id if provided (before get_bytes_opt which holds borrow)
-    let (namespace, table_id) = if !namespace_obj.is_null() {
-        // Check if it's a native implementation using instanceof checks
-        let ns_arc: Arc<dyn LanceNamespace> = if is_directory_namespace(env, &namespace_obj)? {
-            let native_handle = get_native_namespace_handle(env, &namespace_obj)?;
-            let ns = unsafe { &*(native_handle as *const BlockingDirectoryNamespace) };
-            ns.inner.clone()
-        } else if is_rest_namespace(env, &namespace_obj)? {
-            let native_handle = get_native_namespace_handle(env, &namespace_obj)?;
-            let ns = unsafe { &*(native_handle as *const BlockingRestNamespace) };
-            ns.inner.clone()
-        } else {
-            // Custom Java implementation, create a Java bridge wrapper
-            create_java_lance_namespace(env, &namespace_obj)?
-        };
-
-        // Extract table_id from List<String>
-        let table_id = if !table_id_obj.is_null() {
-            Some(env.get_strings(&table_id_obj)?)
-        } else {
-            None
-        };
-
-        (Some(ns_arc), table_id)
-    } else {
-        (None, None)
+    let namespace_info = extract_namespace_info(env, &namespace_obj, &table_id_obj)?;
+    let (namespace, table_id) = match namespace_info {
+        Some((ns, tid)) => (Some(ns), Some(tid)),
+        None => (None, None),
     };
 
     let serialized_manifest = env.get_bytes_opt(&serialized_manifest)?;
@@ -1219,7 +1171,7 @@ fn inner_open_native<'local>(
 }
 
 /// Check if the Java object is an instance of DirectoryNamespace.
-fn is_directory_namespace(env: &mut JNIEnv, namespace_obj: &JObject) -> Result<bool> {
+pub(crate) fn is_directory_namespace(env: &mut JNIEnv, namespace_obj: &JObject) -> Result<bool> {
     let class = env
         .find_class("org/lance/namespace/DirectoryNamespace")
         .map_err(|e| {
@@ -1230,7 +1182,7 @@ fn is_directory_namespace(env: &mut JNIEnv, namespace_obj: &JObject) -> Result<b
 }
 
 /// Check if the Java object is an instance of RestNamespace.
-fn is_rest_namespace(env: &mut JNIEnv, namespace_obj: &JObject) -> Result<bool> {
+pub(crate) fn is_rest_namespace(env: &mut JNIEnv, namespace_obj: &JObject) -> Result<bool> {
     let class = env
         .find_class("org/lance/namespace/RestNamespace")
         .map_err(|e| Error::runtime_error(format!("Failed to find RestNamespace class: {}", e)))?;
@@ -1239,11 +1191,48 @@ fn is_rest_namespace(env: &mut JNIEnv, namespace_obj: &JObject) -> Result<bool> 
 }
 
 /// Get the native handle from a Java LanceNamespace object.
-fn get_native_namespace_handle(env: &mut JNIEnv, namespace_obj: &JObject) -> Result<jlong> {
+pub(crate) fn get_native_namespace_handle(
+    env: &mut JNIEnv,
+    namespace_obj: &JObject,
+) -> Result<jlong> {
     env.call_method(namespace_obj, "getNativeHandle", "()J", &[])
         .map_err(|e| Error::runtime_error(format!("Failed to call getNativeHandle: {}", e)))?
         .j()
         .map_err(|e| Error::runtime_error(format!("getNativeHandle did not return a long: {}", e)))
+}
+
+/// Extract namespace and table_id from Java objects into Rust types.
+///
+/// Returns `None` if `namespace_obj` is null, otherwise returns the namespace
+/// and table_id pair.
+#[allow(clippy::type_complexity)]
+pub(crate) fn extract_namespace_info(
+    env: &mut JNIEnv,
+    namespace_obj: &JObject,
+    table_id_obj: &JObject,
+) -> Result<Option<(Arc<dyn LanceNamespace>, Vec<String>)>> {
+    use crate::namespace::{
+        create_java_lance_namespace, BlockingDirectoryNamespace, BlockingRestNamespace,
+    };
+
+    if namespace_obj.is_null() {
+        return Ok(None);
+    }
+
+    let namespace: Arc<dyn LanceNamespace> = if is_directory_namespace(env, namespace_obj)? {
+        let native_handle = get_native_namespace_handle(env, namespace_obj)?;
+        let ns = unsafe { &*(native_handle as *const BlockingDirectoryNamespace) };
+        ns.inner.clone()
+    } else if is_rest_namespace(env, namespace_obj)? {
+        let native_handle = get_native_namespace_handle(env, namespace_obj)?;
+        let ns = unsafe { &*(native_handle as *const BlockingRestNamespace) };
+        ns.inner.clone()
+    } else {
+        create_java_lance_namespace(env, namespace_obj)?
+    };
+
+    let table_id = env.get_strings(table_id_obj)?;
+    Ok(Some((namespace, table_id)))
 }
 
 #[no_mangle]

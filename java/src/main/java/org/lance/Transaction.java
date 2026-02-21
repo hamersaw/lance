@@ -13,12 +13,15 @@
  */
 package org.lance;
 
+import org.lance.io.StorageOptionsProvider;
 import org.lance.operation.Operation;
 
 import com.google.common.base.MoreObjects;
+import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.util.Preconditions;
 
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -38,6 +41,14 @@ public class Transaction {
   private final Dataset dataset;
   private final Operation operation;
 
+  // URI-based commit fields
+  private final String uri;
+  private final BufferAllocator allocator;
+  private final StorageOptionsProvider storageOptionsProvider;
+  private final Object namespace;
+  private final List<String> tableId;
+  private final boolean enableV2ManifestPaths;
+
   private Transaction(
       Dataset dataset,
       long readVersion,
@@ -45,12 +56,46 @@ public class Transaction {
       Operation operation,
       Map<String, String> writeParams,
       Map<String, String> transactionProperties) {
+    this(
+        dataset,
+        readVersion,
+        uuid,
+        operation,
+        writeParams,
+        transactionProperties,
+        null,
+        null,
+        null,
+        null,
+        null,
+        true);
+  }
+
+  private Transaction(
+      Dataset dataset,
+      long readVersion,
+      String uuid,
+      Operation operation,
+      Map<String, String> writeParams,
+      Map<String, String> transactionProperties,
+      String uri,
+      BufferAllocator allocator,
+      StorageOptionsProvider storageOptionsProvider,
+      Object namespace,
+      List<String> tableId,
+      boolean enableV2ManifestPaths) {
     this.dataset = dataset;
     this.readVersion = readVersion;
     this.uuid = uuid;
     this.operation = operation;
     this.writeParams = writeParams != null ? writeParams : new HashMap<>();
     this.transactionProperties = Optional.ofNullable(transactionProperties);
+    this.uri = uri;
+    this.allocator = allocator;
+    this.storageOptionsProvider = storageOptionsProvider;
+    this.namespace = namespace;
+    this.tableId = tableId;
+    this.enableV2ManifestPaths = enableV2ManifestPaths;
   }
 
   public long readVersion() {
@@ -73,11 +118,59 @@ public class Transaction {
     return transactionProperties;
   }
 
+  public String uri() {
+    return uri;
+  }
+
+  public BufferAllocator allocator() {
+    return allocator;
+  }
+
+  public StorageOptionsProvider storageOptionsProvider() {
+    return storageOptionsProvider;
+  }
+
+  public Object namespace() {
+    return namespace;
+  }
+
+  public List<String> tableId() {
+    return tableId;
+  }
+
+  public boolean enableV2ManifestPaths() {
+    return enableV2ManifestPaths;
+  }
+
+  /**
+   * Commit the transaction and return a new Dataset.
+   *
+   * <p>When this transaction was built from an existing dataset, commits against that dataset. When
+   * built from a URI, creates a new dataset at the specified location.
+   *
+   * @return a new Dataset at the committed version
+   */
   public Dataset commit() {
-    if (dataset == null) {
-      throw new UnsupportedOperationException("Transaction doesn't support create new dataset yet");
+    if (dataset != null) {
+      return dataset.commitTransaction(this);
     }
-    return dataset.commitTransaction(this);
+    if (uri != null) {
+      return commitToUri();
+    }
+    throw new IllegalStateException("Transaction requires either a dataset or a URI");
+  }
+
+  private Dataset commitToUri() {
+    Dataset result =
+        nativeCommitTransactionToUri(
+            uri,
+            this,
+            enableV2ManifestPaths,
+            storageOptionsProvider,
+            namespace,
+            tableId,
+            allocator);
+    return result;
   }
 
   public void release() {
@@ -92,6 +185,7 @@ public class Transaction {
         .add("operation", operation)
         .add("writeParams", writeParams)
         .add("transactionProperties", transactionProperties)
+        .add("uri", uri)
         .toString();
   }
 
@@ -111,16 +205,50 @@ public class Transaction {
         && Objects.equals(transactionProperties, that.transactionProperties);
   }
 
+  private static native Dataset nativeCommitTransactionToUri(
+      String uri,
+      Transaction transaction,
+      boolean enableV2ManifestPaths,
+      Object storageOptionsProvider,
+      Object namespace,
+      Object tableId,
+      Object allocator);
+
   public static class Builder {
     private final String uuid;
-    private final Dataset dataset;
+    private Dataset dataset;
+    private String uri;
+    private BufferAllocator allocator;
     private long readVersion;
     private Operation operation;
     private Map<String, String> writeParams;
     private Map<String, String> transactionProperties;
+    private StorageOptionsProvider storageOptionsProvider;
+    private Object namespace;
+    private List<String> tableId;
+    private boolean enableV2ManifestPaths = true;
 
+    /**
+     * Create a builder for committing against an existing dataset.
+     *
+     * @param dataset the existing dataset to commit against
+     */
     public Builder(Dataset dataset) {
       this.dataset = dataset;
+      this.uuid = UUID.randomUUID().toString();
+    }
+
+    /**
+     * Create a builder for creating a new dataset at the given URI.
+     *
+     * @param uri the target URI for the new dataset
+     * @param allocator the Arrow buffer allocator for schema export
+     */
+    public Builder(String uri, BufferAllocator allocator) {
+      Preconditions.checkNotNull(uri, "URI must not be null");
+      Preconditions.checkNotNull(allocator, "Allocator must not be null");
+      this.uri = uri;
+      this.allocator = allocator;
       this.uuid = UUID.randomUUID().toString();
     }
 
@@ -145,6 +273,54 @@ public class Transaction {
       return this;
     }
 
+    /**
+     * Set the storage options provider for credential refresh during URI-based commits.
+     *
+     * @param provider the storage options provider
+     * @return this builder instance
+     */
+    public Builder storageOptionsProvider(StorageOptionsProvider provider) {
+      this.storageOptionsProvider = provider;
+      return this;
+    }
+
+    /**
+     * Set the namespace for managed versioning during URI-based commits.
+     *
+     * @param namespace the LanceNamespace instance
+     * @return this builder instance
+     */
+    public Builder namespace(Object namespace) {
+      this.namespace = namespace;
+      return this;
+    }
+
+    /**
+     * Set the table ID for namespace-based commit handling.
+     *
+     * @param tableId the table identifier (e.g., ["workspace", "table_name"])
+     * @return this builder instance
+     */
+    public Builder tableId(List<String> tableId) {
+      this.tableId = tableId;
+      return this;
+    }
+
+    /**
+     * Enable or disable v2 manifest paths for new datasets.
+     *
+     * <p>Defaults to true. V2 manifest paths allow constant-time lookups for the latest manifest on
+     * object storage. Warning: enabling this makes the dataset unreadable for Lance versions prior
+     * to 0.17.0.
+     *
+     * @param enable whether to enable v2 manifest paths
+     * @return this builder instance
+     */
+    public Builder enableV2ManifestPaths(boolean enable) {
+      this.enableV2ManifestPaths = enable;
+      return this;
+    }
+
     private void validateState() {
       if (operation != null) {
         throw new IllegalStateException(
@@ -156,7 +332,18 @@ public class Transaction {
       Preconditions.checkState(operation != null, "TransactionBuilder has no operations");
 
       return new Transaction(
-          dataset, readVersion, uuid, operation, writeParams, transactionProperties);
+          dataset,
+          readVersion,
+          uuid,
+          operation,
+          writeParams,
+          transactionProperties,
+          uri,
+          allocator,
+          storageOptionsProvider,
+          namespace,
+          tableId,
+          enableV2ManifestPaths);
     }
   }
 }

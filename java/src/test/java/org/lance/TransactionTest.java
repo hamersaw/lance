@@ -19,8 +19,10 @@ import org.lance.index.IndexType;
 import org.lance.index.scalar.ScalarIndexParams;
 import org.lance.operation.Append;
 import org.lance.operation.CreateIndex;
+import org.lance.operation.Overwrite;
 
 import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.types.pojo.Schema;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -106,6 +108,36 @@ public class TransactionTest {
         assertTrue(
             op.getRemovedIndices().isEmpty(), "removedIndices should be empty for CreateIndex");
         assertEquals("btree_id_index", (op.getNewIndices().get(0).name()));
+      }
+    }
+  }
+
+  @Test
+  public void testCommitToUri(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("testCommitToUri").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      Schema schema = testDataset.getSchema();
+
+      // Create fragments at the dataset path
+      FragmentMetadata fragmentMeta = testDataset.createNewFragment(20);
+
+      // Build a transaction targeting a URI (no existing dataset)
+      Transaction txn =
+          new Transaction.Builder(datasetPath, allocator)
+              .operation(
+                  Overwrite.builder()
+                      .fragments(Collections.singletonList(fragmentMeta))
+                      .schema(schema)
+                      .build())
+              .build();
+
+      try (Dataset committedDataset = txn.commit()) {
+        assertEquals(1, committedDataset.version());
+        assertEquals(20, committedDataset.countRows());
+      } finally {
+        txn.release();
       }
     }
   }
