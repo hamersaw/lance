@@ -14,6 +14,7 @@
 package org.lance;
 
 import org.lance.io.StorageOptionsProvider;
+import org.lance.namespace.LanceNamespace;
 
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.util.Preconditions;
@@ -65,7 +66,7 @@ public class CommitBuilder {
 
   private Map<String, String> writeParams;
   private StorageOptionsProvider storageOptionsProvider;
-  private Object namespace;
+  private LanceNamespace namespace;
   private List<String> tableId;
   private boolean enableV2ManifestPaths = true;
   private boolean detached = false;
@@ -128,7 +129,7 @@ public class CommitBuilder {
    * @param namespace the LanceNamespace instance
    * @return this builder instance
    */
-  public CommitBuilder namespace(Object namespace) {
+  public CommitBuilder namespace(LanceNamespace namespace) {
     this.namespace = namespace;
     return this;
   }

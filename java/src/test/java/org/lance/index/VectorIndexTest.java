@@ -13,10 +13,11 @@
  */
 package org.lance.index;
 
+import org.lance.CommitBuilder;
 import org.lance.Dataset;
 import org.lance.Fragment;
-import org.lance.SourcedTransaction;
 import org.lance.TestVectorDataset;
+import org.lance.Transaction;
 import org.lance.index.vector.IvfBuildParams;
 import org.lance.index.vector.PQBuildParams;
 import org.lance.index.vector.RQBuildParams;
@@ -130,12 +131,15 @@ public class VectorIndexTest {
         CreateIndex createIndexOp =
             CreateIndex.builder().withNewIndices(Collections.singletonList(index)).build();
 
-        SourcedTransaction createIndexTx =
-            dataset.newTransactionBuilder().operation(createIndexOp).build();
-
-        try (Dataset newDataset = createIndexTx.commit()) {
-          assertEquals(datasetVersion + 1, newDataset.version());
-          assertTrue(newDataset.listIndexes().contains(TestVectorDataset.indexName));
+        try (Transaction createIndexTx =
+            new Transaction.Builder()
+                .readVersion(dataset.version())
+                .operation(createIndexOp)
+                .build()) {
+          try (Dataset newDataset = new CommitBuilder(dataset).execute(createIndexTx)) {
+            assertEquals(datasetVersion + 1, newDataset.version());
+            assertTrue(newDataset.listIndexes().contains(TestVectorDataset.indexName));
+          }
         }
       }
     }
@@ -248,12 +252,15 @@ public class VectorIndexTest {
         CreateIndex createIndexOp =
             CreateIndex.builder().withNewIndices(Collections.singletonList(index)).build();
 
-        SourcedTransaction createIndexTx =
-            dataset.newTransactionBuilder().operation(createIndexOp).build();
-
-        try (Dataset newDataset = createIndexTx.commit()) {
-          assertEquals(datasetVersion + 1, newDataset.version());
-          assertTrue(newDataset.listIndexes().contains(TestVectorDataset.indexName));
+        try (Transaction createIndexTx =
+            new Transaction.Builder()
+                .readVersion(dataset.version())
+                .operation(createIndexOp)
+                .build()) {
+          try (Dataset newDataset = new CommitBuilder(dataset).execute(createIndexTx)) {
+            assertEquals(datasetVersion + 1, newDataset.version());
+            assertTrue(newDataset.listIndexes().contains(TestVectorDataset.indexName));
+          }
         }
       }
     }
@@ -350,12 +357,15 @@ public class VectorIndexTest {
         CreateIndex createIndexOp =
             CreateIndex.builder().withNewIndices(Collections.singletonList(index)).build();
 
-        SourcedTransaction createIndexTx =
-            dataset.newTransactionBuilder().operation(createIndexOp).build();
-
-        try (Dataset newDataset = createIndexTx.commit()) {
-          assertEquals(datasetVersion + 1, newDataset.version());
-          assertTrue(newDataset.listIndexes().contains(TestVectorDataset.indexName));
+        try (Transaction createIndexTx =
+            new Transaction.Builder()
+                .readVersion(dataset.version())
+                .operation(createIndexOp)
+                .build()) {
+          try (Dataset newDataset = new CommitBuilder(dataset).execute(createIndexTx)) {
+            assertEquals(datasetVersion + 1, newDataset.version());
+            assertTrue(newDataset.listIndexes().contains(TestVectorDataset.indexName));
+          }
         }
       }
     }

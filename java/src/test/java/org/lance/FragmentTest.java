@@ -210,7 +210,11 @@ public class FragmentTest {
 
         Update update =
             Update.builder().updatedFragments(Collections.singletonList(updateFragment)).build();
-        Dataset dataset3 = dataset2.newTransactionBuilder().operation(update).build().commit();
+        Dataset dataset3;
+        try (Transaction txn =
+            new Transaction.Builder().readVersion(dataset2.version()).operation(update).build()) {
+          dataset3 = new CommitBuilder(dataset2).execute(txn);
+        }
 
         assertEquals(totalRows - deleteCount, dataset3.countRows());
 
@@ -226,7 +230,11 @@ public class FragmentTest {
 
         update =
             Update.builder().updatedFragments(Collections.singletonList(updateFragment)).build();
-        Dataset dataset4 = dataset3.newTransactionBuilder().operation(update).build().commit();
+        Dataset dataset4;
+        try (Transaction txn =
+            new Transaction.Builder().readVersion(dataset3.version()).operation(update).build()) {
+          dataset4 = new CommitBuilder(dataset3).execute(txn);
+        }
         assertEquals(totalRows - deleteCount - deleteCount2, dataset4.countRows());
 
         // Case 3. Test delete all rows
@@ -242,7 +250,11 @@ public class FragmentTest {
             Update.builder()
                 .removedFragmentIds(Collections.singletonList(Long.valueOf(fragment.getId())))
                 .build();
-        Dataset dataset5 = dataset4.newTransactionBuilder().operation(update).build().commit();
+        Dataset dataset5;
+        try (Transaction txn =
+            new Transaction.Builder().readVersion(dataset4.version()).operation(update).build()) {
+          dataset5 = new CommitBuilder(dataset4).execute(txn);
+        }
 
         assertEquals(0, dataset5.countRows());
       }
@@ -292,16 +304,16 @@ public class FragmentTest {
 
         FragmentMergeResult mergeResult = testDataset.mergeColumn(fragment, 10);
 
-        try (SourcedTransaction transaction =
-            new SourcedTransaction.Builder(dataset)
+        try (Transaction transaction =
+            new Transaction.Builder()
+                .readVersion(dataset.version())
                 .operation(
                     Merge.builder()
                         .fragments(Collections.singletonList(mergeResult.getFragmentMetadata()))
                         .schema(mergeResult.getSchema().asArrowSchema())
                         .build())
-                .readVersion(dataset.version())
                 .build()) {
-          try (Dataset newDs = transaction.commit()) {
+          try (Dataset newDs = new CommitBuilder(dataset).execute(transaction)) {
             assertEquals(3, newDs.version());
             assertEquals(3, newDs.latestVersion());
             Fragment newFrag = newDs.getFragments().get(0);
