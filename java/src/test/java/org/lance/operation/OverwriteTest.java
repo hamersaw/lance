@@ -13,11 +13,12 @@
  */
 package org.lance.operation;
 
+import org.lance.CommitBuilder;
 import org.lance.Dataset;
 import org.lance.Fragment;
 import org.lance.FragmentMetadata;
-import org.lance.SourcedTransaction;
 import org.lance.TestUtils;
+import org.lance.Transaction;
 import org.lance.ipc.LanceScanner;
 
 import org.apache.arrow.memory.RootAllocator;
@@ -43,16 +44,16 @@ public class OverwriteTest extends OperationTestBase {
       // Commit fragment
       int rowCount = 20;
       FragmentMetadata fragmentMeta = testDataset.createNewFragment(rowCount);
-      SourcedTransaction transaction =
-          dataset
-              .newTransactionBuilder()
+      Transaction txn =
+          new Transaction.Builder()
+              .readVersion(dataset.version())
               .operation(
                   Overwrite.builder()
                       .fragments(Collections.singletonList(fragmentMeta))
                       .schema(testDataset.getSchema())
                       .build())
               .build();
-      try (Dataset dataset = transaction.commit()) {
+      try (Dataset dataset = new CommitBuilder(this.dataset).execute(txn)) {
         assertEquals(2, dataset.version());
         assertEquals(2, dataset.latestVersion());
         assertEquals(rowCount, dataset.countRows());
@@ -62,14 +63,16 @@ public class OverwriteTest extends OperationTestBase {
           Schema schemaRes = scanner.schema();
           assertEquals(testDataset.getSchema(), schemaRes);
         }
+      } finally {
+        txn.release();
       }
 
       // Commit fragment again
       rowCount = 40;
       fragmentMeta = testDataset.createNewFragment(rowCount);
-      transaction =
-          dataset
-              .newTransactionBuilder()
+      Transaction txn2 =
+          new Transaction.Builder()
+              .readVersion(dataset.version())
               .operation(
                   Overwrite.builder()
                       .fragments(Collections.singletonList(fragmentMeta))
@@ -78,9 +81,8 @@ public class OverwriteTest extends OperationTestBase {
                       .build())
               .transactionProperties(Collections.singletonMap("key", "value"))
               .build();
-      assertEquals(
-          "value", transaction.transactionProperties().map(m -> m.get("key")).orElse(null));
-      try (Dataset dataset = transaction.commit()) {
+      assertEquals("value", txn2.transactionProperties().map(m -> m.get("key")).orElse(null));
+      try (Dataset dataset = new CommitBuilder(this.dataset).execute(txn2)) {
         assertEquals(3, dataset.version());
         assertEquals(3, dataset.latestVersion());
         assertEquals(rowCount, dataset.countRows());
@@ -91,7 +93,9 @@ public class OverwriteTest extends OperationTestBase {
           Schema schemaRes = scanner.schema();
           assertEquals(testDataset.getSchema(), schemaRes);
         }
-        assertEquals(transaction.transaction(), dataset.readTransaction().orElse(null));
+        assertEquals(txn2, dataset.readTransaction().orElse(null));
+      } finally {
+        txn2.release();
       }
     }
   }

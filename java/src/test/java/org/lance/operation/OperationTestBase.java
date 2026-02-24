@@ -13,10 +13,11 @@
  */
 package org.lance.operation;
 
+import org.lance.CommitBuilder;
 import org.lance.Dataset;
 import org.lance.FragmentMetadata;
-import org.lance.SourcedTransaction;
 import org.lance.TestUtils;
+import org.lance.Transaction;
 import org.lance.file.LanceFileWriter;
 import org.lance.fragment.DataFile;
 
@@ -53,12 +54,16 @@ public class OperationTestBase {
     dataset = suite.createEmptyDataset();
     FragmentMetadata fragmentMeta = suite.createNewFragment(rowCount);
 
-    SourcedTransaction appendTxn =
-        dataset
-            .newTransactionBuilder()
+    Transaction txn =
+        new Transaction.Builder()
+            .readVersion(dataset.version())
             .operation(Append.builder().fragments(Collections.singletonList(fragmentMeta)).build())
             .build();
-    return appendTxn.commit();
+    try {
+      return new CommitBuilder(dataset).execute(txn);
+    } finally {
+      txn.release();
+    }
   }
 
   /**

@@ -13,10 +13,10 @@
  */
 package org.lance.operation;
 
+import org.lance.CommitBuilder;
 import org.lance.Dataset;
 import org.lance.Fragment;
 import org.lance.FragmentMetadata;
-import org.lance.SourcedTransaction;
 import org.lance.TestUtils;
 import org.lance.Transaction;
 import org.lance.fragment.FragmentUpdateResult;
@@ -55,35 +55,42 @@ public class UpdateTest extends OperationTestBase {
       // Commit fragment
       int rowCount = 20;
       FragmentMetadata fragmentMeta = testDataset.createNewFragment(rowCount);
-      SourcedTransaction transaction =
-          dataset
-              .newTransactionBuilder()
+      Transaction appendTxn =
+          new Transaction.Builder()
+              .readVersion(dataset.version())
               .operation(
                   Append.builder().fragments(Collections.singletonList(fragmentMeta)).build())
               .build();
 
-      try (Dataset dataset = transaction.commit()) {
+      try (Dataset dataset = new CommitBuilder(this.dataset).execute(appendTxn)) {
         assertEquals(2, dataset.version());
         assertEquals(2, dataset.latestVersion());
         assertEquals(rowCount, dataset.countRows());
         assertThrows(
             IllegalArgumentException.class,
-            () ->
-                dataset
-                    .newTransactionBuilder()
-                    .operation(Append.builder().fragments(new ArrayList<>()).build())
-                    .build()
-                    .commit()
-                    .close());
+            () -> {
+              Transaction txn =
+                  new Transaction.Builder()
+                      .readVersion(dataset.version())
+                      .operation(Append.builder().fragments(new ArrayList<>()).build())
+                      .build();
+              try {
+                new CommitBuilder(dataset).execute(txn).close();
+              } finally {
+                txn.release();
+              }
+            });
+      } finally {
+        appendTxn.release();
       }
 
       dataset = Dataset.open(datasetPath, allocator);
       // Update fragments
       rowCount = 40;
       FragmentMetadata newFragment = testDataset.createNewFragment(rowCount);
-      transaction =
-          dataset
-              .newTransactionBuilder()
+      Transaction updateTxn =
+          new Transaction.Builder()
+              .readVersion(dataset.version())
               .operation(
                   Update.builder()
                       .removedFragmentIds(
@@ -94,13 +101,15 @@ public class UpdateTest extends OperationTestBase {
                       .build())
               .build();
 
-      try (Dataset dataset = transaction.commit()) {
+      try (Dataset dataset = new CommitBuilder(this.dataset).execute(updateTxn)) {
         assertEquals(3, dataset.version());
         assertEquals(3, dataset.latestVersion());
         assertEquals(rowCount, dataset.countRows());
 
         Transaction txn = dataset.readTransaction().orElse(null);
-        assertEquals(transaction.transaction(), txn);
+        assertEquals(updateTxn, txn);
+      } finally {
+        updateTxn.release();
       }
     }
   }
@@ -123,16 +132,18 @@ public class UpdateTest extends OperationTestBase {
        */
       int rowCount = 6;
       FragmentMetadata fragmentMeta = testDataset.createNewFragment(rowCount);
-      SourcedTransaction appendTransaction =
-          dataset
-              .newTransactionBuilder()
+      Transaction appendTxn =
+          new Transaction.Builder()
+              .readVersion(dataset.version())
               .operation(
                   Append.builder().fragments(Collections.singletonList(fragmentMeta)).build())
               .build();
-      try (Dataset dataset = appendTransaction.commit()) {
+      try (Dataset dataset = new CommitBuilder(this.dataset).execute(appendTxn)) {
         assertEquals(2, dataset.version());
         assertEquals(2, dataset.latestVersion());
         assertEquals(rowCount, dataset.countRows());
+      } finally {
+        appendTxn.release();
       }
 
       dataset = Dataset.open(datasetPath, allocator);
@@ -146,9 +157,9 @@ public class UpdateTest extends OperationTestBase {
        *   3:   |  null  |     null     |
        */
       FragmentUpdateResult updateResult = testDataset.updateColumn(targetFragment, updateRowCount);
-      SourcedTransaction updateTransaction =
-          dataset
-              .newTransactionBuilder()
+      Transaction updateTxn =
+          new Transaction.Builder()
+              .readVersion(dataset.version())
               .operation(
                   Update.builder()
                       .updatedFragments(
@@ -156,7 +167,7 @@ public class UpdateTest extends OperationTestBase {
                       .fieldsModified(updateResult.getFieldsModified())
                       .build())
               .build();
-      try (Dataset dataset = updateTransaction.commit()) {
+      try (Dataset dataset = new CommitBuilder(this.dataset).execute(updateTxn)) {
         assertEquals(3, dataset.version());
         assertEquals(3, dataset.latestVersion());
         Fragment fragment = dataset.getFragments().get(0);
@@ -200,6 +211,8 @@ public class UpdateTest extends OperationTestBase {
           assertEquals(expectNames, actualNames);
           assertEquals(expectTimeStamps, actualTimeStamps);
         }
+      } finally {
+        updateTxn.release();
       }
     }
   }

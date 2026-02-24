@@ -13,10 +13,11 @@
  */
 package org.lance.operation;
 
+import org.lance.CommitBuilder;
 import org.lance.Dataset;
 import org.lance.FragmentMetadata;
-import org.lance.SourcedTransaction;
 import org.lance.TestUtils;
+import org.lance.Transaction;
 
 import org.apache.arrow.memory.RootAllocator;
 import org.junit.jupiter.api.Test;
@@ -43,32 +44,35 @@ public class RestoreTest extends OperationTestBase {
       // Append data to create a new version
       int rowCount = 20;
       FragmentMetadata fragmentMeta = testDataset.createNewFragment(rowCount);
-      SourcedTransaction transaction =
-          dataset
-              .newTransactionBuilder()
+      Transaction appendTxn =
+          new Transaction.Builder()
+              .readVersion(dataset.version())
               .operation(
                   Append.builder().fragments(Collections.singletonList(fragmentMeta)).build())
               .build();
-      try (Dataset modifiedDataset = transaction.commit()) {
+      try (Dataset modifiedDataset = new CommitBuilder(dataset).execute(appendTxn)) {
         // Verify the dataset was modified
         long newVersion = modifiedDataset.version();
         assertEquals(initialVersion + 1, newVersion);
         assertEquals(rowCount, modifiedDataset.countRows());
 
         // Restore to the initial version
-        SourcedTransaction restoreTransaction =
-            modifiedDataset
-                .newTransactionBuilder()
+        Transaction restoreTxn =
+            new Transaction.Builder()
+                .readVersion(modifiedDataset.version())
                 .operation(new Restore.Builder().version(initialVersion).build())
                 .build();
-        try (Dataset restoredDataset = restoreTransaction.commit()) {
+        try (Dataset restoredDataset = new CommitBuilder(modifiedDataset).execute(restoreTxn)) {
           // Verify the dataset was restored to the initial version, but the version increases
           assertEquals(initialVersion + 2, restoredDataset.version());
           // Initial dataset had 0 rows
           assertEquals(0, restoredDataset.countRows());
-          assertEquals(
-              restoreTransaction.transaction(), restoredDataset.readTransaction().orElse(null));
+          assertEquals(restoreTxn, restoredDataset.readTransaction().orElse(null));
+        } finally {
+          restoreTxn.release();
         }
+      } finally {
+        appendTxn.release();
       }
     }
   }

@@ -13,11 +13,12 @@
  */
 package org.lance.operation;
 
+import org.lance.CommitBuilder;
 import org.lance.Dataset;
 import org.lance.Fragment;
 import org.lance.FragmentMetadata;
-import org.lance.SourcedTransaction;
 import org.lance.TestUtils;
+import org.lance.Transaction;
 import org.lance.WriteParams;
 import org.lance.fragment.DataFile;
 import org.lance.ipc.LanceScanner;
@@ -71,13 +72,13 @@ public class DataReplacementTest extends OperationTestBase {
         List<FragmentMetadata> fragmentMetas =
             Fragment.create(datasetPath, allocator, idRoot, new WriteParams.Builder().build());
 
-        SourcedTransaction appendTxn =
-            dataset
-                .newTransactionBuilder()
+        Transaction appendTxn =
+            new Transaction.Builder()
+                .readVersion(dataset.version())
                 .operation(Append.builder().fragments(fragmentMetas).build())
                 .build();
 
-        try (Dataset initDataset = appendTxn.commit()) {
+        try (Dataset initDataset = new CommitBuilder(dataset).execute(appendTxn)) {
           assertEquals(2, initDataset.version());
           assertEquals(rowCount, initDataset.countRows());
 
@@ -124,13 +125,13 @@ public class DataReplacementTest extends OperationTestBase {
                 Collections.singletonList(
                     new DataReplacement.DataReplacementGroup(
                         fragmentMetas.get(0).getId(), datafile));
-            SourcedTransaction replaceTxn =
-                initDataset
-                    .newTransactionBuilder()
+            Transaction replaceTxn =
+                new Transaction.Builder()
+                    .readVersion(initDataset.version())
                     .operation(DataReplacement.builder().replacements(replacementGroups).build())
                     .build();
 
-            try (Dataset datasetWithAddress = replaceTxn.commit()) {
+            try (Dataset datasetWithAddress = new CommitBuilder(initDataset).execute(replaceTxn)) {
               assertEquals(4, datasetWithAddress.version());
               assertEquals(rowCount, datasetWithAddress.countRows());
 
@@ -151,8 +152,12 @@ public class DataReplacementTest extends OperationTestBase {
                   }
                 }
               }
+            } finally {
+              replaceTxn.release();
             }
           }
+        } finally {
+          appendTxn.release();
         }
       }
     }

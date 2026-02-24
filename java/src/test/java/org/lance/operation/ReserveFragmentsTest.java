@@ -13,11 +13,12 @@
  */
 package org.lance.operation;
 
+import org.lance.CommitBuilder;
 import org.lance.Dataset;
 import org.lance.Fragment;
 import org.lance.FragmentMetadata;
-import org.lance.SourcedTransaction;
 import org.lance.TestUtils;
+import org.lance.Transaction;
 
 import org.apache.arrow.memory.RootAllocator;
 import org.junit.jupiter.api.Assertions;
@@ -42,35 +43,37 @@ public class ReserveFragmentsTest extends OperationTestBase {
 
       // Create an initial fragment to establish a baseline fragment ID
       FragmentMetadata initialFragmentMeta = testDataset.createNewFragment(10);
-      SourcedTransaction appendTransaction =
-          dataset
-              .newTransactionBuilder()
+      Transaction appendTxn =
+          new Transaction.Builder()
+              .readVersion(dataset.version())
               .operation(
                   Append.builder()
                       .fragments(Collections.singletonList(initialFragmentMeta))
                       .build())
               .build();
-      try (Dataset datasetWithFragment = appendTransaction.commit()) {
+      try (Dataset datasetWithFragment = new CommitBuilder(dataset).execute(appendTxn)) {
         // Reserve fragment IDs
         int numFragmentsToReserve = 5;
-        SourcedTransaction reserveTransaction =
-            datasetWithFragment
-                .newTransactionBuilder()
+        Transaction reserveTxn =
+            new Transaction.Builder()
+                .readVersion(datasetWithFragment.version())
                 .operation(
                     new ReserveFragments.Builder().numFragments(numFragmentsToReserve).build())
                 .build();
-        try (Dataset datasetWithReservedFragments = reserveTransaction.commit()) {
+        try (Dataset datasetWithReservedFragments =
+            new CommitBuilder(datasetWithFragment).execute(reserveTxn)) {
           // Create a new fragment and verify its ID reflects the reservation
           FragmentMetadata newFragmentMeta = testDataset.createNewFragment(10);
-          SourcedTransaction appendTransaction2 =
-              datasetWithReservedFragments
-                  .newTransactionBuilder()
+          Transaction appendTxn2 =
+              new Transaction.Builder()
+                  .readVersion(datasetWithReservedFragments.version())
                   .operation(
                       Append.builder()
                           .fragments(Collections.singletonList(newFragmentMeta))
                           .build())
                   .build();
-          try (Dataset finalDataset = appendTransaction2.commit()) {
+          try (Dataset finalDataset =
+              new CommitBuilder(datasetWithReservedFragments).execute(appendTxn2)) {
             // Verify the fragment IDs were properly reserved
             // The new fragment should have an ID that's at least numFragmentsToReserve higher
             // than it would have been without the reservation
@@ -88,11 +91,15 @@ public class ReserveFragmentsTest extends OperationTestBase {
                 firstFragment.metadata().getId() + 1, secondFragment.getId());
 
             // Verify the transaction is recorded
-            assertEquals(
-                reserveTransaction.transaction(),
-                datasetWithReservedFragments.readTransaction().orElse(null));
+            assertEquals(reserveTxn, datasetWithReservedFragments.readTransaction().orElse(null));
+          } finally {
+            appendTxn2.release();
           }
+        } finally {
+          reserveTxn.release();
         }
+      } finally {
+        appendTxn.release();
       }
     }
   }

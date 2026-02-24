@@ -13,9 +13,9 @@
  */
 package org.lance.operation;
 
+import org.lance.CommitBuilder;
 import org.lance.Dataset;
 import org.lance.FragmentMetadata;
-import org.lance.SourcedTransaction;
 import org.lance.TestUtils;
 import org.lance.Transaction;
 
@@ -43,15 +43,17 @@ public class DeleteTest extends OperationTestBase {
       int rowCount = 20;
       FragmentMetadata fragmentMeta0 = testDataset.createNewFragment(rowCount);
       FragmentMetadata fragmentMeta1 = testDataset.createNewFragment(rowCount);
-      SourcedTransaction transaction =
-          dataset
-              .newTransactionBuilder()
+      Transaction appendTxn =
+          new Transaction.Builder()
+              .readVersion(dataset.version())
               .operation(
                   Append.builder().fragments(Arrays.asList(fragmentMeta0, fragmentMeta1)).build())
               .build();
-      try (Dataset dataset = transaction.commit()) {
+      try (Dataset dataset = new CommitBuilder(this.dataset).execute(appendTxn)) {
         assertEquals(2, dataset.version());
         assertEquals(2, dataset.latestVersion());
+      } finally {
+        appendTxn.release();
       }
 
       dataset = Dataset.open(datasetPath, allocator);
@@ -61,17 +63,19 @@ public class DeleteTest extends OperationTestBase {
               .map(t -> Long.valueOf(t.getId()))
               .collect(Collectors.toList());
 
-      SourcedTransaction delete =
-          dataset
-              .newTransactionBuilder()
+      Transaction deleteTxn =
+          new Transaction.Builder()
+              .readVersion(dataset.version())
               .operation(
                   Delete.builder().deletedFragmentIds(deletedFragmentIds).predicate("1=1").build())
               .build();
-      try (Dataset dataset = delete.commit()) {
+      try (Dataset dataset = new CommitBuilder(this.dataset).execute(deleteTxn)) {
         Transaction txn = dataset.readTransaction().get();
         Delete execDelete = (Delete) txn.operation();
-        assertEquals(delete.operation(), execDelete);
+        assertEquals(deleteTxn.operation(), execDelete);
         assertEquals(0, dataset.countRows());
+      } finally {
+        deleteTxn.release();
       }
     }
   }

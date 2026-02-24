@@ -13,9 +13,10 @@
  */
 package org.lance.operation;
 
+import org.lance.CommitBuilder;
 import org.lance.Dataset;
-import org.lance.SourcedTransaction;
 import org.lance.TestUtils;
+import org.lance.Transaction;
 
 import org.apache.arrow.memory.RootAllocator;
 import org.junit.jupiter.api.Test;
@@ -45,12 +46,12 @@ public class UpdateConfigTest extends OperationTestBase {
 
       UpdateMap configUpdates = UpdateMap.builder().updates(configValues).replace(false).build();
 
-      SourcedTransaction transaction =
-          dataset
-              .newTransactionBuilder()
+      Transaction txn =
+          new Transaction.Builder()
+              .readVersion(dataset.version())
               .operation(UpdateConfig.builder().configUpdates(configUpdates).build())
               .build();
-      try (Dataset updatedDataset = transaction.commit()) {
+      try (Dataset updatedDataset = new CommitBuilder(dataset).execute(txn)) {
         assertEquals(2, updatedDataset.version());
         assertEquals("value1", updatedDataset.getConfig().get("key1"));
         assertEquals("value2", updatedDataset.getConfig().get("key2"));
@@ -62,12 +63,12 @@ public class UpdateConfigTest extends OperationTestBase {
         UpdateMap configDeleteUpdates =
             UpdateMap.builder().updates(deleteUpdates).replace(false).build();
 
-        transaction =
-            updatedDataset
-                .newTransactionBuilder()
+        Transaction txn2 =
+            new Transaction.Builder()
+                .readVersion(updatedDataset.version())
                 .operation(UpdateConfig.builder().configUpdates(configDeleteUpdates).build())
                 .build();
-        try (Dataset updatedDataset2 = transaction.commit()) {
+        try (Dataset updatedDataset2 = new CommitBuilder(updatedDataset).execute(txn2)) {
           assertEquals(3, updatedDataset2.version());
           assertNull(updatedDataset2.getConfig().get("key1"));
           assertEquals("value2", updatedDataset2.getConfig().get("key2"));
@@ -80,13 +81,13 @@ public class UpdateConfigTest extends OperationTestBase {
           UpdateMap schemaMetadataUpdates =
               UpdateMap.builder().updates(schemaMetadataMap).replace(false).build();
 
-          transaction =
-              updatedDataset2
-                  .newTransactionBuilder()
+          Transaction txn3 =
+              new Transaction.Builder()
+                  .readVersion(updatedDataset2.version())
                   .operation(
                       UpdateConfig.builder().schemaMetadataUpdates(schemaMetadataUpdates).build())
                   .build();
-          try (Dataset updatedDataset3 = transaction.commit()) {
+          try (Dataset updatedDataset3 = new CommitBuilder(updatedDataset2).execute(txn3)) {
             assertEquals(4, updatedDataset3.version());
             assertEquals(
                 "schema_value1", updatedDataset3.getLanceSchema().metadata().get("schema_key1"));
@@ -110,13 +111,13 @@ public class UpdateConfigTest extends OperationTestBase {
             fieldMetadataUpdates.put(0, field0UpdateMap);
             fieldMetadataUpdates.put(1, field1UpdateMap);
 
-            transaction =
-                updatedDataset3
-                    .newTransactionBuilder()
+            Transaction txn4 =
+                new Transaction.Builder()
+                    .readVersion(updatedDataset3.version())
                     .operation(
                         UpdateConfig.builder().fieldMetadataUpdates(fieldMetadataUpdates).build())
                     .build();
-            try (Dataset updatedDataset4 = transaction.commit()) {
+            try (Dataset updatedDataset4 = new CommitBuilder(updatedDataset3).execute(txn4)) {
               assertEquals(5, updatedDataset4.version());
 
               // Verify field metadata for field 0
@@ -129,9 +130,17 @@ public class UpdateConfigTest extends OperationTestBase {
                   updatedDataset4.getLanceSchema().fields().get(1).getMetadata();
               assertEquals("field1_value1", field1Result.get("field1_key1"));
               assertEquals("field1_value2", field1Result.get("field1_key2"));
+            } finally {
+              txn4.release();
             }
+          } finally {
+            txn3.release();
           }
+        } finally {
+          txn2.release();
         }
+      } finally {
+        txn.release();
       }
     }
   }

@@ -13,10 +13,11 @@
  */
 package org.lance.operation;
 
+import org.lance.CommitBuilder;
 import org.lance.Dataset;
 import org.lance.FragmentMetadata;
-import org.lance.SourcedTransaction;
 import org.lance.TestUtils;
+import org.lance.Transaction;
 
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.types.pojo.Schema;
@@ -40,15 +41,15 @@ public class TruncateTest extends OperationTestBase {
       // Append some data
       int rowCount = 20;
       FragmentMetadata fragmentMeta = testDataset.createNewFragment(rowCount);
-      SourcedTransaction transaction =
-          dataset
-              .newTransactionBuilder()
+      Transaction txn =
+          new Transaction.Builder()
+              .readVersion(dataset.version())
               .operation(
                   Append.builder()
                       .fragments(java.util.Collections.singletonList(fragmentMeta))
                       .build())
               .build();
-      try (Dataset ds1 = transaction.commit()) {
+      try (Dataset ds1 = new CommitBuilder(dataset).execute(txn)) {
         assertEquals(rowCount, ds1.countRows());
 
         // Truncate to empty while preserving schema
@@ -59,6 +60,8 @@ public class TruncateTest extends OperationTestBase {
           Schema schemaRes = scanner.schema();
           assertEquals(testDataset.getSchema(), schemaRes);
         }
+      } finally {
+        txn.release();
       }
     }
   }

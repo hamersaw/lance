@@ -243,31 +243,37 @@ public class CommitBuilder {
   public Dataset execute(Transaction transaction) {
     Preconditions.checkNotNull(transaction, "Transaction must not be null");
     if (dataset != null) {
-      return nativeCommitToDataset(
-          dataset,
-          transaction,
-          detached,
-          enableV2ManifestPaths,
-          writeParams,
-          useStableRowIds,
-          storageFormat,
-          maxRetries,
-          skipAutoCleanup);
+      Dataset result =
+          nativeCommitToDataset(
+              dataset,
+              transaction,
+              detached,
+              enableV2ManifestPaths,
+              writeParams,
+              useStableRowIds,
+              storageFormat,
+              maxRetries,
+              skipAutoCleanup);
+      result.setAllocator(dataset.allocator());
+      return result;
     }
     if (uri != null) {
-      return nativeCommitToUri(
-          uri,
-          transaction,
-          enableV2ManifestPaths,
-          storageOptionsProvider,
-          namespace,
-          tableId,
-          allocator,
-          writeParams,
-          useStableRowIds,
-          storageFormat,
-          maxRetries,
-          skipAutoCleanup);
+      Dataset result =
+          nativeCommitToUri(
+              uri,
+              transaction,
+              enableV2ManifestPaths,
+              storageOptionsProvider,
+              namespace,
+              tableId,
+              allocator,
+              writeParams,
+              useStableRowIds,
+              storageFormat,
+              maxRetries,
+              skipAutoCleanup);
+      result.setAllocator(allocator);
+      return result;
     }
     throw new IllegalStateException("CommitBuilder requires either a dataset or a URI");
   }

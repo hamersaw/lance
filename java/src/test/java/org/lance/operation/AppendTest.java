@@ -13,10 +13,11 @@
  */
 package org.lance.operation;
 
+import org.lance.CommitBuilder;
 import org.lance.Dataset;
 import org.lance.FragmentMetadata;
-import org.lance.SourcedTransaction;
 import org.lance.TestUtils;
+import org.lance.Transaction;
 
 import org.apache.arrow.memory.RootAllocator;
 import org.junit.jupiter.api.Test;
@@ -62,17 +63,19 @@ public class AppendTest extends OperationTestBase {
               testDataset.createNewFragment(rowCount),
               testDataset.createNewFragment(rowCount));
 
-      SourcedTransaction transaction =
-          dataset
-              .newTransactionBuilder()
+      Transaction txn =
+          new Transaction.Builder()
+              .readVersion(dataset.version())
               .operation(Append.builder().fragments(fragments).build())
               .build();
 
-      try (Dataset dataset = transaction.commit()) {
+      try (Dataset dataset = new CommitBuilder(this.dataset).execute(txn)) {
         assertEquals(2, dataset.version());
         assertEquals(rowCount * 3, dataset.countRows());
         assertEquals(3, dataset.getFragments().size());
-        assertEquals(transaction.transaction(), dataset.readTransaction().orElse(null));
+        assertEquals(txn, dataset.readTransaction().orElse(null));
+      } finally {
+        txn.release();
       }
     }
   }
@@ -88,12 +91,16 @@ public class AppendTest extends OperationTestBase {
         assertThrows(
             IllegalArgumentException.class,
             () -> {
-              SourcedTransaction transaction =
-                  dataset
-                      .newTransactionBuilder()
+              Transaction txn =
+                  new Transaction.Builder()
+                      .readVersion(dataset.version())
                       .operation(Append.builder().fragments(new ArrayList<>()).build())
                       .build();
-              transaction.commit().close();
+              try {
+                new CommitBuilder(dataset).execute(txn).close();
+              } finally {
+                txn.release();
+              }
             });
       }
     }

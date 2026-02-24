@@ -511,6 +511,11 @@ public class Dataset implements Closeable {
     return allocator;
   }
 
+  /** Package-private setter for allocator, used by {@link CommitBuilder}. */
+  void setAllocator(BufferAllocator allocator) {
+    this.allocator = allocator;
+  }
+
   /**
    * Create a new transaction builder at current version for the dataset. The dataset itself will
    * not refresh after the transaction committed.

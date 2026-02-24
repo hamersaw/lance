@@ -13,10 +13,11 @@
  */
 package org.lance.operation;
 
+import org.lance.CommitBuilder;
 import org.lance.Dataset;
 import org.lance.FragmentMetadata;
-import org.lance.SourcedTransaction;
 import org.lance.TestUtils;
+import org.lance.Transaction;
 
 import org.apache.arrow.memory.RootAllocator;
 import org.junit.jupiter.api.Test;
@@ -44,14 +45,14 @@ public class RewriteTest extends OperationTestBase {
       FragmentMetadata fragmentMeta1 = testDataset.createNewFragment(rowCount);
       FragmentMetadata fragmentMeta2 = testDataset.createNewFragment(rowCount);
 
-      SourcedTransaction appendTx =
-          dataset
-              .newTransactionBuilder()
+      Transaction appendTxn =
+          new Transaction.Builder()
+              .readVersion(dataset.version())
               .operation(
                   Append.builder().fragments(Arrays.asList(fragmentMeta1, fragmentMeta2)).build())
               .build();
 
-      try (Dataset datasetWithData = appendTx.commit()) {
+      try (Dataset datasetWithData = new CommitBuilder(dataset).execute(appendTxn)) {
         assertEquals(2, datasetWithData.version());
         assertEquals(rowCount * 2, datasetWithData.countRows());
 
@@ -72,20 +73,24 @@ public class RewriteTest extends OperationTestBase {
         groups.add(group);
 
         // Create and commit the rewrite transaction
-        SourcedTransaction rewriteTx =
-            datasetWithData
-                .newTransactionBuilder()
+        Transaction rewriteTxn =
+            new Transaction.Builder()
+                .readVersion(datasetWithData.version())
                 .operation(Rewrite.builder().groups(groups).build())
                 .build();
 
-        try (Dataset rewrittenDataset = rewriteTx.commit()) {
+        try (Dataset rewrittenDataset = new CommitBuilder(datasetWithData).execute(rewriteTxn)) {
           assertEquals(3, rewrittenDataset.version());
           // The row count should remain the same since we're just rewriting
           assertEquals(rowCount * 2, rewrittenDataset.countRows());
 
           // Verify that the transaction was recorded
-          assertEquals(rewriteTx.transaction(), rewrittenDataset.readTransaction().orElse(null));
+          assertEquals(rewriteTxn, rewrittenDataset.readTransaction().orElse(null));
+        } finally {
+          rewriteTxn.release();
         }
+      } finally {
+        appendTxn.release();
       }
     }
   }

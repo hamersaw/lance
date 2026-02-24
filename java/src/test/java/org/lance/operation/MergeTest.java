@@ -13,10 +13,11 @@
  */
 package org.lance.operation;
 
+import org.lance.CommitBuilder;
 import org.lance.Dataset;
 import org.lance.FragmentMetadata;
-import org.lance.SourcedTransaction;
 import org.lance.TestUtils;
+import org.lance.Transaction;
 import org.lance.fragment.DataFile;
 import org.lance.ipc.LanceScanner;
 
@@ -90,9 +91,9 @@ public class MergeTest extends OperationTestBase {
                   fragmentMeta.getDeletionFile(),
                   fragmentMeta.getRowIdMeta());
 
-          SourcedTransaction mergeTransaction =
-              initialDataset
-                  .newTransactionBuilder()
+          Transaction mergeTxn =
+              new Transaction.Builder()
+                  .readVersion(initialDataset.version())
                   .operation(
                       Merge.builder()
                           .fragments(Collections.singletonList(evolvedFragment))
@@ -100,7 +101,7 @@ public class MergeTest extends OperationTestBase {
                           .build())
                   .build();
 
-          try (Dataset evolvedDataset = mergeTransaction.commit()) {
+          try (Dataset evolvedDataset = new CommitBuilder(initialDataset).execute(mergeTxn)) {
             Assertions.assertEquals(3, evolvedDataset.version());
             Assertions.assertEquals(rowCount, evolvedDataset.countRows());
             Assertions.assertEquals(evolvedSchema, evolvedDataset.getSchema());
@@ -123,6 +124,8 @@ public class MergeTest extends OperationTestBase {
                 }
               }
             }
+          } finally {
+            mergeTxn.release();
           }
         }
       }
@@ -169,9 +172,9 @@ public class MergeTest extends OperationTestBase {
                   fragmentMeta.getDeletionFile(),
                   fragmentMeta.getRowIdMeta());
 
-          SourcedTransaction mergeTransaction =
-              initialDataset
-                  .newTransactionBuilder()
+          Transaction mergeTxn =
+              new Transaction.Builder()
+                  .readVersion(initialDataset.version())
                   .operation(
                       Merge.builder()
                           .fragments(Collections.singletonList(evolvedFragment))
@@ -179,7 +182,7 @@ public class MergeTest extends OperationTestBase {
                           .build())
                   .build();
 
-          try (Dataset evolvedDataset = mergeTransaction.commit()) {
+          try (Dataset evolvedDataset = new CommitBuilder(initialDataset).execute(mergeTxn)) {
             Assertions.assertEquals(3, evolvedDataset.version());
             Assertions.assertEquals(rowCount, evolvedDataset.countRows());
             Assertions.assertEquals(evolvedSchema, evolvedDataset.getSchema());
@@ -202,6 +205,8 @@ public class MergeTest extends OperationTestBase {
                 }
               }
             }
+          } finally {
+            mergeTxn.release();
           }
         }
       }
@@ -254,9 +259,9 @@ public class MergeTest extends OperationTestBase {
                   fragmentMeta.getDeletionFile(),
                   fragmentMeta.getRowIdMeta());
 
-          SourcedTransaction mergeTransaction =
-              initialDataset
-                  .newTransactionBuilder()
+          Transaction mergeTxn =
+              new Transaction.Builder()
+                  .readVersion(initialDataset.version())
                   .operation(
                       Merge.builder()
                           .fragments(Collections.singletonList(evolvedFragment))
@@ -264,7 +269,7 @@ public class MergeTest extends OperationTestBase {
                           .build())
                   .build();
 
-          try (Dataset mergedDataset = mergeTransaction.commit()) {
+          try (Dataset mergedDataset = new CommitBuilder(initialDataset).execute(mergeTxn)) {
             Assertions.assertEquals(3, mergedDataset.version());
             Assertions.assertEquals(rowCount, mergedDataset.countRows());
 
@@ -282,6 +287,8 @@ public class MergeTest extends OperationTestBase {
                 }
               }
             }
+          } finally {
+            mergeTxn.release();
           }
         }
       }
