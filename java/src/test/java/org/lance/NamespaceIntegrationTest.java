@@ -1414,8 +1414,8 @@ public class NamespaceIntegrationTest {
 
         // Create and commit transaction
         Append appendOp = Append.builder().fragments(newFragments).build();
-        Transaction transaction =
-            new Transaction.Builder(datasetWithProvider)
+        SourcedTransaction transaction =
+            new SourcedTransaction.Builder(datasetWithProvider)
                 .readVersion(datasetWithProvider.version())
                 .operation(appendOp)
                 .build();

@@ -279,7 +279,7 @@ public class FragmentTest {
 
       // Commit fragment
       FragmentOperation.Append appendOp = new FragmentOperation.Append(Arrays.asList(fragmentMeta));
-      Transaction transaction;
+      SourcedTransaction transaction;
       try (Dataset dataset = Dataset.commit(allocator, datasetPath, appendOp, Optional.of(1L))) {
         assertEquals(2, dataset.version());
         assertEquals(2, dataset.latestVersion());
@@ -293,7 +293,7 @@ public class FragmentTest {
 
         FragmentMergeResult mergeResult = testDataset.mergeColumn(fragment, 10);
 
-        Transaction.Builder builder = new Transaction.Builder(dataset);
+        SourcedTransaction.Builder builder = new SourcedTransaction.Builder(dataset);
         transaction =
             builder
                 .operation(

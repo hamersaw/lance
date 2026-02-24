@@ -3,6 +3,9 @@
 
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
+use crate::namespace::{
+    create_java_lance_namespace, BlockingDirectoryNamespace, BlockingRestNamespace,
+};
 use crate::session::{handle_from_session, session_from_handle};
 use crate::storage_options::JavaStorageOptionsProvider;
 use crate::traits::{export_vec, import_vec, FromJObjectWithEnv, FromJString};
@@ -1171,7 +1174,7 @@ fn inner_open_native<'local>(
 }
 
 /// Check if the Java object is an instance of DirectoryNamespace.
-pub(crate) fn is_directory_namespace(env: &mut JNIEnv, namespace_obj: &JObject) -> Result<bool> {
+fn is_directory_namespace(env: &mut JNIEnv, namespace_obj: &JObject) -> Result<bool> {
     let class = env
         .find_class("org/lance/namespace/DirectoryNamespace")
         .map_err(|e| {
@@ -1182,7 +1185,7 @@ pub(crate) fn is_directory_namespace(env: &mut JNIEnv, namespace_obj: &JObject) 
 }
 
 /// Check if the Java object is an instance of RestNamespace.
-pub(crate) fn is_rest_namespace(env: &mut JNIEnv, namespace_obj: &JObject) -> Result<bool> {
+fn is_rest_namespace(env: &mut JNIEnv, namespace_obj: &JObject) -> Result<bool> {
     let class = env
         .find_class("org/lance/namespace/RestNamespace")
         .map_err(|e| Error::runtime_error(format!("Failed to find RestNamespace class: {}", e)))?;
@@ -1191,10 +1194,7 @@ pub(crate) fn is_rest_namespace(env: &mut JNIEnv, namespace_obj: &JObject) -> Re
 }
 
 /// Get the native handle from a Java LanceNamespace object.
-pub(crate) fn get_native_namespace_handle(
-    env: &mut JNIEnv,
-    namespace_obj: &JObject,
-) -> Result<jlong> {
+fn get_native_namespace_handle(env: &mut JNIEnv, namespace_obj: &JObject) -> Result<jlong> {
     env.call_method(namespace_obj, "getNativeHandle", "()J", &[])
         .map_err(|e| Error::runtime_error(format!("Failed to call getNativeHandle: {}", e)))?
         .j()
@@ -1211,10 +1211,6 @@ pub(crate) fn extract_namespace_info(
     namespace_obj: &JObject,
     table_id_obj: &JObject,
 ) -> Result<Option<(Arc<dyn LanceNamespace>, Vec<String>)>> {
-    use crate::namespace::{
-        create_java_lance_namespace, BlockingDirectoryNamespace, BlockingRestNamespace,
-    };
-
     if namespace_obj.is_null() {
         return Ok(None);
     }

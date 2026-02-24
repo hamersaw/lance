@@ -16,8 +16,8 @@ package org.lance.operation;
 import org.lance.Dataset;
 import org.lance.Fragment;
 import org.lance.FragmentMetadata;
+import org.lance.SourcedTransaction;
 import org.lance.TestUtils;
-import org.lance.Transaction;
 
 import org.apache.arrow.memory.RootAllocator;
 import org.junit.jupiter.api.Assertions;
@@ -42,7 +42,7 @@ public class ReserveFragmentsTest extends OperationTestBase {
 
       // Create an initial fragment to establish a baseline fragment ID
       FragmentMetadata initialFragmentMeta = testDataset.createNewFragment(10);
-      Transaction appendTransaction =
+      SourcedTransaction appendTransaction =
           dataset
               .newTransactionBuilder()
               .operation(
@@ -53,7 +53,7 @@ public class ReserveFragmentsTest extends OperationTestBase {
       try (Dataset datasetWithFragment = appendTransaction.commit()) {
         // Reserve fragment IDs
         int numFragmentsToReserve = 5;
-        Transaction reserveTransaction =
+        SourcedTransaction reserveTransaction =
             datasetWithFragment
                 .newTransactionBuilder()
                 .operation(
@@ -62,7 +62,7 @@ public class ReserveFragmentsTest extends OperationTestBase {
         try (Dataset datasetWithReservedFragments = reserveTransaction.commit()) {
           // Create a new fragment and verify its ID reflects the reservation
           FragmentMetadata newFragmentMeta = testDataset.createNewFragment(10);
-          Transaction appendTransaction2 =
+          SourcedTransaction appendTransaction2 =
               datasetWithReservedFragments
                   .newTransactionBuilder()
                   .operation(
@@ -89,7 +89,8 @@ public class ReserveFragmentsTest extends OperationTestBase {
 
             // Verify the transaction is recorded
             assertEquals(
-                reserveTransaction, datasetWithReservedFragments.readTransaction().orElse(null));
+                reserveTransaction.transaction(),
+                datasetWithReservedFragments.readTransaction().orElse(null));
           }
         }
       }

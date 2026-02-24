@@ -15,8 +15,8 @@ package org.lance.operation;
 
 import org.lance.Dataset;
 import org.lance.FragmentMetadata;
+import org.lance.SourcedTransaction;
 import org.lance.TestUtils;
-import org.lance.Transaction;
 
 import org.apache.arrow.memory.RootAllocator;
 import org.junit.jupiter.api.Test;
@@ -43,7 +43,7 @@ public class RestoreTest extends OperationTestBase {
       // Append data to create a new version
       int rowCount = 20;
       FragmentMetadata fragmentMeta = testDataset.createNewFragment(rowCount);
-      Transaction transaction =
+      SourcedTransaction transaction =
           dataset
               .newTransactionBuilder()
               .operation(
@@ -56,7 +56,7 @@ public class RestoreTest extends OperationTestBase {
         assertEquals(rowCount, modifiedDataset.countRows());
 
         // Restore to the initial version
-        Transaction restoreTransaction =
+        SourcedTransaction restoreTransaction =
             modifiedDataset
                 .newTransactionBuilder()
                 .operation(new Restore.Builder().version(initialVersion).build())
@@ -66,7 +66,8 @@ public class RestoreTest extends OperationTestBase {
           assertEquals(initialVersion + 2, restoredDataset.version());
           // Initial dataset had 0 rows
           assertEquals(0, restoredDataset.countRows());
-          assertEquals(restoreTransaction, restoredDataset.readTransaction().orElse(null));
+          assertEquals(
+              restoreTransaction.transaction(), restoredDataset.readTransaction().orElse(null));
         }
       }
     }

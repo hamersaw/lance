@@ -14,8 +14,8 @@
 package org.lance.operation;
 
 import org.lance.Dataset;
+import org.lance.SourcedTransaction;
 import org.lance.TestUtils;
-import org.lance.Transaction;
 
 import org.apache.arrow.memory.RootAllocator;
 import org.junit.jupiter.api.Test;
@@ -45,7 +45,7 @@ public class UpdateConfigTest extends OperationTestBase {
 
       UpdateMap configUpdates = UpdateMap.builder().updates(configValues).replace(false).build();
 
-      Transaction transaction =
+      SourcedTransaction transaction =
           dataset
               .newTransactionBuilder()
               .operation(UpdateConfig.builder().configUpdates(configUpdates).build())

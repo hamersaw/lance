@@ -15,8 +15,8 @@ package org.lance.index;
 
 import org.lance.Dataset;
 import org.lance.Fragment;
+import org.lance.SourcedTransaction;
 import org.lance.TestVectorDataset;
-import org.lance.Transaction;
 import org.lance.index.vector.IvfBuildParams;
 import org.lance.index.vector.PQBuildParams;
 import org.lance.index.vector.RQBuildParams;
@@ -130,7 +130,7 @@ public class VectorIndexTest {
         CreateIndex createIndexOp =
             CreateIndex.builder().withNewIndices(Collections.singletonList(index)).build();
 
-        Transaction createIndexTx =
+        SourcedTransaction createIndexTx =
             dataset.newTransactionBuilder().operation(createIndexOp).build();
 
         try (Dataset newDataset = createIndexTx.commit()) {
@@ -248,7 +248,7 @@ public class VectorIndexTest {
         CreateIndex createIndexOp =
             CreateIndex.builder().withNewIndices(Collections.singletonList(index)).build();
 
-        Transaction createIndexTx =
+        SourcedTransaction createIndexTx =
             dataset.newTransactionBuilder().operation(createIndexOp).build();
 
         try (Dataset newDataset = createIndexTx.commit()) {
@@ -350,7 +350,7 @@ public class VectorIndexTest {
         CreateIndex createIndexOp =
             CreateIndex.builder().withNewIndices(Collections.singletonList(index)).build();
 
-        Transaction createIndexTx =
+        SourcedTransaction createIndexTx =
             dataset.newTransactionBuilder().operation(createIndexOp).build();
 
         try (Dataset newDataset = createIndexTx.commit()) {

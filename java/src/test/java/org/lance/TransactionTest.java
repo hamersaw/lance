@@ -51,7 +51,7 @@ public class TransactionTest {
         Map<String, String> properties = new HashMap<>();
         properties.put("transactionType", "APPEND");
         properties.put("createdBy", "testUser");
-        Transaction appendTxn =
+        SourcedTransaction appendTxn =
             dataset
                 .newTransactionBuilder()
                 .operation(
@@ -125,7 +125,7 @@ public class TransactionTest {
 
       // Build a transaction targeting a URI (no existing dataset)
       Transaction txn =
-          new Transaction.Builder(datasetPath, allocator)
+          new Transaction.Builder()
               .operation(
                   Overwrite.builder()
                       .fragments(Collections.singletonList(fragmentMeta))
@@ -133,7 +133,7 @@ public class TransactionTest {
                       .build())
               .build();
 
-      try (Dataset committedDataset = txn.commit()) {
+      try (Dataset committedDataset = new CommitBuilder(datasetPath, allocator).execute(txn)) {
         assertEquals(1, committedDataset.version());
         assertEquals(20, committedDataset.countRows());
       } finally {

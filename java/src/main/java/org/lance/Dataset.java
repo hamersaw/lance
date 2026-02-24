@@ -515,10 +515,10 @@ public class Dataset implements Closeable {
    * Create a new transaction builder at current version for the dataset. The dataset itself will
    * not refresh after the transaction committed.
    *
-   * @return A new instance of {@link Transaction.Builder} linked to the opened dataset.
+   * @return A new instance of {@link SourcedTransaction.Builder} linked to the opened dataset.
    */
-  public Transaction.Builder newTransactionBuilder() {
-    return new Transaction.Builder(this).readVersion(version());
+  public SourcedTransaction.Builder newTransactionBuilder() {
+    return new SourcedTransaction.Builder(this);
   }
 
   /**
@@ -549,7 +549,11 @@ public class Dataset implements Closeable {
       Transaction transaction, boolean detached, boolean enableV2ManifestPaths) {
     Preconditions.checkNotNull(transaction);
     try {
-      Dataset dataset = nativeCommitTransaction(transaction, detached, enableV2ManifestPaths);
+      Dataset dataset =
+          new CommitBuilder(this)
+              .detached(detached)
+              .enableV2ManifestPaths(enableV2ManifestPaths)
+              .execute(transaction);
       if (selfManagedAllocator) {
         dataset.allocator = new RootAllocator(Long.MAX_VALUE);
       } else {
@@ -560,9 +564,6 @@ public class Dataset implements Closeable {
       transaction.release();
     }
   }
-
-  private native Dataset nativeCommitTransaction(
-      Transaction transaction, boolean detached, boolean enableV2ManifestPaths);
 
   /**
    * Drop a Dataset.

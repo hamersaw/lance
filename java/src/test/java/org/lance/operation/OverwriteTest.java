@@ -16,8 +16,8 @@ package org.lance.operation;
 import org.lance.Dataset;
 import org.lance.Fragment;
 import org.lance.FragmentMetadata;
+import org.lance.SourcedTransaction;
 import org.lance.TestUtils;
-import org.lance.Transaction;
 import org.lance.ipc.LanceScanner;
 
 import org.apache.arrow.memory.RootAllocator;
@@ -43,7 +43,7 @@ public class OverwriteTest extends OperationTestBase {
       // Commit fragment
       int rowCount = 20;
       FragmentMetadata fragmentMeta = testDataset.createNewFragment(rowCount);
-      Transaction transaction =
+      SourcedTransaction transaction =
           dataset
               .newTransactionBuilder()
               .operation(
@@ -91,7 +91,7 @@ public class OverwriteTest extends OperationTestBase {
           Schema schemaRes = scanner.schema();
           assertEquals(testDataset.getSchema(), schemaRes);
         }
-        assertEquals(transaction, dataset.readTransaction().orElse(null));
+        assertEquals(transaction.transaction(), dataset.readTransaction().orElse(null));
       }
     }
   }

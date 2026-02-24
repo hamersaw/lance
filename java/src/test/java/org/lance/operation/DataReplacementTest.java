@@ -16,8 +16,8 @@ package org.lance.operation;
 import org.lance.Dataset;
 import org.lance.Fragment;
 import org.lance.FragmentMetadata;
+import org.lance.SourcedTransaction;
 import org.lance.TestUtils;
-import org.lance.Transaction;
 import org.lance.WriteParams;
 import org.lance.fragment.DataFile;
 import org.lance.ipc.LanceScanner;
@@ -71,7 +71,7 @@ public class DataReplacementTest extends OperationTestBase {
         List<FragmentMetadata> fragmentMetas =
             Fragment.create(datasetPath, allocator, idRoot, new WriteParams.Builder().build());
 
-        Transaction appendTxn =
+        SourcedTransaction appendTxn =
             dataset
                 .newTransactionBuilder()
                 .operation(Append.builder().fragments(fragmentMetas).build())
@@ -124,7 +124,7 @@ public class DataReplacementTest extends OperationTestBase {
                 Collections.singletonList(
                     new DataReplacement.DataReplacementGroup(
                         fragmentMetas.get(0).getId(), datafile));
-            Transaction replaceTxn =
+            SourcedTransaction replaceTxn =
                 initDataset
                     .newTransactionBuilder()
                     .operation(DataReplacement.builder().replacements(replacementGroups).build())

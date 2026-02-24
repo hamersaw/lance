@@ -760,7 +760,7 @@ public class TestUtils {
           fragments.add(createBlobFragment(batchRows, Integer.MAX_VALUE));
         }
 
-        Transaction txn =
+        SourcedTransaction txn =
             ds.newTransactionBuilder()
                 .operation(org.lance.operation.Append.builder().fragments(fragments).build())
                 .build();

@@ -295,7 +295,7 @@ fn inner_read_transaction<'local>(
     };
 
     let transaction = match transaction {
-        Some(transaction) => convert_to_java_transaction(env, transaction, &java_dataset)?,
+        Some(transaction) => convert_to_java_transaction(env, transaction)?,
         None => JObject::null(),
     };
     Ok(transaction)
@@ -304,7 +304,6 @@ fn inner_read_transaction<'local>(
 pub(crate) fn convert_to_java_transaction<'local>(
     env: &mut JNIEnv<'local>,
     transaction: Transaction,
-    java_dataset: &JObject,
 ) -> Result<JObject<'local>> {
     let uuid = env.new_string(transaction.uuid)?;
     let transaction_properties = match transaction.transaction_properties {
@@ -315,13 +314,11 @@ pub(crate) fn convert_to_java_transaction<'local>(
 
     let java_transaction = env.new_object(
         "org/lance/Transaction",
-        "(Lorg/lance/Dataset;JLjava/lang/String;Lorg/lance/operation/Operation;Ljava/util/Map;Ljava/util/Map;)V",
+        "(JLjava/lang/String;Lorg/lance/operation/Operation;Ljava/util/Map;)V",
         &[
-            JValue::Object(java_dataset),
             JValue::Long(transaction.read_version as i64),
             JValue::Object(&uuid),
             JValue::Object(&operation),
-            JValue::Object(&JObject::null()),
             JValue::Object(&transaction_properties),
         ],
     )?;
@@ -589,37 +586,42 @@ pub(crate) fn convert_to_java_schema<'local>(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_org_lance_Dataset_nativeCommitTransaction<'local>(
+pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToDataset<'local>(
     mut env: JNIEnv<'local>,
+    _cls: JObject,
     java_dataset: JObject,
     java_transaction: JObject,
     detached_jbool: jboolean,
     enable_v2_manifest_paths: jboolean,
+    write_params_obj: JObject,
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
-        inner_commit_transaction(
+        inner_commit_to_dataset(
             &mut env,
             java_dataset,
             java_transaction,
             detached_jbool != 0,
             enable_v2_manifest_paths != 0,
+            write_params_obj,
         )
     )
 }
 
-fn inner_commit_transaction<'local>(
+fn inner_commit_to_dataset<'local>(
     env: &mut JNIEnv<'local>,
     java_dataset: JObject,
     java_transaction: JObject,
     detached: bool,
     enable_v2_manifest_paths: bool,
+    write_params_obj: JObject,
 ) -> Result<JObject<'local>> {
-    let write_param_jobj = env
-        .call_method(&java_transaction, "writeParams", "()Ljava/util/Map;", &[])?
-        .l()?;
-    let write_param_jmap = JMap::from_env(env, &write_param_jobj)?;
-    let write_param = to_rust_map(env, &write_param_jmap)?;
+    let write_param = if write_params_obj.is_null() {
+        HashMap::new()
+    } else {
+        let write_param_jmap = JMap::from_env(env, &write_params_obj)?;
+        to_rust_map(env, &write_param_jmap)?
+    };
 
     // Get the Dataset's storage_options_accessor and merge with write_param
     let storage_options_accessor = {
@@ -1079,7 +1081,7 @@ fn export_update_map<'a>(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_org_lance_Transaction_nativeCommitTransactionToUri<'local>(
+pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToUri<'local>(
     mut env: JNIEnv<'local>,
     _cls: JObject,
     uri: JString,
@@ -1089,10 +1091,11 @@ pub extern "system" fn Java_org_lance_Transaction_nativeCommitTransactionToUri<'
     namespace_obj: JObject,
     table_id_obj: JObject,
     allocator_obj: JObject,
+    write_params_obj: JObject,
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
-        inner_commit_transaction_to_uri(
+        inner_commit_to_uri(
             &mut env,
             uri,
             java_transaction,
@@ -1101,12 +1104,13 @@ pub extern "system" fn Java_org_lance_Transaction_nativeCommitTransactionToUri<'
             namespace_obj,
             table_id_obj,
             allocator_obj,
+            write_params_obj,
         )
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn inner_commit_transaction_to_uri<'local>(
+fn inner_commit_to_uri<'local>(
     env: &mut JNIEnv<'local>,
     uri: JString,
     java_transaction: JObject,
@@ -1115,15 +1119,17 @@ fn inner_commit_transaction_to_uri<'local>(
     namespace_obj: JObject,
     table_id_obj: JObject,
     allocator_obj: JObject,
+    write_params_obj: JObject,
 ) -> Result<JObject<'local>> {
     let uri_str: String = uri.extract(env)?;
 
-    // Extract write params from the transaction as storage options
-    let write_param_jobj = env
-        .call_method(&java_transaction, "writeParams", "()Ljava/util/Map;", &[])?
-        .l()?;
-    let write_param_jmap = JMap::from_env(env, &write_param_jobj)?;
-    let write_param = to_rust_map(env, &write_param_jmap)?;
+    // Extract write params from parameter
+    let write_param = if write_params_obj.is_null() {
+        HashMap::new()
+    } else {
+        let write_param_jmap = JMap::from_env(env, &write_params_obj)?;
+        to_rust_map(env, &write_param_jmap)?
+    };
 
     // Build storage options accessor
     let storage_options_provider: Option<JavaStorageOptionsProvider> = env

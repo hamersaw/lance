@@ -15,8 +15,8 @@ package org.lance.operation;
 
 import org.lance.Dataset;
 import org.lance.FragmentMetadata;
+import org.lance.SourcedTransaction;
 import org.lance.TestUtils;
-import org.lance.Transaction;
 
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.types.pojo.Schema;
@@ -40,7 +40,7 @@ public class TruncateTest extends OperationTestBase {
       // Append some data
       int rowCount = 20;
       FragmentMetadata fragmentMeta = testDataset.createNewFragment(rowCount);
-      Transaction transaction =
+      SourcedTransaction transaction =
           dataset
               .newTransactionBuilder()
               .operation(

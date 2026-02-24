@@ -15,6 +15,7 @@ package org.lance.operation;
 
 import org.lance.Dataset;
 import org.lance.FragmentMetadata;
+import org.lance.SourcedTransaction;
 import org.lance.TestUtils;
 import org.lance.Transaction;
 
@@ -42,7 +43,7 @@ public class DeleteTest extends OperationTestBase {
       int rowCount = 20;
       FragmentMetadata fragmentMeta0 = testDataset.createNewFragment(rowCount);
       FragmentMetadata fragmentMeta1 = testDataset.createNewFragment(rowCount);
-      Transaction transaction =
+      SourcedTransaction transaction =
           dataset
               .newTransactionBuilder()
               .operation(
@@ -60,7 +61,7 @@ public class DeleteTest extends OperationTestBase {
               .map(t -> Long.valueOf(t.getId()))
               .collect(Collectors.toList());
 
-      Transaction delete =
+      SourcedTransaction delete =
           dataset
               .newTransactionBuilder()
               .operation(

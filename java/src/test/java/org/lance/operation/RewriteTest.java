@@ -15,8 +15,8 @@ package org.lance.operation;
 
 import org.lance.Dataset;
 import org.lance.FragmentMetadata;
+import org.lance.SourcedTransaction;
 import org.lance.TestUtils;
-import org.lance.Transaction;
 
 import org.apache.arrow.memory.RootAllocator;
 import org.junit.jupiter.api.Test;
@@ -44,7 +44,7 @@ public class RewriteTest extends OperationTestBase {
       FragmentMetadata fragmentMeta1 = testDataset.createNewFragment(rowCount);
       FragmentMetadata fragmentMeta2 = testDataset.createNewFragment(rowCount);
 
-      Transaction appendTx =
+      SourcedTransaction appendTx =
           dataset
               .newTransactionBuilder()
               .operation(
@@ -72,7 +72,7 @@ public class RewriteTest extends OperationTestBase {
         groups.add(group);
 
         // Create and commit the rewrite transaction
-        Transaction rewriteTx =
+        SourcedTransaction rewriteTx =
             datasetWithData
                 .newTransactionBuilder()
                 .operation(Rewrite.builder().groups(groups).build())
@@ -84,7 +84,7 @@ public class RewriteTest extends OperationTestBase {
           assertEquals(rowCount * 2, rewrittenDataset.countRows());
 
           // Verify that the transaction was recorded
-          assertEquals(rewriteTx, rewrittenDataset.readTransaction().orElse(null));
+          assertEquals(rewriteTx.transaction(), rewrittenDataset.readTransaction().orElse(null));
         }
       }
     }

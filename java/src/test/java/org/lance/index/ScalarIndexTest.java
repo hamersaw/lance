@@ -15,8 +15,8 @@ package org.lance.index;
 
 import org.lance.Dataset;
 import org.lance.Fragment;
+import org.lance.SourcedTransaction;
 import org.lance.TestUtils;
-import org.lance.Transaction;
 import org.lance.WriteParams;
 import org.lance.index.scalar.ScalarIndexParams;
 import org.lance.ipc.LanceScanner;
@@ -167,7 +167,7 @@ public class ScalarIndexTest {
         CreateIndex createIndexOp =
             CreateIndex.builder().withNewIndices(Collections.singletonList(index)).build();
 
-        Transaction createIndexTx =
+        SourcedTransaction createIndexTx =
             dataset.newTransactionBuilder().operation(createIndexOp).build();
 
         try (Dataset newDataset = createIndexTx.commit()) {
@@ -244,7 +244,7 @@ public class ScalarIndexTest {
         CreateIndex createIndexOp =
             CreateIndex.builder().withNewIndices(Collections.singletonList(index)).build();
 
-        Transaction createIndexTx =
+        SourcedTransaction createIndexTx =
             dataset.newTransactionBuilder().operation(createIndexOp).build();
 
         try (Dataset newDataset = createIndexTx.commit()) {

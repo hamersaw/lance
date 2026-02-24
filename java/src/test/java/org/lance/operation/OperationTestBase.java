@@ -15,8 +15,8 @@ package org.lance.operation;
 
 import org.lance.Dataset;
 import org.lance.FragmentMetadata;
+import org.lance.SourcedTransaction;
 import org.lance.TestUtils;
-import org.lance.Transaction;
 import org.lance.file.LanceFileWriter;
 import org.lance.fragment.DataFile;
 
@@ -53,7 +53,7 @@ public class OperationTestBase {
     dataset = suite.createEmptyDataset();
     FragmentMetadata fragmentMeta = suite.createNewFragment(rowCount);
 
-    Transaction appendTxn =
+    SourcedTransaction appendTxn =
         dataset
             .newTransactionBuilder()
             .operation(Append.builder().fragments(Collections.singletonList(fragmentMeta)).build())

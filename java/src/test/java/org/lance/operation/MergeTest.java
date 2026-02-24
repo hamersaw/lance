@@ -15,8 +15,8 @@ package org.lance.operation;
 
 import org.lance.Dataset;
 import org.lance.FragmentMetadata;
+import org.lance.SourcedTransaction;
 import org.lance.TestUtils;
-import org.lance.Transaction;
 import org.lance.fragment.DataFile;
 import org.lance.ipc.LanceScanner;
 
@@ -90,7 +90,7 @@ public class MergeTest extends OperationTestBase {
                   fragmentMeta.getDeletionFile(),
                   fragmentMeta.getRowIdMeta());
 
-          Transaction mergeTransaction =
+          SourcedTransaction mergeTransaction =
               initialDataset
                   .newTransactionBuilder()
                   .operation(
@@ -169,7 +169,7 @@ public class MergeTest extends OperationTestBase {
                   fragmentMeta.getDeletionFile(),
                   fragmentMeta.getRowIdMeta());
 
-          Transaction mergeTransaction =
+          SourcedTransaction mergeTransaction =
               initialDataset
                   .newTransactionBuilder()
                   .operation(
@@ -254,7 +254,7 @@ public class MergeTest extends OperationTestBase {
                   fragmentMeta.getDeletionFile(),
                   fragmentMeta.getRowIdMeta());
 
-          Transaction mergeTransaction =
+          SourcedTransaction mergeTransaction =
               initialDataset
                   .newTransactionBuilder()
                   .operation(

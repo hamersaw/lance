@@ -16,6 +16,7 @@ package org.lance.operation;
 import org.lance.Dataset;
 import org.lance.Fragment;
 import org.lance.FragmentMetadata;
+import org.lance.SourcedTransaction;
 import org.lance.TestUtils;
 import org.lance.Transaction;
 import org.lance.fragment.FragmentUpdateResult;
@@ -54,7 +55,7 @@ public class UpdateTest extends OperationTestBase {
       // Commit fragment
       int rowCount = 20;
       FragmentMetadata fragmentMeta = testDataset.createNewFragment(rowCount);
-      Transaction transaction =
+      SourcedTransaction transaction =
           dataset
               .newTransactionBuilder()
               .operation(
@@ -99,7 +100,7 @@ public class UpdateTest extends OperationTestBase {
         assertEquals(rowCount, dataset.countRows());
 
         Transaction txn = dataset.readTransaction().orElse(null);
-        assertEquals(transaction, txn);
+        assertEquals(transaction.transaction(), txn);
       }
     }
   }
@@ -122,7 +123,7 @@ public class UpdateTest extends OperationTestBase {
        */
       int rowCount = 6;
       FragmentMetadata fragmentMeta = testDataset.createNewFragment(rowCount);
-      Transaction appendTransaction =
+      SourcedTransaction appendTransaction =
           dataset
               .newTransactionBuilder()
               .operation(
@@ -145,7 +146,7 @@ public class UpdateTest extends OperationTestBase {
        *   3:   |  null  |     null     |
        */
       FragmentUpdateResult updateResult = testDataset.updateColumn(targetFragment, updateRowCount);
-      Transaction updateTransaction =
+      SourcedTransaction updateTransaction =
           dataset
               .newTransactionBuilder()
               .operation(

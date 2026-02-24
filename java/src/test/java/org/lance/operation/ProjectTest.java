@@ -14,8 +14,8 @@
 package org.lance.operation;
 
 import org.lance.Dataset;
+import org.lance.SourcedTransaction;
 import org.lance.TestUtils;
-import org.lance.Transaction;
 
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.types.pojo.Field;
@@ -43,7 +43,7 @@ public class ProjectTest extends OperationTestBase {
       assertEquals(testDataset.getSchema(), dataset.getSchema());
       List<Field> fieldList = new ArrayList<>(testDataset.getSchema().getFields());
       Collections.reverse(fieldList);
-      Transaction txn1 =
+      SourcedTransaction txn1 =
           dataset
               .newTransactionBuilder()
               .operation(Project.builder().schema(new Schema(fieldList)).build())
@@ -54,7 +54,7 @@ public class ProjectTest extends OperationTestBase {
         assertEquals(2, committedDataset.version());
         assertEquals(new Schema(fieldList), committedDataset.getSchema());
         fieldList.remove(1);
-        Transaction txn2 =
+        SourcedTransaction txn2 =
             committedDataset
                 .newTransactionBuilder()
                 .operation(Project.builder().schema(new Schema(fieldList)).build())
@@ -64,8 +64,8 @@ public class ProjectTest extends OperationTestBase {
           assertEquals(2, committedDataset.version());
           assertEquals(3, committedDataset2.version());
           assertEquals(new Schema(fieldList), committedDataset2.getSchema());
-          assertEquals(txn1, committedDataset.readTransaction().orElse(null));
-          assertEquals(txn2, committedDataset2.readTransaction().orElse(null));
+          assertEquals(txn1.transaction(), committedDataset.readTransaction().orElse(null));
+          assertEquals(txn2.transaction(), committedDataset2.readTransaction().orElse(null));
         }
       }
     }

@@ -15,8 +15,8 @@ package org.lance.operation;
 
 import org.lance.Dataset;
 import org.lance.FragmentMetadata;
+import org.lance.SourcedTransaction;
 import org.lance.TestUtils;
-import org.lance.Transaction;
 
 import org.apache.arrow.memory.RootAllocator;
 import org.junit.jupiter.api.Test;
@@ -62,7 +62,7 @@ public class AppendTest extends OperationTestBase {
               testDataset.createNewFragment(rowCount),
               testDataset.createNewFragment(rowCount));
 
-      Transaction transaction =
+      SourcedTransaction transaction =
           dataset
               .newTransactionBuilder()
               .operation(Append.builder().fragments(fragments).build())
@@ -72,7 +72,7 @@ public class AppendTest extends OperationTestBase {
         assertEquals(2, dataset.version());
         assertEquals(rowCount * 3, dataset.countRows());
         assertEquals(3, dataset.getFragments().size());
-        assertEquals(transaction, dataset.readTransaction().orElse(null));
+        assertEquals(transaction.transaction(), dataset.readTransaction().orElse(null));
       }
     }
   }
@@ -88,7 +88,7 @@ public class AppendTest extends OperationTestBase {
         assertThrows(
             IllegalArgumentException.class,
             () -> {
-              Transaction transaction =
+              SourcedTransaction transaction =
                   dataset
                       .newTransactionBuilder()
                       .operation(Append.builder().fragments(new ArrayList<>()).build())
