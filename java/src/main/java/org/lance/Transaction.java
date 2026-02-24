@@ -36,6 +36,7 @@ public class Transaction {
   private final long readVersion;
   private final String uuid;
   private final Operation operation;
+  private final Optional<String> tag;
   private final Optional<Map<String, String>> transactionProperties;
 
   /**
@@ -44,16 +45,19 @@ public class Transaction {
    * @param readVersion the version that was read when creating this transaction
    * @param uuid the unique identifier for this transaction
    * @param operation the operation to perform
+   * @param tag optional tag for the transaction
    * @param transactionProperties optional transaction properties
    */
   private Transaction(
       long readVersion,
       String uuid,
       Operation operation,
+      String tag,
       Map<String, String> transactionProperties) {
     this.readVersion = readVersion;
     this.uuid = uuid;
     this.operation = operation;
+    this.tag = Optional.ofNullable(tag);
     this.transactionProperties = Optional.ofNullable(transactionProperties);
   }
 
@@ -65,7 +69,7 @@ public class Transaction {
    * @param operation the operation to perform
    */
   public Transaction(long readVersion, Operation operation) {
-    this(readVersion, UUID.randomUUID().toString(), operation, null);
+    this(readVersion, UUID.randomUUID().toString(), operation, null, null);
   }
 
   public long readVersion() {
@@ -78,6 +82,11 @@ public class Transaction {
 
   public Operation operation() {
     return operation;
+  }
+
+  /** Returns the optional tag for this transaction. */
+  public Optional<String> tag() {
+    return tag;
   }
 
   public Optional<Map<String, String>> transactionProperties() {
@@ -95,6 +104,7 @@ public class Transaction {
         .add("readVersion", readVersion)
         .add("uuid", uuid)
         .add("operation", operation)
+        .add("tag", tag)
         .add("transactionProperties", transactionProperties)
         .toString();
   }
@@ -111,12 +121,13 @@ public class Transaction {
     return readVersion == that.readVersion
         && uuid.equals(that.uuid)
         && Objects.equals(operation, that.operation)
+        && Objects.equals(tag, that.tag)
         && Objects.equals(transactionProperties, that.transactionProperties);
   }
 
   @Override
   public int hashCode() {
-    return Objects.hash(readVersion, uuid, operation, transactionProperties);
+    return Objects.hash(readVersion, uuid, operation, tag, transactionProperties);
   }
 
   /** Builder for constructing {@link Transaction} instances. */
@@ -124,6 +135,7 @@ public class Transaction {
     private String uuid;
     private long readVersion;
     private Operation operation;
+    private String tag;
     private Map<String, String> transactionProperties;
 
     public Builder() {
@@ -149,6 +161,17 @@ public class Transaction {
       return this;
     }
 
+    /**
+     * Set an optional tag for the transaction.
+     *
+     * @param tag the tag string
+     * @return this builder instance
+     */
+    public Builder tag(String tag) {
+      this.tag = tag;
+      return this;
+    }
+
     public Builder transactionProperties(Map<String, String> properties) {
       this.transactionProperties = properties;
       return this;
@@ -156,7 +179,7 @@ public class Transaction {
 
     public Transaction build() {
       Preconditions.checkState(operation != null, "TransactionBuilder has no operations");
-      return new Transaction(readVersion, uuid, operation, transactionProperties);
+      return new Transaction(readVersion, uuid, operation, tag, transactionProperties);
     }
   }
 }

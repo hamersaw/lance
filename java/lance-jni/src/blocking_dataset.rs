@@ -44,6 +44,7 @@ use lance::session::Session as LanceSession;
 use lance::table::format::IndexMetadata;
 use lance::table::format::{BasePath, Fragment};
 use lance_core::datatypes::Schema as LanceSchema;
+use lance_file::version::LanceFileVersion;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::btree::BTreeParameters;
 use lance_index::DatasetIndexExt;
@@ -325,20 +326,35 @@ impl BlockingDataset {
         Ok(indexes)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn commit_transaction(
         &mut self,
         transaction: Transaction,
         store_params: ObjectStoreParams,
         detached: bool,
         enable_v2_manifest_paths: bool,
+        use_stable_row_ids: Option<bool>,
+        storage_format: Option<LanceFileVersion>,
+        max_retries: u32,
+        skip_auto_cleanup: bool,
     ) -> Result<Self> {
-        let new_dataset = RT.block_on(
-            CommitBuilder::new(Arc::new(self.clone().inner))
-                .with_store_params(store_params)
-                .with_detached(detached)
-                .enable_v2_manifest_paths(enable_v2_manifest_paths)
-                .execute(transaction),
-        )?;
+        let mut builder = CommitBuilder::new(Arc::new(self.clone().inner))
+            .with_store_params(store_params)
+            .with_detached(detached)
+            .enable_v2_manifest_paths(enable_v2_manifest_paths);
+        if let Some(use_stable) = use_stable_row_ids {
+            builder = builder.use_stable_row_ids(use_stable);
+        }
+        if let Some(format) = storage_format {
+            builder = builder.with_storage_format(format);
+        }
+        if max_retries > 0 {
+            builder = builder.with_max_retries(max_retries);
+        }
+        if skip_auto_cleanup {
+            builder = builder.with_skip_auto_cleanup(true);
+        }
+        let new_dataset = RT.block_on(builder.execute(transaction))?;
         Ok(BlockingDataset { inner: new_dataset })
     }
 

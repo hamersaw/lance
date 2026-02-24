@@ -68,6 +68,11 @@ public class SourcedTransaction {
     return transaction.operation();
   }
 
+  /** Delegates to {@link Transaction#tag()}. */
+  public Optional<String> tag() {
+    return transaction.tag();
+  }
+
   /** Delegates to {@link Transaction#transactionProperties()}. */
   public Optional<Map<String, String>> transactionProperties() {
     return transaction.transactionProperties();
@@ -103,6 +108,7 @@ public class SourcedTransaction {
     private final Dataset dataset;
     private long readVersion;
     private Operation operation;
+    private String tag;
     private Map<String, String> transactionProperties;
 
     /**
@@ -130,6 +136,17 @@ public class SourcedTransaction {
       return this;
     }
 
+    /**
+     * Set an optional tag for the transaction.
+     *
+     * @param tag the tag string
+     * @return this builder instance
+     */
+    public Builder tag(String tag) {
+      this.tag = tag;
+      return this;
+    }
+
     public Builder transactionProperties(Map<String, String> properties) {
       this.transactionProperties = properties;
       return this;
@@ -141,6 +158,7 @@ public class SourcedTransaction {
           new Transaction.Builder()
               .readVersion(readVersion)
               .operation(operation)
+              .tag(tag)
               .transactionProperties(transactionProperties)
               .build();
       return new SourcedTransaction(transaction, dataset);

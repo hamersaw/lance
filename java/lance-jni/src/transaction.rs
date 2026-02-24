@@ -15,7 +15,7 @@ use arrow::datatypes::Schema;
 use arrow_schema::ffi::FFI_ArrowSchema;
 use chrono::DateTime;
 use jni::objects::{JByteArray, JLongArray, JMap, JObject, JString, JValue, JValueGen};
-use jni::sys::jboolean;
+use jni::sys::{jboolean, jint};
 use jni::JNIEnv;
 use lance::dataset::transaction::{
     DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder,
@@ -26,6 +26,7 @@ use lance::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 use lance::io::ObjectStoreParams;
 use lance::table::format::{Fragment, IndexMetadata};
 use lance_core::datatypes::Schema as LanceSchema;
+use lance_file::version::LanceFileVersion;
 use lance_io::object_store::StorageOptionsProvider;
 use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
 use lance_table::io::commit::CommitHandler;
@@ -306,6 +307,10 @@ pub(crate) fn convert_to_java_transaction<'local>(
     transaction: Transaction,
 ) -> Result<JObject<'local>> {
     let uuid = env.new_string(transaction.uuid)?;
+    let tag = match transaction.tag {
+        Some(tag) => JObject::from(env.new_string(tag)?),
+        None => JObject::null(),
+    };
     let transaction_properties = match transaction.transaction_properties {
         Some(properties) => to_java_map(env, &properties)?,
         _ => JObject::null(),
@@ -314,11 +319,12 @@ pub(crate) fn convert_to_java_transaction<'local>(
 
     let java_transaction = env.new_object(
         "org/lance/Transaction",
-        "(JLjava/lang/String;Lorg/lance/operation/Operation;Ljava/util/Map;)V",
+        "(JLjava/lang/String;Lorg/lance/operation/Operation;Ljava/lang/String;Ljava/util/Map;)V",
         &[
             JValue::Long(transaction.read_version as i64),
             JValue::Object(&uuid),
             JValue::Object(&operation),
+            JValue::Object(&tag),
             JValue::Object(&transaction_properties),
         ],
     )?;
@@ -585,7 +591,23 @@ pub(crate) fn convert_to_java_schema<'local>(
         .l()?)
 }
 
+fn parse_storage_format(name: &str) -> Result<LanceFileVersion> {
+    match name.to_lowercase().as_str() {
+        "legacy" => Ok(LanceFileVersion::Legacy),
+        "v2_0" | "v2.0" => Ok(LanceFileVersion::V2_0),
+        "stable" => Ok(LanceFileVersion::Stable),
+        "v2_1" | "v2.1" => Ok(LanceFileVersion::V2_1),
+        "next" => Ok(LanceFileVersion::Next),
+        "v2_2" | "v2.2" => Ok(LanceFileVersion::V2_2),
+        _ => Err(Error::input_error(format!(
+            "Unknown storage format: {}",
+            name
+        ))),
+    }
+}
+
 #[no_mangle]
+#[allow(clippy::too_many_arguments)]
 pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToDataset<'local>(
     mut env: JNIEnv<'local>,
     _cls: JObject,
@@ -594,6 +616,10 @@ pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToDataset<'local
     detached_jbool: jboolean,
     enable_v2_manifest_paths: jboolean,
     write_params_obj: JObject,
+    use_stable_row_ids_obj: JObject,
+    storage_format_obj: JObject,
+    max_retries: jint,
+    skip_auto_cleanup: jboolean,
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -604,10 +630,15 @@ pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToDataset<'local
             detached_jbool != 0,
             enable_v2_manifest_paths != 0,
             write_params_obj,
+            use_stable_row_ids_obj,
+            storage_format_obj,
+            max_retries as u32,
+            skip_auto_cleanup != 0,
         )
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn inner_commit_to_dataset<'local>(
     env: &mut JNIEnv<'local>,
     java_dataset: JObject,
@@ -615,12 +646,34 @@ fn inner_commit_to_dataset<'local>(
     detached: bool,
     enable_v2_manifest_paths: bool,
     write_params_obj: JObject,
+    use_stable_row_ids_obj: JObject,
+    storage_format_obj: JObject,
+    max_retries: u32,
+    skip_auto_cleanup: bool,
 ) -> Result<JObject<'local>> {
     let write_param = if write_params_obj.is_null() {
         HashMap::new()
     } else {
         let write_param_jmap = JMap::from_env(env, &write_params_obj)?;
         to_rust_map(env, &write_param_jmap)?
+    };
+
+    // Parse optional use_stable_row_ids (boxed Boolean)
+    let use_stable_row_ids = if use_stable_row_ids_obj.is_null() {
+        None
+    } else {
+        let val = env
+            .call_method(&use_stable_row_ids_obj, "booleanValue", "()Z", &[])?
+            .z()?;
+        Some(val)
+    };
+
+    // Parse optional storage format string
+    let storage_format = if storage_format_obj.is_null() {
+        None
+    } else {
+        let format_str: String = JString::from(storage_format_obj).extract(env)?;
+        Some(parse_storage_format(&format_str)?)
     };
 
     // Get the Dataset's storage_options_accessor and merge with write_param
@@ -684,6 +737,10 @@ fn inner_commit_to_dataset<'local>(
             store_params,
             detached,
             enable_v2_manifest_paths,
+            use_stable_row_ids,
+            storage_format,
+            max_retries,
+            skip_auto_cleanup,
         )?
     };
     new_blocking_ds.into_java(env)
@@ -706,6 +763,11 @@ fn convert_to_rust_transaction(
         .l()?;
     let op = convert_to_rust_operation(env, &op, allocator)?;
 
+    let tag = env.get_optional_from_method(&java_transaction, "tag", |env, tag_obj| {
+        let tag_str = JString::from(tag_obj);
+        tag_str.extract(env)
+    })?;
+
     let transaction_properties = env.get_optional_from_method(
         &java_transaction,
         "transactionProperties",
@@ -716,6 +778,7 @@ fn convert_to_rust_transaction(
     )?;
     Ok(TransactionBuilder::new(read_ver, op)
         .uuid(uuid)
+        .tag(tag)
         .transaction_properties(transaction_properties.map(Arc::new))
         .build())
 }
@@ -1081,6 +1144,7 @@ fn export_update_map<'a>(
 }
 
 #[no_mangle]
+#[allow(clippy::too_many_arguments)]
 pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToUri<'local>(
     mut env: JNIEnv<'local>,
     _cls: JObject,
@@ -1092,6 +1156,10 @@ pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToUri<'local>(
     table_id_obj: JObject,
     allocator_obj: JObject,
     write_params_obj: JObject,
+    use_stable_row_ids_obj: JObject,
+    storage_format_obj: JObject,
+    max_retries: jint,
+    skip_auto_cleanup: jboolean,
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -1105,6 +1173,10 @@ pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToUri<'local>(
             table_id_obj,
             allocator_obj,
             write_params_obj,
+            use_stable_row_ids_obj,
+            storage_format_obj,
+            max_retries as u32,
+            skip_auto_cleanup != 0,
         )
     )
 }
@@ -1120,6 +1192,10 @@ fn inner_commit_to_uri<'local>(
     table_id_obj: JObject,
     allocator_obj: JObject,
     write_params_obj: JObject,
+    use_stable_row_ids_obj: JObject,
+    storage_format_obj: JObject,
+    max_retries: u32,
+    skip_auto_cleanup: bool,
 ) -> Result<JObject<'local>> {
     let uri_str: String = uri.extract(env)?;
 
@@ -1129,6 +1205,24 @@ fn inner_commit_to_uri<'local>(
     } else {
         let write_param_jmap = JMap::from_env(env, &write_params_obj)?;
         to_rust_map(env, &write_param_jmap)?
+    };
+
+    // Parse optional use_stable_row_ids (boxed Boolean)
+    let use_stable_row_ids = if use_stable_row_ids_obj.is_null() {
+        None
+    } else {
+        let val = env
+            .call_method(&use_stable_row_ids_obj, "booleanValue", "()Z", &[])?
+            .z()?;
+        Some(val)
+    };
+
+    // Parse optional storage format string
+    let storage_format = if storage_format_obj.is_null() {
+        None
+    } else {
+        let format_str: String = JString::from(storage_format_obj).extract(env)?;
+        Some(parse_storage_format(&format_str)?)
     };
 
     // Build storage options accessor
@@ -1170,6 +1264,19 @@ fn inner_commit_to_uri<'local>(
     let mut builder = CommitBuilder::new(&*uri_str)
         .with_store_params(store_params)
         .enable_v2_manifest_paths(enable_v2_manifest_paths);
+
+    if let Some(use_stable) = use_stable_row_ids {
+        builder = builder.use_stable_row_ids(use_stable);
+    }
+    if let Some(format) = storage_format {
+        builder = builder.with_storage_format(format);
+    }
+    if max_retries > 0 {
+        builder = builder.with_max_retries(max_retries);
+    }
+    if skip_auto_cleanup {
+        builder = builder.with_skip_auto_cleanup(true);
+    }
 
     // Set namespace commit handler if provided
     let namespace_info = extract_namespace_info(env, &namespace_obj, &table_id_obj)?;

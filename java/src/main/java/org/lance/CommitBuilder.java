@@ -73,6 +73,10 @@ public class CommitBuilder {
   private List<String> tableId;
   private boolean enableV2ManifestPaths = true;
   private boolean detached = false;
+  private Boolean useStableRowIds;
+  private String storageFormat;
+  private int maxRetries = 0;
+  private boolean skipAutoCleanup = false;
 
   /**
    * Create a commit builder for committing against an existing dataset.
@@ -171,6 +175,63 @@ public class CommitBuilder {
   }
 
   /**
+   * Whether to use stable row ids. This makes the {@code _rowid} column stable after compaction,
+   * but not updates.
+   *
+   * <p>This is only used for new datasets. Existing datasets will use their existing setting.
+   * Default is false.
+   *
+   * @param useStableRowIds whether to use stable row ids
+   * @return this builder instance
+   */
+  public CommitBuilder useStableRowIds(boolean useStableRowIds) {
+    this.useStableRowIds = useStableRowIds;
+    return this;
+  }
+
+  /**
+   * Set the storage format to use for the dataset.
+   *
+   * <p>This is only needed when creating a new empty table. If any data files are passed, the
+   * storage format will be inferred from the data files. Valid values: "legacy", "v2_0", "stable",
+   * "v2_1", "next", "v2_2".
+   *
+   * @param storageFormat the storage format name
+   * @return this builder instance
+   */
+  public CommitBuilder storageFormat(String storageFormat) {
+    this.storageFormat = storageFormat;
+    return this;
+  }
+
+  /**
+   * Set the maximum number of retries for commit operations.
+   *
+   * <p>If a commit operation fails, it will be retried up to {@code maxRetries} times. Default is
+   * 0.
+   *
+   * @param maxRetries the maximum number of retries
+   * @return this builder instance
+   */
+  public CommitBuilder maxRetries(int maxRetries) {
+    this.maxRetries = maxRetries;
+    return this;
+  }
+
+  /**
+   * Set whether to skip automatic cleanup after commit.
+   *
+   * <p>Default is false.
+   *
+   * @param skipAutoCleanup if true, skip automatic cleanup
+   * @return this builder instance
+   */
+  public CommitBuilder skipAutoCleanup(boolean skipAutoCleanup) {
+    this.skipAutoCleanup = skipAutoCleanup;
+    return this;
+  }
+
+  /**
    * Execute the commit with the given transaction.
    *
    * <p>The caller is responsible for calling {@link Transaction#release()} after this method
@@ -183,7 +244,15 @@ public class CommitBuilder {
     Preconditions.checkNotNull(transaction, "Transaction must not be null");
     if (dataset != null) {
       return nativeCommitToDataset(
-          dataset, transaction, detached, enableV2ManifestPaths, writeParams);
+          dataset,
+          transaction,
+          detached,
+          enableV2ManifestPaths,
+          writeParams,
+          useStableRowIds,
+          storageFormat,
+          maxRetries,
+          skipAutoCleanup);
     }
     if (uri != null) {
       return nativeCommitToUri(
@@ -194,7 +263,11 @@ public class CommitBuilder {
           namespace,
           tableId,
           allocator,
-          writeParams);
+          writeParams,
+          useStableRowIds,
+          storageFormat,
+          maxRetries,
+          skipAutoCleanup);
     }
     throw new IllegalStateException("CommitBuilder requires either a dataset or a URI");
   }
@@ -204,7 +277,11 @@ public class CommitBuilder {
       Transaction transaction,
       boolean detached,
       boolean enableV2ManifestPaths,
-      Map<String, String> writeParams);
+      Map<String, String> writeParams,
+      Boolean useStableRowIds,
+      String storageFormat,
+      int maxRetries,
+      boolean skipAutoCleanup);
 
   private static native Dataset nativeCommitToUri(
       String uri,
@@ -214,5 +291,9 @@ public class CommitBuilder {
       Object namespace,
       Object tableId,
       Object allocator,
-      Map<String, String> writeParams);
+      Map<String, String> writeParams,
+      Boolean useStableRowIds,
+      String storageFormat,
+      int maxRetries,
+      boolean skipAutoCleanup);
 }
