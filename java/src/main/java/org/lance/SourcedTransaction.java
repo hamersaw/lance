@@ -30,15 +30,15 @@ import java.util.Optional;
  * <p>Example usage:
  *
  * <pre>{@code
- * SourcedTransaction txn = dataset.newSourcedTransactionBuilder()
+ * try (SourcedTransaction txn = dataset.newSourcedTransactionBuilder()
  *     .operation(Append.builder().fragments(fragments).build())
  *     .build();
- * try (Dataset committed = txn.commit()) {
+ *     Dataset committed = txn.commit()) {
  *     // use committed dataset
  * }
  * }</pre>
  */
-public class SourcedTransaction {
+public class SourcedTransaction implements AutoCloseable {
 
   private final Transaction transaction;
   private final Dataset dataset;
@@ -99,8 +99,9 @@ public class SourcedTransaction {
   }
 
   /** Release native resources held by the underlying transaction's operation. */
-  public void release() {
-    transaction.release();
+  @Override
+  public void close() {
+    transaction.close();
   }
 
   /** Builder for constructing {@link SourcedTransaction} instances from a {@link Dataset}. */

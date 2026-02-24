@@ -124,20 +124,18 @@ public class TransactionTest {
       FragmentMetadata fragmentMeta = testDataset.createNewFragment(20);
 
       // Build a transaction targeting a URI (no existing dataset)
-      Transaction txn =
+      try (Transaction txn =
           new Transaction.Builder()
               .operation(
                   Overwrite.builder()
                       .fragments(Collections.singletonList(fragmentMeta))
                       .schema(schema)
                       .build())
-              .build();
-
-      try (Dataset committedDataset = new CommitBuilder(datasetPath, allocator).execute(txn)) {
-        assertEquals(1, committedDataset.version());
-        assertEquals(20, committedDataset.countRows());
-      } finally {
-        txn.release();
+              .build()) {
+        try (Dataset committedDataset = new CommitBuilder(datasetPath, allocator).execute(txn)) {
+          assertEquals(1, committedDataset.version());
+          assertEquals(20, committedDataset.countRows());
+        }
       }
     }
   }

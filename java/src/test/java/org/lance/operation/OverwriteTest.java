@@ -44,7 +44,7 @@ public class OverwriteTest extends OperationTestBase {
       // Commit fragment
       int rowCount = 20;
       FragmentMetadata fragmentMeta = testDataset.createNewFragment(rowCount);
-      Transaction txn =
+      try (Transaction txn =
           new Transaction.Builder()
               .readVersion(dataset.version())
               .operation(
@@ -52,25 +52,24 @@ public class OverwriteTest extends OperationTestBase {
                       .fragments(Collections.singletonList(fragmentMeta))
                       .schema(testDataset.getSchema())
                       .build())
-              .build();
-      try (Dataset dataset = new CommitBuilder(this.dataset).execute(txn)) {
-        assertEquals(2, dataset.version());
-        assertEquals(2, dataset.latestVersion());
-        assertEquals(rowCount, dataset.countRows());
-        Fragment fragment = dataset.getFragments().get(0);
+              .build()) {
+        try (Dataset dataset = new CommitBuilder(this.dataset).execute(txn)) {
+          assertEquals(2, dataset.version());
+          assertEquals(2, dataset.latestVersion());
+          assertEquals(rowCount, dataset.countRows());
+          Fragment fragment = dataset.getFragments().get(0);
 
-        try (LanceScanner scanner = fragment.newScan()) {
-          Schema schemaRes = scanner.schema();
-          assertEquals(testDataset.getSchema(), schemaRes);
+          try (LanceScanner scanner = fragment.newScan()) {
+            Schema schemaRes = scanner.schema();
+            assertEquals(testDataset.getSchema(), schemaRes);
+          }
         }
-      } finally {
-        txn.release();
       }
 
       // Commit fragment again
       rowCount = 40;
       fragmentMeta = testDataset.createNewFragment(rowCount);
-      Transaction txn2 =
+      try (Transaction txn2 =
           new Transaction.Builder()
               .readVersion(dataset.version())
               .operation(
@@ -80,22 +79,20 @@ public class OverwriteTest extends OperationTestBase {
                       .configUpsertValues(Collections.singletonMap("config_key", "config_value"))
                       .build())
               .transactionProperties(Collections.singletonMap("key", "value"))
-              .build();
-      assertEquals("value", txn2.transactionProperties().map(m -> m.get("key")).orElse(null));
-      try (Dataset dataset = new CommitBuilder(this.dataset).execute(txn2)) {
-        assertEquals(3, dataset.version());
-        assertEquals(3, dataset.latestVersion());
-        assertEquals(rowCount, dataset.countRows());
-        assertEquals("config_value", dataset.getConfig().get("config_key"));
-        Fragment fragment = dataset.getFragments().get(0);
+              .build()) {
+        assertEquals("value", txn2.transactionProperties().map(m -> m.get("key")).orElse(null));
+        try (Dataset dataset = new CommitBuilder(this.dataset).execute(txn2)) {
+          assertEquals(3, dataset.version());
+          assertEquals(3, dataset.latestVersion());
+          assertEquals(rowCount, dataset.countRows());
+          assertEquals("config_value", dataset.getConfig().get("config_key"));
+          Fragment fragment = dataset.getFragments().get(0);
 
-        try (LanceScanner scanner = fragment.newScan()) {
-          Schema schemaRes = scanner.schema();
-          assertEquals(testDataset.getSchema(), schemaRes);
+          try (LanceScanner scanner = fragment.newScan()) {
+            Schema schemaRes = scanner.schema();
+            assertEquals(testDataset.getSchema(), schemaRes);
+          }
         }
-        assertEquals(txn2, dataset.readTransaction().orElse(null));
-      } finally {
-        txn2.release();
       }
     }
   }

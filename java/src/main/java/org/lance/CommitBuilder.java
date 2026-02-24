@@ -34,27 +34,23 @@ import java.util.Map;
  * <p>Example usage (dataset-based):
  *
  * <pre>{@code
- * Transaction txn = new Transaction.Builder()
+ * try (Transaction txn = new Transaction.Builder()
  *     .readVersion(dataset.version())
  *     .operation(Append.builder().fragments(fragments).build())
  *     .build();
- * try (Dataset committed = new CommitBuilder(dataset).execute(txn)) {
+ *     Dataset committed = new CommitBuilder(dataset).execute(txn)) {
  *     // use committed dataset
- * } finally {
- *     txn.release();
  * }
  * }</pre>
  *
  * <p>Example usage (URI-based):
  *
  * <pre>{@code
- * Transaction txn = new Transaction.Builder()
+ * try (Transaction txn = new Transaction.Builder()
  *     .operation(Overwrite.builder().fragments(fragments).schema(schema).build())
  *     .build();
- * try (Dataset committed = new CommitBuilder(uri, allocator).execute(txn)) {
+ *     Dataset committed = new CommitBuilder(uri, allocator).execute(txn)) {
  *     // use committed dataset
- * } finally {
- *     txn.release();
  * }
  * }</pre>
  */
@@ -234,8 +230,8 @@ public class CommitBuilder {
   /**
    * Execute the commit with the given transaction.
    *
-   * <p>The caller is responsible for calling {@link Transaction#release()} after this method
-   * returns.
+   * <p>The caller is responsible for closing the transaction (via try-with-resources or {@link
+   * Transaction#close()}) to release any native resources held by the operation.
    *
    * @param transaction the transaction to commit
    * @return a new Dataset at the committed version

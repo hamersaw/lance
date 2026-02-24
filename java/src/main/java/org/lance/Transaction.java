@@ -31,7 +31,7 @@ import java.util.UUID;
  *
  * <p>To commit a transaction, use {@link CommitBuilder} or {@link SourcedTransaction}.
  */
-public class Transaction {
+public class Transaction implements AutoCloseable {
 
   private final long readVersion;
   private final String uuid;
@@ -93,8 +93,9 @@ public class Transaction {
     return transactionProperties;
   }
 
-  /** Release native resources held by the operation. */
-  public void release() {
+  /** Release native resources held by the operation (e.g. Arrow C schemas). */
+  @Override
+  public void close() {
     operation.release();
   }
 

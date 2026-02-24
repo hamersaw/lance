@@ -553,21 +553,17 @@ public class Dataset implements Closeable {
   public Dataset commitTransaction(
       Transaction transaction, boolean detached, boolean enableV2ManifestPaths) {
     Preconditions.checkNotNull(transaction);
-    try {
-      Dataset dataset =
-          new CommitBuilder(this)
-              .detached(detached)
-              .enableV2ManifestPaths(enableV2ManifestPaths)
-              .execute(transaction);
-      if (selfManagedAllocator) {
-        dataset.allocator = new RootAllocator(Long.MAX_VALUE);
-      } else {
-        dataset.allocator = allocator;
-      }
-      return dataset;
-    } finally {
-      transaction.release();
+    Dataset dataset =
+        new CommitBuilder(this)
+            .detached(detached)
+            .enableV2ManifestPaths(enableV2ManifestPaths)
+            .execute(transaction);
+    if (selfManagedAllocator) {
+      dataset.allocator = new RootAllocator(Long.MAX_VALUE);
+    } else {
+      dataset.allocator = allocator;
     }
+    return dataset;
   }
 
   /**

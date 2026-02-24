@@ -54,15 +54,12 @@ public class OperationTestBase {
     dataset = suite.createEmptyDataset();
     FragmentMetadata fragmentMeta = suite.createNewFragment(rowCount);
 
-    Transaction txn =
+    try (Transaction txn =
         new Transaction.Builder()
             .readVersion(dataset.version())
             .operation(Append.builder().fragments(Collections.singletonList(fragmentMeta)).build())
-            .build();
-    try {
+            .build()) {
       return new CommitBuilder(dataset).execute(txn);
-    } finally {
-      txn.release();
     }
   }
 

@@ -279,7 +279,6 @@ public class FragmentTest {
 
       // Commit fragment
       FragmentOperation.Append appendOp = new FragmentOperation.Append(Arrays.asList(fragmentMeta));
-      SourcedTransaction transaction;
       try (Dataset dataset = Dataset.commit(allocator, datasetPath, appendOp, Optional.of(1L))) {
         assertEquals(2, dataset.version());
         assertEquals(2, dataset.latestVersion());
@@ -293,43 +292,40 @@ public class FragmentTest {
 
         FragmentMergeResult mergeResult = testDataset.mergeColumn(fragment, 10);
 
-        SourcedTransaction.Builder builder = new SourcedTransaction.Builder(dataset);
-        transaction =
-            builder
+        try (SourcedTransaction transaction =
+            new SourcedTransaction.Builder(dataset)
                 .operation(
                     Merge.builder()
                         .fragments(Collections.singletonList(mergeResult.getFragmentMetadata()))
                         .schema(mergeResult.getSchema().asArrowSchema())
                         .build())
                 .readVersion(dataset.version())
-                .build();
+                .build()) {
+          try (Dataset newDs = transaction.commit()) {
+            assertEquals(3, newDs.version());
+            assertEquals(3, newDs.latestVersion());
+            Fragment newFrag = newDs.getFragments().get(0);
+            try (LanceScanner scanner = newFrag.newScan()) {
+              Schema schemaRes = scanner.schema();
+              assertTrue(
+                  schemaRes.getFields().stream()
+                      .anyMatch(field -> field.getName().equals("new_col1")));
+              assertTrue(
+                  schemaRes.getFields().stream()
+                      .anyMatch(field -> field.getName().equals("new_col2")));
 
-        assertNotNull(transaction);
+              try (ArrowReader reader = scanner.scanBatches()) {
+                assertTrue(reader.loadNextBatch());
+                VectorSchemaRoot root = reader.getVectorSchemaRoot();
+                VarCharVector newCol1Vec = (VarCharVector) root.getVector("new_col1");
+                VarCharVector newCol2Vec = (VarCharVector) root.getVector("new_col2");
+                assertEquals(21, newCol2Vec.getValueCount());
 
-        try (Dataset newDs = transaction.commit()) {
-          assertEquals(3, newDs.version());
-          assertEquals(3, newDs.latestVersion());
-          Fragment newFrag = newDs.getFragments().get(0);
-          try (LanceScanner scanner = newFrag.newScan()) {
-            Schema schemaRes = scanner.schema();
-            assertTrue(
-                schemaRes.getFields().stream()
-                    .anyMatch(field -> field.getName().equals("new_col1")));
-            assertTrue(
-                schemaRes.getFields().stream()
-                    .anyMatch(field -> field.getName().equals("new_col2")));
-
-            try (ArrowReader reader = scanner.scanBatches()) {
-              assertTrue(reader.loadNextBatch());
-              VectorSchemaRoot root = reader.getVectorSchemaRoot();
-              VarCharVector newCol1Vec = (VarCharVector) root.getVector("new_col1");
-              VarCharVector newCol2Vec = (VarCharVector) root.getVector("new_col2");
-              assertEquals(21, newCol2Vec.getValueCount());
-
-              // The first 10 rows are not null
-              assertNotNull(newCol1Vec.get(9));
-              // Remaining rows are null
-              assertNull(newCol1Vec.get(10));
+                // The first 10 rows are not null
+                assertNotNull(newCol1Vec.get(9));
+                // Remaining rows are null
+                assertNull(newCol1Vec.get(10));
+              }
             }
           }
         }

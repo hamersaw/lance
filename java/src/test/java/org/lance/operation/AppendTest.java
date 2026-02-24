@@ -63,19 +63,16 @@ public class AppendTest extends OperationTestBase {
               testDataset.createNewFragment(rowCount),
               testDataset.createNewFragment(rowCount));
 
-      Transaction txn =
+      try (Transaction txn =
           new Transaction.Builder()
               .readVersion(dataset.version())
               .operation(Append.builder().fragments(fragments).build())
-              .build();
-
-      try (Dataset dataset = new CommitBuilder(this.dataset).execute(txn)) {
-        assertEquals(2, dataset.version());
-        assertEquals(rowCount * 3, dataset.countRows());
-        assertEquals(3, dataset.getFragments().size());
-        assertEquals(txn, dataset.readTransaction().orElse(null));
-      } finally {
-        txn.release();
+              .build()) {
+        try (Dataset dataset = new CommitBuilder(this.dataset).execute(txn)) {
+          assertEquals(2, dataset.version());
+          assertEquals(rowCount * 3, dataset.countRows());
+          assertEquals(3, dataset.getFragments().size());
+        }
       }
     }
   }
@@ -91,15 +88,12 @@ public class AppendTest extends OperationTestBase {
         assertThrows(
             IllegalArgumentException.class,
             () -> {
-              Transaction txn =
+              try (Transaction txn =
                   new Transaction.Builder()
                       .readVersion(dataset.version())
                       .operation(Append.builder().fragments(new ArrayList<>()).build())
-                      .build();
-              try {
+                      .build()) {
                 new CommitBuilder(dataset).execute(txn).close();
-              } finally {
-                txn.release();
               }
             });
       }

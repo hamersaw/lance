@@ -41,15 +41,15 @@ public class TruncateTest extends OperationTestBase {
       // Append some data
       int rowCount = 20;
       FragmentMetadata fragmentMeta = testDataset.createNewFragment(rowCount);
-      Transaction txn =
-          new Transaction.Builder()
-              .readVersion(dataset.version())
-              .operation(
-                  Append.builder()
-                      .fragments(java.util.Collections.singletonList(fragmentMeta))
-                      .build())
-              .build();
-      try (Dataset ds1 = new CommitBuilder(dataset).execute(txn)) {
+      try (Transaction txn =
+              new Transaction.Builder()
+                  .readVersion(dataset.version())
+                  .operation(
+                      Append.builder()
+                          .fragments(java.util.Collections.singletonList(fragmentMeta))
+                          .build())
+                  .build();
+          Dataset ds1 = new CommitBuilder(dataset).execute(txn)) {
         assertEquals(rowCount, ds1.countRows());
 
         // Truncate to empty while preserving schema
@@ -60,8 +60,6 @@ public class TruncateTest extends OperationTestBase {
           Schema schemaRes = scanner.schema();
           assertEquals(testDataset.getSchema(), schemaRes);
         }
-      } finally {
-        txn.release();
       }
     }
   }
