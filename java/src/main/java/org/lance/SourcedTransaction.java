@@ -30,7 +30,7 @@ import java.util.Optional;
  * <p>Example usage:
  *
  * <pre>{@code
- * try (SourcedTransaction txn = dataset.newSourcedTransactionBuilder()
+ * try (SourcedTransaction txn = dataset.newTransactionBuilder()
  *     .operation(Append.builder().fragments(fragments).build())
  *     .build();
  *     Dataset committed = txn.commit()) {

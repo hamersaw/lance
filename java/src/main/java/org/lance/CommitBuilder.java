@@ -259,6 +259,7 @@ public class CommitBuilder {
           nativeCommitToUri(
               uri,
               transaction,
+              detached,
               enableV2ManifestPaths,
               storageOptionsProvider,
               namespace,
@@ -289,6 +290,7 @@ public class CommitBuilder {
   private static native Dataset nativeCommitToUri(
       String uri,
       Transaction transaction,
+      boolean detached,
       boolean enableV2ManifestPaths,
       Object storageOptionsProvider,
       Object namespace,

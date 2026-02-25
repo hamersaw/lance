@@ -799,10 +799,12 @@ fn convert_schema_from_operation(
     let c_schema_ptr = schema_ptr as *mut FFI_ArrowSchema;
     let c_schema = unsafe { FFI_ArrowSchema::from_raw(c_schema_ptr) };
     let schema = Schema::try_from(&c_schema)?;
-    Ok(
-        LanceSchema::try_from(&schema)
-            .expect("Failed to convert from arrow schema to lance schema"),
-    )
+    LanceSchema::try_from(&schema).map_err(|e| {
+        Error::input_error(format!(
+            "Failed to convert Arrow schema to Lance schema: {}",
+            e
+        ))
+    })
 }
 
 fn convert_to_rust_operation(
@@ -813,7 +815,15 @@ fn convert_to_rust_operation(
     let op_name = env.get_string_from_method(java_operation, "name")?;
     let op = match op_name.as_str() {
         "Project" => Operation::Project {
-            schema: convert_schema_from_operation(env, java_operation, allocator.unwrap())?,
+            schema: convert_schema_from_operation(
+                env,
+                java_operation,
+                allocator.ok_or_else(|| {
+                    Error::input_error(
+                        "BufferAllocator is required for Project operations".to_string(),
+                    )
+                })?,
+            )?,
         },
         "UpdateConfig" => {
             let config_updates_obj = env
@@ -934,7 +944,15 @@ fn convert_to_rust_operation(
                     to_rust_map(env, &config_upsert_values)
                 },
             )?;
-            let schema = convert_schema_from_operation(env, java_operation, allocator.unwrap())?;
+            let schema = convert_schema_from_operation(
+                env,
+                java_operation,
+                allocator.ok_or_else(|| {
+                    Error::input_error(
+                        "BufferAllocator is required for Overwrite operations".to_string(),
+                    )
+                })?,
+            )?;
             Operation::Overwrite {
                 fragments,
                 schema,
@@ -1028,7 +1046,15 @@ fn convert_to_rust_operation(
                 })?;
             Operation::Merge {
                 fragments,
-                schema: convert_schema_from_operation(env, java_operation, allocator.unwrap())?,
+                schema: convert_schema_from_operation(
+                    env,
+                    java_operation,
+                    allocator.ok_or_else(|| {
+                        Error::input_error(
+                            "BufferAllocator is required for Merge operations".to_string(),
+                        )
+                    })?,
+                )?,
             }
         }
         "Restore" => {
@@ -1150,6 +1176,7 @@ pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToUri<'local>(
     _cls: JObject,
     uri: JString,
     java_transaction: JObject,
+    detached_jbool: jboolean,
     enable_v2_manifest_paths: jboolean,
     storage_options_provider_obj: JObject,
     namespace_obj: JObject,
@@ -1167,6 +1194,7 @@ pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToUri<'local>(
             &mut env,
             uri,
             java_transaction,
+            detached_jbool != 0,
             enable_v2_manifest_paths != 0,
             storage_options_provider_obj,
             namespace_obj,
@@ -1186,6 +1214,7 @@ fn inner_commit_to_uri<'local>(
     env: &mut JNIEnv<'local>,
     uri: JString,
     java_transaction: JObject,
+    detached: bool,
     enable_v2_manifest_paths: bool,
     storage_options_provider_obj: JObject,
     namespace_obj: JObject,
@@ -1263,6 +1292,7 @@ fn inner_commit_to_uri<'local>(
     // Build CommitBuilder with URI
     let mut builder = CommitBuilder::new(&*uri_str)
         .with_store_params(store_params)
+        .with_detached(detached)
         .enable_v2_manifest_paths(enable_v2_manifest_paths);
 
     if let Some(use_stable) = use_stable_row_ids {
