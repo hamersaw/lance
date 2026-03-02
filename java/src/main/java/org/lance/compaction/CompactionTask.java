@@ -53,7 +53,10 @@ public class CompactionTask implements Serializable {
         compactionOptions.getMaterializeDeletionsThreshold(),
         compactionOptions.getNumThreads(),
         compactionOptions.getBatchSize(),
-        compactionOptions.getDeferIndexRemap());
+        compactionOptions.getDeferIndexRemap(),
+        compactionOptions.getEnableBinaryCopy(),
+        compactionOptions.getEnableBinaryCopyForce(),
+        compactionOptions.getBinaryCopyReadBatchBytes());
   }
 
   private native RewriteResult nativeExecute(
@@ -67,7 +70,10 @@ public class CompactionTask implements Serializable {
       Optional<Float> materializeDeletionsThreshold,
       Optional<Long> numThreads,
       Optional<Long> batchSize,
-      Optional<Boolean> deferIndexRemap);
+      Optional<Boolean> deferIndexRemap,
+      Optional<Boolean> enableBinaryCopy,
+      Optional<Boolean> enableBinaryCopyForce,
+      Optional<Long> binaryCopyReadBatchBytes);
 
   public CompactionOptions getCompactionOptions() {
     return compactionOptions;

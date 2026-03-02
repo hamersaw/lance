@@ -59,3 +59,21 @@ class CompactionOptions(TypedDict):
 
     The default will use the same default from ``scanner``.
     """
+    enable_binary_copy: Optional[bool]
+    """
+    Whether to enable binary copy optimization during compaction. When
+    enabled, compaction will skip re-encoding data and directly copy
+    binary data for faster compaction times. (default: False)
+    """
+    enable_binary_copy_force: Optional[bool]
+    """
+    Whether to force binary copy optimization. If true, compaction will
+    fail if binary copy is not supported for the given fragments.
+    (default: False)
+    """
+    binary_copy_read_batch_bytes: Optional[int]
+    """
+    The batch size in bytes for reading during binary copy operations.
+    Controls how much data is read at once when performing binary copy.
+    (default: 16MB)
+    """

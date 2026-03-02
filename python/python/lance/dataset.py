@@ -5297,6 +5297,9 @@ class DatasetOptimizer:
         materialize_deletions_threshold: float = 0.1,
         num_threads: Optional[int] = None,
         batch_size: Optional[int] = None,
+        enable_binary_copy: bool = False,
+        enable_binary_copy_force: bool = False,
+        binary_copy_read_batch_bytes: Optional[int] = None,
     ) -> CompactionMetrics:
         """Compacts small files in the dataset, reducing total number of files.
 
@@ -5344,6 +5347,18 @@ class DatasetOptimizer:
             to reduce this if you are running out of memory during compaction.
 
             The default will use the same default from ``scanner``.
+        enable_binary_copy: bool, default False
+            Whether to enable binary copy optimization during compaction. When
+            enabled, compaction will skip re-encoding data and directly copy
+            binary data for faster compaction times.
+        enable_binary_copy_force: bool, default False
+            Whether to force binary copy optimization. If true, compaction will
+            fail if binary copy is not supported for the given fragments.
+        binary_copy_read_batch_bytes: int, optional
+            The batch size in bytes for reading during binary copy operations.
+            Controls how much data is read at once when performing binary copy.
+            Defaults to 16MB.
+
         Returns
         -------
         CompactionMetrics
@@ -5361,6 +5376,9 @@ class DatasetOptimizer:
             materialize_deletions_threshold=materialize_deletions_threshold,
             num_threads=num_threads,
             batch_size=batch_size,
+            enable_binary_copy=enable_binary_copy,
+            enable_binary_copy_force=enable_binary_copy_force,
+            binary_copy_read_batch_bytes=binary_copy_read_batch_bytes,
         )
         return Compaction.execute(self._dataset, opts)
 

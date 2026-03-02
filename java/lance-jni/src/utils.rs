@@ -139,6 +139,9 @@ pub fn build_compaction_options(
     num_threads: &JObject,                     // Optional<Long>
     batch_size: &JObject,                      // Optional<Long>
     defer_index_remap: &JObject,               // Optional<Boolean>
+    enable_binary_copy: &JObject,              // Optional<Boolean>
+    enable_binary_copy_force: &JObject,        // Optional<Boolean>
+    binary_copy_read_batch_bytes: &JObject,    // Optional<Long>
 ) -> Result<CompactionOptions> {
     let mut compaction_options = CompactionOptions::default();
 
@@ -167,6 +170,18 @@ pub fn build_compaction_options(
     }
     if let Some(defer_index_remap_val) = env.get_boolean_opt(defer_index_remap)? {
         compaction_options.defer_index_remap = defer_index_remap_val;
+    }
+    if let Some(enable_binary_copy_val) = env.get_boolean_opt(enable_binary_copy)? {
+        compaction_options.enable_binary_copy = enable_binary_copy_val;
+    }
+    if let Some(enable_binary_copy_force_val) = env.get_boolean_opt(enable_binary_copy_force)? {
+        compaction_options.enable_binary_copy_force = enable_binary_copy_force_val;
+    }
+    if let Some(binary_copy_read_batch_bytes_val) =
+        env.get_long_opt(binary_copy_read_batch_bytes)?
+    {
+        compaction_options.binary_copy_read_batch_bytes =
+            Some(binary_copy_read_batch_bytes_val as usize);
     }
 
     Ok(compaction_options)

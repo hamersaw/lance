@@ -2611,6 +2611,30 @@ fn convert_java_compaction_options_to_rust(
             &[],
         )?
         .l()?;
+    let enable_binary_copy = env
+        .call_method(
+            &java_options,
+            "getEnableBinaryCopy",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
+        .l()?;
+    let enable_binary_copy_force = env
+        .call_method(
+            &java_options,
+            "getEnableBinaryCopyForce",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
+        .l()?;
+    let binary_copy_read_batch_bytes = env
+        .call_method(
+            &java_options,
+            "getBinaryCopyReadBatchBytes",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
+        .l()?;
 
     build_compaction_options(
         env,
@@ -2622,6 +2646,9 @@ fn convert_java_compaction_options_to_rust(
         &num_threads,
         &batch_size,
         &defer_index_remap,
+        &enable_binary_copy,
+        &enable_binary_copy_force,
+        &binary_copy_read_batch_bytes,
     )
 }
 

@@ -51,6 +51,15 @@ fn parse_compaction_options(options: &Bound<'_, PyDict>) -> PyResult<CompactionO
             "batch_size" => {
                 opts.batch_size = value.extract()?;
             }
+            "enable_binary_copy" => {
+                opts.enable_binary_copy = value.extract()?;
+            }
+            "enable_binary_copy_force" => {
+                opts.enable_binary_copy_force = value.extract()?;
+            }
+            "binary_copy_read_batch_bytes" => {
+                opts.binary_copy_read_batch_bytes = value.extract()?;
+            }
             _ => {
                 return Err(PyValueError::new_err(format!(
                     "Invalid compaction option: {}",
