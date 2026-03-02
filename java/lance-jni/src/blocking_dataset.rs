@@ -132,6 +132,10 @@ impl BlockingDataset {
         Ok(Self { inner })
     }
 
+    pub fn new(dataset: Dataset) -> Self {
+        Self { inner: dataset }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn open(
         uri: &str,
@@ -986,6 +990,23 @@ fn inner_create_index<'local>(
     (&index_metadata).into_java(env)
 }
 
+#[no_mangle]
+pub extern "system" fn Java_org_lance_Dataset_nativeDropIndex(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+    name: JString,
+) {
+    ok_or_throw_without_return!(env, inner_drop_index(&mut env, java_dataset, name))
+}
+
+fn inner_drop_index(env: &mut JNIEnv, java_dataset: JObject, name: JString) -> Result<()> {
+    let name = name.extract(env)?;
+    let mut dataset_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+    RT.block_on(dataset_guard.inner.drop_index(&name))?;
+    Ok(())
+}
+
 fn should_skip_commit(index_type: IndexType, params_opt: &Option<String>) -> Result<bool> {
     match index_type {
         IndexType::BTree => {
@@ -1746,6 +1767,38 @@ fn inner_get_config<'local>(
     }
 
     Ok(java_hashmap)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_Dataset_nativeGetLanceFileFormatVersion<'local>(
+    mut env: JNIEnv<'local>,
+    java_dataset: JObject,
+) -> JString<'local> {
+    ok_or_throw_with_return!(
+        env,
+        inner_get_lance_file_format_version(&mut env, java_dataset),
+        JObject::null().into()
+    )
+}
+
+fn inner_get_lance_file_format_version<'local>(
+    env: &mut JNIEnv<'local>,
+    java_dataset: JObject,
+) -> Result<JString<'local>> {
+    let version_string = {
+        let dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+        let version = dataset_guard
+            .inner
+            .manifest()
+            .data_storage_format
+            .lance_file_version()?;
+        version.to_string()
+    };
+
+    Ok(env
+        .new_string(&version_string)
+        .expect("Failed to create Java String"))
 }
 
 #[no_mangle]
