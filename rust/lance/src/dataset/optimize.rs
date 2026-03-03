@@ -136,13 +136,10 @@ impl TryFrom<&str> for CompactionMode {
             "reencode" => Ok(Self::Reencode),
             "try_binary_copy" => Ok(Self::TryBinaryCopy),
             "force_binary_copy" => Ok(Self::ForceBinaryCopy),
-            _ => Err(Error::invalid_input(
-                format!(
-                    "Invalid compaction mode \"{}\". Valid values: \"reencode\", \"try_binary_copy\", \"force_binary_copy\"",
-                    value
-                ),
-                location!(),
-            )),
+            _ => Err(Error::invalid_input(format!(
+                "Invalid compaction mode \"{}\". Valid values: \"reencode\", \"try_binary_copy\", \"force_binary_copy\"",
+                value
+            ))),
         }
     }
 }
