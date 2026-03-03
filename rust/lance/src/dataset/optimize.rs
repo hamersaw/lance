@@ -119,7 +119,7 @@ use binary_copy::rewrite_files_binary_copy;
 pub use remapping::{IgnoreRemap, IndexRemapper, IndexRemapperOptions, RemappedIndex};
 
 /// Controls how data is rewritten during compaction.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum CompactionMode {
     /// Decode and re-encode data (default).
     Reencode,
@@ -240,8 +240,8 @@ impl CompactionOptions {
     /// `compaction_mode` field and falling back to the deprecated boolean
     /// fields for backwards compatibility.
     pub fn compaction_mode(&self) -> CompactionMode {
-        if let Some(mode) = &self.compaction_mode {
-            return mode.clone();
+        if let Some(mode) = self.compaction_mode {
+            return mode;
         }
         // Fall back to deprecated booleans
         match (self.enable_binary_copy, self.enable_binary_copy_force) {
