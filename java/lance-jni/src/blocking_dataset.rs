@@ -2611,18 +2611,10 @@ fn convert_java_compaction_options_to_rust(
             &[],
         )?
         .l()?;
-    let enable_binary_copy = env
+    let compaction_mode = env
         .call_method(
             &java_options,
-            "getEnableBinaryCopy",
-            "()Ljava/util/Optional;",
-            &[],
-        )?
-        .l()?;
-    let enable_binary_copy_force = env
-        .call_method(
-            &java_options,
-            "getEnableBinaryCopyForce",
+            "getCompactionMode",
             "()Ljava/util/Optional;",
             &[],
         )?
@@ -2646,8 +2638,7 @@ fn convert_java_compaction_options_to_rust(
         &num_threads,
         &batch_size,
         &defer_index_remap,
-        &enable_binary_copy,
-        &enable_binary_copy_force,
+        &compaction_mode,
         &binary_copy_read_batch_bytes,
     )
 }

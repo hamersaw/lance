@@ -11,8 +11,8 @@ use jni::{
 use lance::dataset::{
     index::DatasetIndexRemapperOptions,
     optimize::{
-        commit_compaction, plan_compaction, CompactionMetrics, CompactionOptions, CompactionPlan,
-        CompactionTask, IndexRemapperOptions, RewriteResult, TaskData,
+        commit_compaction, plan_compaction, CompactionMetrics, CompactionMode, CompactionOptions,
+        CompactionPlan, CompactionTask, IndexRemapperOptions, RewriteResult, TaskData,
     },
 };
 
@@ -43,8 +43,7 @@ pub extern "system" fn Java_org_lance_compaction_Compaction_nativePlanCompaction
     num_threads: JObject,                     // Optional<Long>
     batch_size: JObject,                      // Optional<Long>
     defer_index_remap: JObject,               // Optional<Boolean>
-    enable_binary_copy: JObject,              // Optional<Boolean>
-    enable_binary_copy_force: JObject,        // Optional<Boolean>
+    compaction_mode: JObject,                 // Optional<String>
     binary_copy_read_batch_bytes: JObject,    // Optional<Long>
 ) -> JObject<'local> {
     ok_or_throw_with_return!(
@@ -60,8 +59,7 @@ pub extern "system" fn Java_org_lance_compaction_Compaction_nativePlanCompaction
             num_threads,
             batch_size,
             defer_index_remap,
-            enable_binary_copy,
-            enable_binary_copy_force,
+            compaction_mode,
             binary_copy_read_batch_bytes
         ),
         JObject::null()
@@ -80,8 +78,7 @@ fn inner_plan_compaction<'local>(
     num_threads: JObject,                     // Optional<Long>
     batch_size: JObject,                      // Optional<Long>
     defer_index_remap: JObject,               // Optional<Boolean>
-    enable_binary_copy: JObject,              // Optional<Boolean>
-    enable_binary_copy_force: JObject,        // Optional<Boolean>
+    compaction_mode: JObject,                 // Optional<String>
     binary_copy_read_batch_bytes: JObject,    // Optional<Long>
 ) -> Result<JObject<'local>> {
     let compaction_options = build_compaction_options(
@@ -94,8 +91,7 @@ fn inner_plan_compaction<'local>(
         &num_threads,
         &batch_size,
         &defer_index_remap,
-        &enable_binary_copy,
-        &enable_binary_copy_force,
+        &compaction_mode,
         &binary_copy_read_batch_bytes,
     )?;
 
@@ -121,8 +117,7 @@ pub extern "system" fn Java_org_lance_compaction_Compaction_nativeCommitCompacti
     num_threads: JObject,                     // Optional<Long>
     batch_size: JObject,                      // Optional<Long>
     defer_index_remap: JObject,               // Optional<Boolean>
-    enable_binary_copy: JObject,              // Optional<Boolean>
-    enable_binary_copy_force: JObject,        // Optional<Boolean>
+    compaction_mode: JObject,                 // Optional<String>
     binary_copy_read_batch_bytes: JObject,    // Optional<Long>
 ) -> JObject<'local> {
     ok_or_throw_with_return!(
@@ -139,8 +134,7 @@ pub extern "system" fn Java_org_lance_compaction_Compaction_nativeCommitCompacti
             num_threads,
             batch_size,
             defer_index_remap,
-            enable_binary_copy,
-            enable_binary_copy_force,
+            compaction_mode,
             binary_copy_read_batch_bytes,
         ),
         JObject::null()
@@ -160,8 +154,7 @@ fn inner_commit_compaction<'local>(
     num_threads: JObject,                     // Optional<Long>
     batch_size: JObject,                      // Optional<Long>
     defer_index_remap: JObject,               // Optional<Boolean>
-    enable_binary_copy: JObject,              // Optional<Boolean>
-    enable_binary_copy_force: JObject,        // Optional<Boolean>
+    compaction_mode: JObject,                 // Optional<String>
     binary_copy_read_batch_bytes: JObject,    // Optional<Long>
 ) -> Result<JObject<'local>> {
     let compaction_options = build_compaction_options(
@@ -174,8 +167,7 @@ fn inner_commit_compaction<'local>(
         &num_threads,
         &batch_size,
         &defer_index_remap,
-        &enable_binary_copy,
-        &enable_binary_copy_force,
+        &compaction_mode,
         &binary_copy_read_batch_bytes,
     )?;
     let completed_tasks = import_vec_to_rust(env, &rewrite_results, |env, rewrite_result| {
@@ -210,8 +202,7 @@ pub extern "system" fn Java_org_lance_compaction_CompactionTask_nativeExecute<'l
     num_threads: JObject,                     // Optional<Long>
     batch_size: JObject,                      // Optional<Long>
     defer_index_remap: JObject,               // Optional<Boolean>
-    enable_binary_copy: JObject,              // Optional<Boolean>
-    enable_binary_copy_force: JObject,        // Optional<Boolean>
+    compaction_mode: JObject,                 // Optional<String>
     binary_copy_read_batch_bytes: JObject,    // Optional<Long>
 ) -> JObject<'local> {
     ok_or_throw_with_return!(
@@ -229,8 +220,7 @@ pub extern "system" fn Java_org_lance_compaction_CompactionTask_nativeExecute<'l
             num_threads,
             batch_size,
             defer_index_remap,
-            enable_binary_copy,
-            enable_binary_copy_force,
+            compaction_mode,
             binary_copy_read_batch_bytes
         ),
         JObject::null()
@@ -251,8 +241,7 @@ fn inner_execute_task<'local>(
     num_threads: JObject,                     // Optional<Long>
     batch_size: JObject,                      // Optional<Long>
     defer_index_remap: JObject,               // Optional<Boolean>
-    enable_binary_copy: JObject,              // Optional<Boolean>
-    enable_binary_copy_force: JObject,        // Optional<Boolean>
+    compaction_mode: JObject,                 // Optional<String>
     binary_copy_read_batch_bytes: JObject,    // Optional<Long>
 ) -> Result<JObject<'local>> {
     let task_data: TaskData = task_data.extract_object(env)?;
@@ -266,8 +255,7 @@ fn inner_execute_task<'local>(
         &num_threads,
         &batch_size,
         &defer_index_remap,
-        &enable_binary_copy,
-        &enable_binary_copy_force,
+        &compaction_mode,
         &binary_copy_read_batch_bytes,
     )?;
     let compaction_task = CompactionTask {
@@ -295,7 +283,7 @@ const REWRITE_RESULT_CONSTRUCTOR_SIG: &str =
     "(Lorg/lance/compaction/CompactionMetrics;Ljava/util/List;Ljava/util/List;JLjava/util/Map;[B)V";
 const COMPACTION_OPTIONS_CLASS: &str = "org/lance/compaction/CompactionOptions";
 const COMPACTION_OPTIONS_CONSTRUCTOR_SIG: &str =
-    "(Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;)V";
+    "(Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;)V";
 
 impl IntoJava for &TaskData {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
@@ -344,11 +332,16 @@ impl IntoJava for &CompactionOptions {
         let batch_size_opt = to_java_optional(env, batch_size)?;
         let defer_index_remap = to_java_boolean_obj(env, Some(self.defer_index_remap))?;
         let defer_index_remap_opt = to_java_optional(env, defer_index_remap)?;
-        let enable_binary_copy = to_java_boolean_obj(env, Some(self.enable_binary_copy))?;
-        let enable_binary_copy_opt = to_java_optional(env, enable_binary_copy)?;
-        let enable_binary_copy_force =
-            to_java_boolean_obj(env, Some(self.enable_binary_copy_force))?;
-        let enable_binary_copy_force_opt = to_java_optional(env, enable_binary_copy_force)?;
+        let compaction_mode_str = self.compaction_mode.as_ref().map(|mode| match mode {
+            CompactionMode::Reencode => "reencode",
+            CompactionMode::TryBinaryCopy => "try_binary_copy",
+            CompactionMode::ForceBinaryCopy => "force_binary_copy",
+        });
+        let compaction_mode_obj = match compaction_mode_str {
+            Some(s) => env.new_string(s)?.into(),
+            None => JObject::null(),
+        };
+        let compaction_mode_opt = to_java_optional(env, compaction_mode_obj)?;
         let binary_copy_read_batch_bytes =
             to_java_long_obj(env, self.binary_copy_read_batch_bytes.map(|v| v as i64))?;
         let binary_copy_read_batch_bytes_opt = to_java_optional(env, binary_copy_read_batch_bytes)?;
@@ -365,8 +358,7 @@ impl IntoJava for &CompactionOptions {
                 JValueGen::Object(&num_threads_opt),
                 JValueGen::Object(&batch_size_opt),
                 JValueGen::Object(&defer_index_remap_opt),
-                JValueGen::Object(&enable_binary_copy_opt),
-                JValueGen::Object(&enable_binary_copy_force_opt),
+                JValueGen::Object(&compaction_mode_opt),
                 JValueGen::Object(&binary_copy_read_batch_bytes_opt),
             ],
         )?)

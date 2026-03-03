@@ -37,8 +37,7 @@ public class CompactionOptions implements Serializable {
   private Optional<Long> numThreads;
   private Optional<Long> batchSize;
   private Optional<Boolean> deferIndexRemap;
-  private Optional<Boolean> enableBinaryCopy;
-  private Optional<Boolean> enableBinaryCopyForce;
+  private Optional<CompactionMode> compactionMode;
   private Optional<Long> binaryCopyReadBatchBytes;
 
   private CompactionOptions(
@@ -50,8 +49,7 @@ public class CompactionOptions implements Serializable {
       Optional<Long> numThreads,
       Optional<Long> batchSize,
       Optional<Boolean> deferIndexRemap,
-      Optional<Boolean> enableBinaryCopy,
-      Optional<Boolean> enableBinaryCopyForce,
+      Optional<CompactionMode> compactionMode,
       Optional<Long> binaryCopyReadBatchBytes) {
     this.targetRowsPerFragment = targetRowsPerFragment;
     this.maxRowsPerGroup = maxRowsPerGroup;
@@ -61,8 +59,7 @@ public class CompactionOptions implements Serializable {
     this.numThreads = numThreads;
     this.batchSize = batchSize;
     this.deferIndexRemap = deferIndexRemap;
-    this.enableBinaryCopy = enableBinaryCopy;
-    this.enableBinaryCopyForce = enableBinaryCopyForce;
+    this.compactionMode = compactionMode;
     this.binaryCopyReadBatchBytes = binaryCopyReadBatchBytes;
   }
 
@@ -70,12 +67,9 @@ public class CompactionOptions implements Serializable {
     return deferIndexRemap;
   }
 
-  public Optional<Boolean> getEnableBinaryCopy() {
-    return enableBinaryCopy;
-  }
-
-  public Optional<Boolean> getEnableBinaryCopyForce() {
-    return enableBinaryCopyForce;
+  /** Returns the compaction mode as its string value for the native layer. */
+  public Optional<String> getCompactionMode() {
+    return compactionMode.map(CompactionMode::getValue);
   }
 
   public Optional<Long> getBinaryCopyReadBatchBytes() {
@@ -125,8 +119,7 @@ public class CompactionOptions implements Serializable {
         .add("numThreads", numThreads.orElse(null))
         .add("batchSize", batchSize.orElse(null))
         .add("deferIndexRemap", deferIndexRemap.orElse(null))
-        .add("enableBinaryCopy", enableBinaryCopy.orElse(null))
-        .add("enableBinaryCopyForce", enableBinaryCopyForce.orElse(null))
+        .add("compactionMode", compactionMode.orElse(null))
         .add("binaryCopyReadBatchBytes", binaryCopyReadBatchBytes.orElse(null))
         .toString();
   }
@@ -140,8 +133,7 @@ public class CompactionOptions implements Serializable {
     output.writeObject(numThreads.orElse(null));
     output.writeObject(batchSize.orElse(null));
     output.writeObject(deferIndexRemap.orElse(null));
-    output.writeObject(enableBinaryCopy.orElse(null));
-    output.writeObject(enableBinaryCopyForce.orElse(null));
+    output.writeObject(compactionMode.map(CompactionMode::getValue).orElse(null));
     output.writeObject(binaryCopyReadBatchBytes.orElse(null));
   }
 
@@ -154,8 +146,16 @@ public class CompactionOptions implements Serializable {
     this.numThreads = Optional.ofNullable((Long) input.readObject());
     this.batchSize = Optional.ofNullable((Long) input.readObject());
     this.deferIndexRemap = Optional.ofNullable((Boolean) input.readObject());
-    this.enableBinaryCopy = Optional.ofNullable((Boolean) input.readObject());
-    this.enableBinaryCopyForce = Optional.ofNullable((Boolean) input.readObject());
+    String modeStr = (String) input.readObject();
+    this.compactionMode = Optional.empty();
+    if (modeStr != null) {
+      for (CompactionMode m : CompactionMode.values()) {
+        if (m.getValue().equals(modeStr)) {
+          this.compactionMode = Optional.of(m);
+          break;
+        }
+      }
+    }
     this.binaryCopyReadBatchBytes = Optional.ofNullable((Long) input.readObject());
   }
 
@@ -169,8 +169,7 @@ public class CompactionOptions implements Serializable {
     private Optional<Long> numThreads = Optional.empty();
     private Optional<Long> batchSize = Optional.empty();
     private Optional<Boolean> deferIndexRemap = Optional.empty();
-    private Optional<Boolean> enableBinaryCopy = Optional.empty();
-    private Optional<Boolean> enableBinaryCopyForce = Optional.empty();
+    private Optional<CompactionMode> compactionMode = Optional.empty();
     private Optional<Long> binaryCopyReadBatchBytes = Optional.empty();
 
     private Builder() {}
@@ -215,13 +214,8 @@ public class CompactionOptions implements Serializable {
       return this;
     }
 
-    public Builder withEnableBinaryCopy(boolean enableBinaryCopy) {
-      this.enableBinaryCopy = Optional.of(enableBinaryCopy);
-      return this;
-    }
-
-    public Builder withEnableBinaryCopyForce(boolean enableBinaryCopyForce) {
-      this.enableBinaryCopyForce = Optional.of(enableBinaryCopyForce);
+    public Builder withCompactionMode(CompactionMode compactionMode) {
+      this.compactionMode = Optional.of(compactionMode);
       return this;
     }
 
@@ -240,8 +234,7 @@ public class CompactionOptions implements Serializable {
           numThreads,
           batchSize,
           deferIndexRemap,
-          enableBinaryCopy,
-          enableBinaryCopyForce,
+          compactionMode,
           binaryCopyReadBatchBytes);
     }
   }

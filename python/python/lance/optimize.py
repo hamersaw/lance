@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
-from typing import Optional, TypedDict
+from typing import Literal, Optional, TypedDict
 
 # Re-exported from native module. See src/dataset/optimize.rs for implementation.
 from .lance import Compaction as Compaction
@@ -59,17 +59,17 @@ class CompactionOptions(TypedDict):
 
     The default will use the same default from ``scanner``.
     """
-    enable_binary_copy: Optional[bool]
+    compaction_mode: Optional[
+        Literal["reencode", "try_binary_copy", "force_binary_copy"]
+    ]
     """
-    Whether to enable binary copy optimization during compaction. When
-    enabled, compaction will skip re-encoding data and directly copy
-    binary data for faster compaction times. (default: False)
-    """
-    enable_binary_copy_force: Optional[bool]
-    """
-    Whether to force binary copy optimization. If true, compaction will
-    fail if binary copy is not supported for the given fragments.
-    (default: False)
+    The compaction mode to use. Valid values:
+
+    - ``"reencode"``: Decode and re-encode data (default).
+    - ``"try_binary_copy"``: Try binary copy if fragments are compatible,
+      fall back to reencode otherwise.
+    - ``"force_binary_copy"``: Use binary copy or fail if fragments are
+      not compatible.
     """
     binary_copy_read_batch_bytes: Optional[int]
     """

@@ -42,8 +42,7 @@ public class Compaction {
         compactionOptions.getNumThreads(),
         compactionOptions.getBatchSize(),
         compactionOptions.getDeferIndexRemap(),
-        compactionOptions.getEnableBinaryCopy(),
-        compactionOptions.getEnableBinaryCopyForce(),
+        compactionOptions.getCompactionMode(),
         compactionOptions.getBinaryCopyReadBatchBytes());
   }
 
@@ -63,8 +62,7 @@ public class Compaction {
         compactionOptions.getNumThreads(),
         compactionOptions.getBatchSize(),
         compactionOptions.getDeferIndexRemap(),
-        compactionOptions.getEnableBinaryCopy(),
-        compactionOptions.getEnableBinaryCopyForce(),
+        compactionOptions.getCompactionMode(),
         compactionOptions.getBinaryCopyReadBatchBytes());
   }
 
@@ -79,8 +77,7 @@ public class Compaction {
       Optional<Long> numThreads,
       Optional<Long> batchSize,
       Optional<Boolean> deferIndexRemap,
-      Optional<Boolean> enableBinaryCopy,
-      Optional<Boolean> enableBinaryCopyForce,
+      Optional<String> compactionMode,
       Optional<Long> binaryCopyReadBatchBytes);
 
   private static native CompactionPlan nativePlanCompaction(
@@ -93,7 +90,6 @@ public class Compaction {
       Optional<Long> numThreads,
       Optional<Long> batchSize,
       Optional<Boolean> deferIndexRemap,
-      Optional<Boolean> enableBinaryCopy,
-      Optional<Boolean> enableBinaryCopyForce,
+      Optional<String> compactionMode,
       Optional<Long> binaryCopyReadBatchBytes);
 }

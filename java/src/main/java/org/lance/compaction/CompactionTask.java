@@ -54,8 +54,7 @@ public class CompactionTask implements Serializable {
         compactionOptions.getNumThreads(),
         compactionOptions.getBatchSize(),
         compactionOptions.getDeferIndexRemap(),
-        compactionOptions.getEnableBinaryCopy(),
-        compactionOptions.getEnableBinaryCopyForce(),
+        compactionOptions.getCompactionMode(),
         compactionOptions.getBinaryCopyReadBatchBytes());
   }
 
@@ -71,8 +70,7 @@ public class CompactionTask implements Serializable {
       Optional<Long> numThreads,
       Optional<Long> batchSize,
       Optional<Boolean> deferIndexRemap,
-      Optional<Boolean> enableBinaryCopy,
-      Optional<Boolean> enableBinaryCopyForce,
+      Optional<String> compactionMode,
       Optional<Long> binaryCopyReadBatchBytes);
 
   public CompactionOptions getCompactionOptions() {
