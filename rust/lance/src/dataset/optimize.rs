@@ -111,12 +111,18 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 
 mod binary_copy;
+pub mod clustering;
 pub mod remapping;
+pub mod rewrite_strategy;
 
 use crate::index::frag_reuse::build_new_frag_reuse_index;
 use crate::io::deletion::read_dataset_deletion_file;
 use binary_copy::rewrite_files_binary_copy;
+pub use clustering::ClusteringRewriteStrategy;
 pub use remapping::{IgnoreRemap, IndexRemapper, IndexRemapperOptions, RemappedIndex};
+pub use rewrite_strategy::{
+    ClusteringMode, DefaultRewriteStrategy, RewriteStrategy, RewriteStrategyConfig,
+};
 
 /// Controls how data is rewritten during compaction.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -201,6 +207,15 @@ pub struct CompactionOptions {
     /// Controls how much data is read at once when performing binary copy.
     /// Defaults to 16MB (16 * 1024 * 1024).
     pub binary_copy_read_batch_bytes: Option<usize>,
+    /// The rewrite strategy to apply during compaction.
+    ///
+    /// When set to [`RewriteStrategyConfig::Clustering`], data will be sorted
+    /// or reordered by the specified columns instead of preserving insertion
+    /// order. Clustering forces the reencode path (binary copy cannot be used).
+    ///
+    /// Defaults to [`RewriteStrategyConfig::Default`] (preserve insertion order).
+    #[serde(default)]
+    pub rewrite_strategy: RewriteStrategyConfig,
 }
 
 #[allow(deprecated)]
@@ -220,6 +235,7 @@ impl Default for CompactionOptions {
             enable_binary_copy: false,
             enable_binary_copy_force: false,
             binary_copy_read_batch_bytes: Some(16 * 1024 * 1024),
+            rewrite_strategy: RewriteStrategyConfig::Default,
         }
     }
 }
@@ -567,6 +583,84 @@ impl CompactionPlanner for DefaultCompactionPlanner {
     }
 }
 
+/// Compaction planner that selects all (or a filtered subset of) fragments
+/// for clustering. Unlike [`DefaultCompactionPlanner`], which only selects
+/// small or deletion-heavy fragments, this planner selects fragments for
+/// data reorganization (sorting / z-ordering / hilbert ordering).
+///
+/// The planner produces one task per chunk of approximately
+/// `target_rows_per_fragment` rows so that memory usage stays bounded.
+/// Within each task the [`RewriteStrategy`] (carried on the
+/// [`CompactionOptions`]) determines how data is reordered.
+#[derive(Debug, Clone)]
+pub struct ClusteringCompactionPlanner {
+    options: CompactionOptions,
+    /// Optional filter: only include fragments with these IDs.
+    fragment_ids: Option<Vec<u64>>,
+}
+
+impl ClusteringCompactionPlanner {
+    pub fn new(mut options: CompactionOptions, fragment_ids: Option<Vec<u64>>) -> Self {
+        options.validate();
+        Self {
+            options,
+            fragment_ids,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl CompactionPlanner for ClusteringCompactionPlanner {
+    async fn plan(&self, dataset: &Dataset) -> Result<CompactionPlan> {
+        let all_fragments = dataset.get_fragments();
+        let fragments: Vec<Fragment> = if let Some(ids) = &self.fragment_ids {
+            all_fragments
+                .into_iter()
+                .filter(|f| ids.contains(&(f.id() as u64)))
+                .map(|f| f.metadata)
+                .collect()
+        } else {
+            all_fragments.into_iter().map(|f| f.metadata).collect()
+        };
+
+        if fragments.is_empty() {
+            return Ok(CompactionPlan::new(
+                dataset.manifest.version,
+                self.options.clone(),
+            ));
+        }
+
+        // Group fragments into tasks so each task has roughly
+        // target_rows_per_fragment rows.  This keeps memory bounded when
+        // sorting.  For exact global ordering the caller should set a very
+        // large target.
+        let target = self.options.target_rows_per_fragment as u64;
+        let mut plan = CompactionPlan::new(dataset.manifest.version, self.options.clone());
+        let mut current_task = Vec::new();
+        let mut current_rows: u64 = 0;
+
+        for frag in fragments {
+            let frag_rows = frag.physical_rows.unwrap_or(0) as u64;
+            current_task.push(frag);
+            current_rows += frag_rows;
+
+            if current_rows >= target {
+                plan.extend_tasks(std::iter::once(TaskData {
+                    fragments: std::mem::take(&mut current_task),
+                }));
+                current_rows = 0;
+            }
+        }
+        if !current_task.is_empty() {
+            plan.extend_tasks(std::iter::once(TaskData {
+                fragments: current_task,
+            }));
+        }
+
+        Ok(plan)
+    }
+}
+
 /// Compacts the files in the dataset without reordering them.
 ///
 /// By default, this does a few things:
@@ -709,6 +803,10 @@ impl CompactionPlan {
 ///   in-order reading.
 /// - `capture_row_ids`: When index remapping is needed, include and capture the
 ///   `_rowid` column from the stream.
+/// - `include_row_id_column`: When true, include `_rowid` as a regular column in
+///   the stream without capturing it. Used by the clustering rewrite strategy so
+///   that row IDs flow through the sort and can be captured afterwards.
+///   Mutually exclusive with `capture_row_ids`.
 ///
 /// Returns:
 /// - `SendableRecordBatchStream`: The batch stream (with `_rowid` removed if captured)
@@ -721,10 +819,15 @@ async fn prepare_reader(
     batch_size: Option<usize>,
     with_frags: bool,
     capture_row_ids: bool,
+    include_row_id_column: bool,
 ) -> Result<(
     SendableRecordBatchStream,
     Option<std::sync::mpsc::Receiver<CapturedRowIds>>,
 )> {
+    debug_assert!(
+        !(capture_row_ids && include_row_id_column),
+        "capture_row_ids and include_row_id_column are mutually exclusive"
+    );
     let mut scanner = dataset.scan();
     let has_blob_columns = dataset
         .schema()
@@ -741,8 +844,10 @@ async fn prepare_reader(
             .with_fragments(fragments.to_vec())
             .scan_in_order(true);
     }
-    if capture_row_ids {
+    if capture_row_ids || include_row_id_column {
         scanner.with_row_id();
+    }
+    if capture_row_ids {
         let data = SendableRecordBatchStream::from(scanner.try_into_stream().await?);
         let (data_no_row_ids, rx) =
             make_rowid_capture_stream(data, dataset.manifest.uses_stable_row_ids())?;
@@ -1001,8 +1106,14 @@ async fn rewrite_files(
         num_rows,
         fragments.len()
     );
+    let is_clustering = !options.rewrite_strategy.is_default();
     let mode = options.compaction_mode();
-    let can_binary_copy = can_use_binary_copy(dataset.as_ref(), options, &fragments).await;
+    // Clustering requires re-encoding (cannot binary-copy and sort).
+    let can_binary_copy = if is_clustering {
+        false
+    } else {
+        can_use_binary_copy(dataset.as_ref(), options, &fragments).await
+    };
     if !can_binary_copy && matches!(mode, CompactionMode::ForceBinaryCopy) {
         return Err(Error::not_supported_source(
             format!("compaction task {}: binary copy is not supported", task_id).into(),
@@ -1012,12 +1123,19 @@ async fn rewrite_files(
     let mut reader: Option<SendableRecordBatchStream> = None;
 
     if !can_binary_copy {
+        // When clustering, we need _rowid to flow through the sort so we
+        // can capture the addresses in the sorted (output) order.  So we
+        // include _rowid as a regular column and defer capture until after
+        // the rewrite strategy transforms the stream.
+        let capture_now = needs_remapping && !is_clustering;
+        let include_rowid_col = needs_remapping && is_clustering;
         let (prepared_reader, rx_initial) = prepare_reader(
             dataset.as_ref(),
             &fragments,
             options.batch_size,
             true,
-            needs_remapping,
+            capture_now,
+            include_rowid_col,
         )
         .await?;
         row_ids_rx = rx_initial;
@@ -1033,10 +1151,24 @@ async fn rewrite_files(
                 num_rows,
             );
         });
-        reader = Some(Box::pin(RecordBatchStreamAdapter::new(
-            schema,
-            reader_with_progress,
-        )));
+        let mut stream: SendableRecordBatchStream =
+            Box::pin(RecordBatchStreamAdapter::new(schema, reader_with_progress));
+
+        // Apply the rewrite strategy (sort / z-order / hilbert).
+        if is_clustering {
+            let strategy = options.rewrite_strategy.to_strategy()?;
+            stream = strategy.transform(stream).await?;
+
+            // Now capture _rowid from the (reordered) stream.
+            if needs_remapping {
+                let (data_no_row_ids, rx) =
+                    make_rowid_capture_stream(stream, dataset.manifest.uses_stable_row_ids())?;
+                stream = data_no_row_ids;
+                row_ids_rx = Some(rx);
+            }
+        }
+
+        reader = Some(stream);
     }
 
     let mut params = WriteParams {
