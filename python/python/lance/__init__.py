@@ -6,7 +6,7 @@ from __future__ import annotations
 import logging
 import os
 import warnings
-from typing import TYPE_CHECKING, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 from . import io, log
 from .blob import Blob, BlobArray, BlobColumn, BlobFile, blob_array, blob_field
@@ -99,6 +99,7 @@ def dataset(
     session: Optional[Session] = None,
     namespace: Optional[LanceNamespace] = None,
     table_id: Optional[List[str]] = None,
+    storage_options_provider: Optional[Any] = None,
 ) -> LanceDataset:
     """
     Opens the Lance dataset from the address specified.
@@ -152,7 +153,8 @@ def dataset(
     read_params : optional, dict
         Dictionary of read parameters. Currently supports:
         - cache_repetition_index (bool): Whether to cache repetition indices for
-          large string/binary columns
+          large string/binary columns. This is enabled by default. You can disable
+          it globally by setting LANCE_READ_CACHE_REPETITION_INDEX=false.
         - validate_on_decode (bool): Whether to validate data during decoding
     session : optional, lance.Session
         A session to use for this dataset. This contains the caches used by the
@@ -166,6 +168,11 @@ def dataset(
     table_id : optional, List[str]
         The table identifier when using a namespace (e.g., ["my_table"]).
         Must be provided together with `namespace`. Cannot be used with `uri`.
+    storage_options_provider : optional
+        A storage options provider for automatic credential refresh. Must implement
+        `fetch_storage_options()` method that returns a dict of storage options.
+        If provided along with `namespace`, this takes precedence over the
+        namespace-created provider.
 
     Notes
     -----
@@ -191,7 +198,7 @@ def dataset(
         )
 
     # Handle namespace resolution in Python
-    storage_options_provider = None
+    managed_versioning = False
     if namespace is not None:
         if table_id is None:
             raise ValueError(
@@ -205,12 +212,16 @@ def dataset(
         if uri is None:
             raise ValueError("Namespace did not return a 'location' for the table")
 
+        # Check if namespace manages versioning (commits go through namespace API)
+        managed_versioning = getattr(response, "managed_versioning", None) is True
+
         namespace_storage_options = response.storage_options
 
         if namespace_storage_options:
-            storage_options_provider = LanceNamespaceStorageOptionsProvider(
-                namespace=namespace, table_id=table_id
-            )
+            if storage_options_provider is None:
+                storage_options_provider = LanceNamespaceStorageOptionsProvider(
+                    namespace=namespace, table_id=table_id
+                )
             if storage_options is None:
                 storage_options = namespace_storage_options
             else:
@@ -233,6 +244,8 @@ def dataset(
         read_params=read_params,
         session=session,
         storage_options_provider=storage_options_provider,
+        namespace=namespace if managed_versioning else None,
+        table_id=table_id if managed_versioning else None,
     )
     if version is None and asof is not None:
         ts_cutoff = sanitize_ts(asof)

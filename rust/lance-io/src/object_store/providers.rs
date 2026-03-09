@@ -4,19 +4,18 @@
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc, RwLock, Weak,
+        atomic::{AtomicU64, Ordering},
     },
 };
 
 use object_store::path::Path;
-use snafu::location;
 use url::Url;
 
-use crate::object_store::uri_to_url;
 use crate::object_store::WrappingObjectStore;
+use crate::object_store::uri_to_url;
 
-use super::{tracing::ObjectStoreTracingExt, ObjectStore, ObjectStoreParams};
+use super::{ObjectStore, ObjectStoreParams, tracing::ObjectStoreTracingExt};
 use lance_core::error::{Error, LanceOptionExt, Result};
 
 #[cfg(feature = "aws")]
@@ -31,6 +30,8 @@ pub mod local;
 pub mod memory;
 #[cfg(feature = "oss")]
 pub mod oss;
+#[cfg(feature = "tencent")]
+pub mod tencent;
 
 #[async_trait::async_trait]
 pub trait ObjectStoreProvider: std::fmt::Debug + Sync + Send {
@@ -44,9 +45,8 @@ pub trait ObjectStoreProvider: std::fmt::Debug + Sync + Send {
     /// Meanwhile, for a file store, the path is relative to the filesystem root.
     /// So a URL of `file:///path/to/file` would return `/path/to/file`.
     fn extract_path(&self, url: &Url) -> Result<Path> {
-        Path::parse(url.path()).map_err(|_| {
-            Error::invalid_input(format!("Invalid path in URL: {}", url.path()), location!())
-        })
+        Path::parse(url.path())
+            .map_err(|_| Error::invalid_input(format!("Invalid path in URL: {}", url.path())))
     }
 
     /// Calculate the unique prefix that should be used for this object store.
@@ -190,7 +190,7 @@ impl ObjectStoreRegistry {
             let valid_schemes = providers.keys().cloned().collect::<Vec<_>>().join(", ");
             message.push_str(&format!("\nValid schemes: {}", valid_schemes));
         }
-        Error::invalid_input(message, location!())
+        Error::invalid_input(message)
     }
 
     /// Get an object store for a given base path and parameters.
@@ -231,11 +231,11 @@ impl ObjectStoreRegistry {
                         .active_stores
                         .write()
                         .expect("ObjectStoreRegistry lock poisoned");
-                    if let Some(store) = cache_lock.get(&cache_key) {
-                        if store.upgrade().is_none() {
-                            // Remove the weak reference if it is no longer valid
-                            cache_lock.remove(&cache_key);
-                        }
+                    if let Some(store) = cache_lock.get(&cache_key)
+                        && store.upgrade().is_none()
+                    {
+                        // Remove the weak reference if it is no longer valid
+                        cache_lock.remove(&cache_key);
                     }
                 }
             }
@@ -314,6 +314,8 @@ impl Default for ObjectStoreRegistry {
         providers.insert("gs".into(), Arc::new(gcp::GcsStoreProvider));
         #[cfg(feature = "oss")]
         providers.insert("oss".into(), Arc::new(oss::OssStoreProvider));
+        #[cfg(feature = "tencent")]
+        providers.insert("cos".into(), Arc::new(tencent::TencentStoreProvider));
         #[cfg(feature = "huggingface")]
         providers.insert("hf".into(), Arc::new(huggingface::HuggingfaceStoreProvider));
         Self {

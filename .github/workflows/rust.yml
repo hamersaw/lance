@@ -12,6 +12,7 @@ on:
       - rust/**
       - protos/**
       - .github/workflows/rust.yml
+      - rust-toolchain.toml
       - Cargo.toml
       - Cargo.lock
       - deny.toml
@@ -177,6 +178,10 @@ jobs:
       CXX: clang++
     steps:
       - uses: actions/checkout@v4
+      - name: Set up Rust
+        run: |
+          rustup update stable
+          rustup default stable
       # Remote cargo.lock to force a fresh build
       - name: Remove Cargo.lock
         run: rm -f Cargo.lock
@@ -251,7 +256,7 @@ jobs:
     runs-on: ubuntu-24.04
     strategy:
       matrix:
-        msrv: ["1.88.0"] # This should match up with rust-version in Cargo.toml
+        msrv: ["1.91.0"] # This should match up with rust-version in Cargo.toml
     env:
       # Need up-to-date compilers for kernels
       CC: clang

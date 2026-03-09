@@ -2,15 +2,16 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use fst::Streamer;
-use futures::{stream, StreamExt, TryStreamExt};
-use lance_core::{cache::LanceCache, utils::tokio::get_num_compute_intensive_cpus, Error, Result};
-use snafu::location;
+use futures::{StreamExt, TryStreamExt, stream};
+use lance_core::{Error, Result, cache::LanceCache, utils::tokio::get_num_compute_intensive_cpus};
+use std::sync::Arc;
 
+use crate::progress::IndexBuildProgress;
 use crate::scalar::IndexStore;
 
 use super::{
-    builder::{doc_file_path, posting_file_path, token_file_path, InnerBuilder, PositionRecorder},
     InvertedPartition, PostingListBuilder, TokenMap, TokenSetFormat,
+    builder::{InnerBuilder, PositionRecorder, doc_file_path, posting_file_path, token_file_path},
 };
 
 pub trait Merger {
@@ -51,6 +52,7 @@ pub struct SizeBasedMerger<'a> {
     with_position: Option<bool>,
     target_size: u64,
     token_set_format: TokenSetFormat,
+    progress: Arc<dyn IndexBuildProgress>,
     builder: Option<InnerBuilder>,
     next_id: u64,
     partitions: Vec<u64>,
@@ -66,6 +68,7 @@ impl<'a> SizeBasedMerger<'a> {
         input: Vec<PartitionSource>,
         target_size: u64,
         token_set_format: TokenSetFormat,
+        progress: Arc<dyn IndexBuildProgress>,
     ) -> Self {
         let max_id = input.iter().map(|p| p.id).max().unwrap_or(0);
 
@@ -75,6 +78,7 @@ impl<'a> SizeBasedMerger<'a> {
             with_position: None,
             target_size,
             token_set_format,
+            progress,
             builder: None,
             next_id: max_id + 1,
             partitions: Vec::new(),
@@ -113,10 +117,9 @@ impl<'a> SizeBasedMerger<'a> {
         match self.with_position {
             Some(existing) => {
                 if existing != with_position {
-                    return Err(Error::Index {
-                        message: "partition position settings do not match".to_string(),
-                        location: location!(),
-                    });
+                    return Err(Error::index(
+                        "partition position settings do not match".to_string(),
+                    ));
                 }
             }
             None => {
@@ -215,6 +218,7 @@ impl<'a> SizeBasedMerger<'a> {
 impl Merger for SizeBasedMerger<'_> {
     async fn merge(&mut self) -> Result<Vec<u64>> {
         if self.input.len() <= 1 {
+            let mut completed = 0;
             for part in self.input.iter() {
                 part.store
                     .copy_index_file(&token_file_path(part.id), self.dest_store)
@@ -224,6 +228,10 @@ impl Merger for SizeBasedMerger<'_> {
                     .await?;
                 part.store
                     .copy_index_file(&doc_file_path(part.id), self.dest_store)
+                    .await?;
+                completed += 1;
+                self.progress
+                    .stage_progress("merge_partitions", completed)
                     .await?;
             }
 
@@ -250,14 +258,18 @@ impl Merger for SizeBasedMerger<'_> {
         let token_set_format = self.token_set_format;
         let mut stream = stream::iter(parts.into_iter().map(|part| {
             let cache = cache.clone();
-            async move { part.load(&cache, token_set_format).await }
+            tokio::task::spawn(async move { part.load(&cache, token_set_format).await })
         }))
         .buffered(buffer_size);
 
         let mut idx = 0;
         while let Some(part) = stream.try_next().await? {
+            let part = part?;
             idx += 1;
             self.merge_partition(part, &mut estimated_size).await?;
+            self.progress
+                .stage_progress("merge_partitions", idx as u64)
+                .await?;
             log::info!(
                 "merged {}/{} partitions in {:?}",
                 idx,
@@ -328,6 +340,7 @@ mod tests {
             ],
             u64::MAX,
             token_set_format,
+            crate::progress::noop_progress(),
         );
         let merged_partitions = merger.merge().await?;
         assert_eq!(merged_partitions, vec![2]);
@@ -387,8 +400,13 @@ mod tests {
             sources.push(PartitionSource::new(src_store.clone(), id));
         }
 
-        let mut merger =
-            SizeBasedMerger::new(dest_store.as_ref(), sources, u64::MAX, token_set_format);
+        let mut merger = SizeBasedMerger::new(
+            dest_store.as_ref(),
+            sources,
+            u64::MAX,
+            token_set_format,
+            crate::progress::noop_progress(),
+        );
         let merged_partitions = merger.merge().await?;
         assert_eq!(merged_partitions, vec![num_parts as u64]);
 

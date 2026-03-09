@@ -16,7 +16,6 @@ use arrow_schema::Schema as ArrowSchema;
 use lance_core::datatypes::Schema;
 use lance_core::{Error, Result};
 use lance_index::scalar::bloomfilter::sbbf::Sbbf;
-use snafu::location;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -192,10 +191,10 @@ impl MemTable {
         let pk_bloom_filter =
             Sbbf::with_ndv_fpp(PK_BLOOM_FILTER_EXPECTED_ITEMS, PK_BLOOM_FILTER_FPP).map_err(
                 |e| {
-                    Error::io(
-                        format!("Failed to create bloom filter for primary key: {}", e),
-                        location!(),
-                    )
+                    Error::io(format!(
+                        "Failed to create bloom filter for primary key: {}",
+                        e
+                    ))
                 },
             )?;
 
@@ -347,16 +346,12 @@ impl MemTable {
         if batch.schema() != self.schema {
             return Err(Error::invalid_input(
                 "Batch schema doesn't match MemTable schema",
-                location!(),
             ));
         }
 
         let num_rows = batch.num_rows();
         if num_rows == 0 {
-            return Err(Error::invalid_input(
-                "Cannot insert empty batch",
-                location!(),
-            ));
+            return Err(Error::invalid_input("Cannot insert empty batch"));
         }
 
         // Row offset is the current row count (before adding this batch)
@@ -376,10 +371,7 @@ impl MemTable {
         // Append to batch store (returns batch_position, row_offset, estimated_size)
         let (batch_position, _row_offset, _estimated_size) =
             self.batch_store.append(batch).map_err(|_| {
-                Error::invalid_input(
-                    "MemTable batch store is full - should have been flushed",
-                    location!(),
-                )
+                Error::invalid_input("MemTable batch store is full - should have been flushed")
             })?;
 
         Ok(batch_position)
@@ -399,16 +391,12 @@ impl MemTable {
         if batch.schema() != self.schema {
             return Err(Error::invalid_input(
                 "Batch schema doesn't match MemTable schema",
-                location!(),
             ));
         }
 
         let num_rows = batch.num_rows();
         if num_rows == 0 {
-            return Err(Error::invalid_input(
-                "Cannot insert empty batch",
-                location!(),
-            ));
+            return Err(Error::invalid_input("Cannot insert empty batch"));
         }
 
         // Update bloom filter with primary keys
@@ -419,10 +407,7 @@ impl MemTable {
         // Append to batch store (returns batch_position, row_offset, estimated_size)
         let (batch_position, row_offset, estimated_size) =
             self.batch_store.append(batch).map_err(|_| {
-                Error::invalid_input(
-                    "MemTable batch store is full - should have been flushed",
-                    location!(),
-                )
+                Error::invalid_input("MemTable batch store is full - should have been flushed")
             })?;
 
         Ok((batch_position, row_offset, estimated_size))
@@ -449,16 +434,13 @@ impl MemTable {
         // Validate all batches upfront
         for (i, batch) in batches.iter().enumerate() {
             if batch.schema() != self.schema {
-                return Err(Error::invalid_input(
-                    format!("Batch {} schema doesn't match MemTable schema", i),
-                    location!(),
-                ));
+                return Err(Error::invalid_input(format!(
+                    "Batch {} schema doesn't match MemTable schema",
+                    i
+                )));
             }
             if batch.num_rows() == 0 {
-                return Err(Error::invalid_input(
-                    format!("Batch {} is empty", i),
-                    location!(),
-                ));
+                return Err(Error::invalid_input(format!("Batch {} is empty", i)));
             }
         }
 
@@ -471,10 +453,7 @@ impl MemTable {
 
         // Append all batches atomically
         let results = self.batch_store.append_batches(batches).map_err(|_| {
-            Error::invalid_input(
-                "MemTable batch store is full - should have been flushed",
-                location!(),
-            )
+            Error::invalid_input("MemTable batch store is full - should have been flushed")
         })?;
 
         Ok(results)
@@ -555,10 +534,7 @@ impl MemTable {
             .collect();
 
         if pk_columns.len() != self.pk_field_ids.len() {
-            return Err(Error::invalid_input(
-                "Batch is missing primary key columns",
-                location!(),
-            ));
+            return Err(Error::invalid_input("Batch is missing primary key columns"));
         }
 
         // Insert each row's primary key hash
@@ -639,10 +615,7 @@ impl MemTable {
     /// Construct a fresh Dataset from stored batches.
     async fn construct_dataset(&self) -> Result<Dataset> {
         if self.batch_store.is_empty() {
-            return Err(Error::invalid_input(
-                "Cannot construct Dataset: no batches",
-                location!(),
-            ));
+            return Err(Error::invalid_input("Cannot construct Dataset: no batches"));
         }
 
         // Get batches
@@ -662,12 +635,27 @@ impl MemTable {
         Ok(self.batch_store.to_vec())
     }
 
+    /// Scan all data from the MemTable in reverse order (newest first).
+    ///
+    /// This is used when flushing MemTable to persistent storage to ensure
+    /// the flushed data is ordered from newest to oldest. This enables more
+    /// efficient K-way merge during LSM scan because flushed generations
+    /// will be pre-sorted in the order needed for deduplication.
+    ///
+    /// The total number of rows in the MemTable is also returned to allow
+    /// callers to compute reversed row positions for indexes.
+    pub async fn scan_batches_reversed(&self) -> Result<(Vec<RecordBatch>, usize)> {
+        let total_rows = self.batch_store.total_rows();
+        let batches = self.batch_store.to_vec_reversed()?;
+        Ok((batches, total_rows))
+    }
+
     /// Scan specific batches by their batch_positions.
     pub async fn scan_batches_by_ids(&self, batch_positions: &[usize]) -> Result<Vec<RecordBatch>> {
         let mut results = Vec::with_capacity(batch_positions.len());
         for &batch_position in batch_positions {
             let batch = self.batch_store.get_batch(batch_position).ok_or_else(|| {
-                Error::invalid_input(format!("Batch {} not found", batch_position), location!())
+                Error::invalid_input(format!("Batch {} not found", batch_position))
             })?;
             results.push(batch.clone());
         }

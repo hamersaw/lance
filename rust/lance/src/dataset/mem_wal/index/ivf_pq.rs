@@ -33,11 +33,10 @@ use crossbeam_skiplist::SkipMap;
 use lance_core::{Error, Result};
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::kmeans::compute_partitions_arrow_array;
-use lance_index::vector::pq::storage::transpose;
 use lance_index::vector::pq::ProductQuantizer;
+use lance_index::vector::pq::storage::transpose;
 use lance_index::vector::quantizer::Quantization;
 use lance_linalg::distance::DistanceType;
-use snafu::location;
 
 use crate::dataset::mem_wal::memtable::batch_store::StoredBatch;
 
@@ -553,14 +552,11 @@ impl IvfPqMemIndex {
 
         let column = batch.column(col_idx);
         let fsl = column.as_fixed_size_list_opt().ok_or_else(|| {
-            Error::invalid_input(
-                format!(
-                    "Column '{}' is not a FixedSizeList, got {:?}",
-                    self.column_name,
-                    column.data_type()
-                ),
-                location!(),
-            )
+            Error::invalid_input(format!(
+                "Column '{}' is not a FixedSizeList, got {:?}",
+                self.column_name,
+                column.data_type()
+            ))
         })?;
 
         // Find partition assignments for all vectors using batch computation
@@ -568,7 +564,7 @@ impl IvfPqMemIndex {
             .ivf_model
             .centroids
             .as_ref()
-            .ok_or_else(|| Error::invalid_input("IVF model has no centroids", location!()))?;
+            .ok_or_else(|| Error::invalid_input("IVF model has no centroids"))?;
         let (partition_ids, _distances) =
             compute_partitions_arrow_array(centroids, fsl, self.distance_type)?;
 
@@ -582,10 +578,10 @@ impl IvfPqMemIndex {
         // Group vectors by partition
         let mut partition_groups: Vec<Vec<usize>> = vec![Vec::new(); self.num_partitions];
         for (row_idx, partition_id) in partition_ids.iter().enumerate().take(batch.num_rows()) {
-            if let Some(pid) = partition_id {
-                if (*pid as usize) < self.num_partitions {
-                    partition_groups[*pid as usize].push(row_idx);
-                }
+            if let Some(pid) = partition_id
+                && (*pid as usize) < self.num_partitions
+            {
+                partition_groups[*pid as usize].push(row_idx);
             }
         }
 
@@ -672,7 +668,7 @@ impl IvfPqMemIndex {
             .ivf_model
             .centroids
             .as_ref()
-            .ok_or_else(|| Error::invalid_input("IVF model has no centroids", location!()))?;
+            .ok_or_else(|| Error::invalid_input("IVF model has no centroids"))?;
         let (partition_ids, _distances) =
             compute_partitions_arrow_array(centroids, mega_fsl, self.distance_type)?;
 
@@ -694,10 +690,10 @@ impl IvfPqMemIndex {
         // Group vectors by partition
         let mut partition_groups: Vec<Vec<usize>> = vec![Vec::new(); self.num_partitions];
         for (idx, pid) in partition_ids.iter().enumerate() {
-            if let Some(pid) = pid {
-                if (*pid as usize) < self.num_partitions {
-                    partition_groups[*pid as usize].push(idx);
-                }
+            if let Some(pid) = pid
+                && (*pid as usize) < self.num_partitions
+            {
+                partition_groups[*pid as usize].push(idx);
             }
         }
 
@@ -757,10 +753,10 @@ impl IvfPqMemIndex {
         max_row_position: RowPosition,
     ) -> Result<Vec<(f32, RowPosition)>> {
         if query.len() != 1 {
-            return Err(Error::invalid_input(
-                format!("Query must have exactly 1 vector, got {}", query.len()),
-                location!(),
-            ));
+            return Err(Error::invalid_input(format!(
+                "Query must have exactly 1 vector, got {}",
+                query.len()
+            )));
         }
 
         // Find nearest partitions to probe
@@ -961,21 +957,89 @@ impl IvfPqMemIndex {
                     Arc::new(pq_codes_array),
                     None,
                 )
-                .map_err(|e| {
-                    Error::io(
-                        format!("Failed to create PQ code array: {}", e),
-                        location!(),
-                    )
-                })?,
+                .map_err(|e| Error::io(format!("Failed to create PQ code array: {}", e)))?,
             );
 
             let batch = RecordBatch::try_new(schema.clone(), vec![row_id_array, pq_codes_fsl])
-                .map_err(|e| {
-                    Error::io(
-                        format!("Failed to create partition batch: {}", e),
-                        location!(),
-                    )
-                })?;
+                .map_err(|e| Error::io(format!("Failed to create partition batch: {}", e)))?;
+
+            result.push((part_id, batch));
+        }
+
+        Ok(result)
+    }
+
+    /// Export partition data as RecordBatches with reversed row positions.
+    ///
+    /// This is used when flushing MemTable to disk with batches in reverse order.
+    /// Since the flushed data will have rows in reverse order, we need to map
+    /// the row positions accordingly:
+    /// `reversed_position = total_rows - original_position - 1`
+    ///
+    /// # Arguments
+    /// * `total_rows` - Total number of rows in the MemTable (needed for position reversal)
+    pub fn to_partition_batches_reversed(
+        &self,
+        total_rows: usize,
+    ) -> Result<Vec<(usize, RecordBatch)>> {
+        use arrow_array::UInt64Array;
+        use arrow_schema::{Field, Schema};
+        use lance_core::ROW_ID;
+        use lance_index::vector::PQ_CODE_COLUMN;
+        use std::sync::Arc;
+
+        let pq_code_len = self.pq.num_sub_vectors * self.pq.num_bits as usize / 8;
+        let total_rows_u64 = total_rows as u64;
+
+        // Schema for partition data: row_id and pq_code
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(ROW_ID, arrow_schema::DataType::UInt64, false),
+            Field::new(
+                PQ_CODE_COLUMN,
+                arrow_schema::DataType::FixedSizeList(
+                    Arc::new(Field::new("item", arrow_schema::DataType::UInt8, false)),
+                    pq_code_len as i32,
+                ),
+                false,
+            ),
+        ]));
+
+        let mut result = Vec::new();
+
+        for part_id in 0..self.num_partitions {
+            let entries = self.get_partition(part_id);
+            if entries.is_empty() {
+                continue;
+            }
+
+            // Collect row IDs with reversed positions
+            let row_ids: Vec<u64> = entries
+                .iter()
+                .map(|e| total_rows_u64 - e.row_position - 1)
+                .collect();
+            let row_id_array = Arc::new(UInt64Array::from(row_ids));
+
+            // Collect PQ codes into a flat array
+            let mut pq_codes_flat: Vec<u8> = Vec::with_capacity(entries.len() * pq_code_len);
+            for entry in &entries {
+                pq_codes_flat.extend_from_slice(&entry.pq_code);
+            }
+
+            // Create FixedSizeList array for PQ codes with non-nullable inner field
+            let pq_codes_array = UInt8Array::from(pq_codes_flat);
+            let inner_field = Arc::new(Field::new("item", arrow_schema::DataType::UInt8, false));
+            let pq_codes_fsl = Arc::new(
+                FixedSizeListArray::try_new(
+                    inner_field,
+                    pq_code_len as i32,
+                    Arc::new(pq_codes_array),
+                    None,
+                )
+                .map_err(|e| Error::io(format!("Failed to create PQ code array: {}", e)))?,
+            );
+
+            let batch = RecordBatch::try_new(schema.clone(), vec![row_id_array, pq_codes_fsl])
+                .map_err(|e| Error::io(format!("Failed to create partition batch: {}", e)))?;
 
             result.push((part_id, batch));
         }
