@@ -770,6 +770,7 @@ impl FromPyObject<'_> for PyLance<Fragment> {
             row_id_meta,
             last_updated_at_version_meta,
             created_at_version_meta,
+            clustering_metadata: None,
         }))
     }
 }

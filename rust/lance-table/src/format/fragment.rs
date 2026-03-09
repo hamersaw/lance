@@ -275,6 +275,18 @@ impl TryFrom<pb::data_fragment::RowIdSequence> for RowIdMeta {
     }
 }
 
+/// Metadata about how a fragment's data was clustered during compaction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
+pub struct ClusteringMetadata {
+    /// The columns by which this fragment's data is clustered.
+    pub columns: Vec<String>,
+    /// The provider that performed the clustering (e.g. "hilbert", "zorder").
+    pub provider: String,
+    /// A UUID identifying the compaction group — all fragments written in the same
+    /// compaction task share this value.
+    pub group: String,
+}
+
 /// Data fragment.
 ///
 /// A fragment is a set of files which represent the different columns of the same rows.
@@ -307,6 +319,10 @@ pub struct Fragment {
     /// Created at version metadata
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at_version_meta: Option<RowDatasetVersionMeta>,
+
+    /// Clustering metadata for this fragment, if it was produced by a clustered compaction.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clustering_metadata: Option<ClusteringMetadata>,
 }
 
 impl Fragment {
@@ -319,6 +335,7 @@ impl Fragment {
             physical_rows: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            clustering_metadata: None,
         }
     }
 
@@ -358,6 +375,7 @@ impl Fragment {
             row_id_meta: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            clustering_metadata: None,
         }
     }
 
@@ -487,6 +505,11 @@ impl TryFrom<pb::DataFragment> for Fragment {
                 .created_at_version_sequence
                 .map(RowDatasetVersionMeta::try_from)
                 .transpose()?,
+            clustering_metadata: p.clustering_metadata.map(|cm| ClusteringMetadata {
+                columns: cm.columns,
+                provider: cm.provider,
+                group: cm.group,
+            }),
         })
     }
 }
@@ -528,6 +551,14 @@ impl From<&Fragment> for pb::DataFragment {
             physical_rows: f.physical_rows.unwrap_or_default() as u64,
             last_updated_at_version_sequence,
             created_at_version_sequence,
+            clustering_metadata: f
+                .clustering_metadata
+                .as_ref()
+                .map(|cm| pb::ClusteringMetadata {
+                    columns: cm.columns.clone(),
+                    provider: cm.provider.clone(),
+                    group: cm.group.clone(),
+                }),
         }
     }
 }
@@ -644,5 +675,28 @@ mod tests {
         data_file
             .validate(&base_path)
             .expect("validation should allow extra columns without field ids");
+    }
+
+    #[test]
+    fn test_roundtrip_fragment_with_clustering_metadata() {
+        let mut fragment = Fragment::new(42);
+        let schema = ArrowSchema::new(vec![ArrowField::new("x", DataType::Float16, true)]);
+        fragment.add_file_legacy("clustered.lance", &Schema::try_from(&schema).unwrap());
+        fragment.physical_rows = Some(100);
+        fragment.clustering_metadata = Some(ClusteringMetadata {
+            columns: vec!["col_a".to_string(), "col_b".to_string()],
+            provider: "hilbert".to_string(),
+            group: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+        });
+
+        let proto = pb::DataFragment::from(&fragment);
+        let roundtripped = Fragment::try_from(proto).unwrap();
+        assert_eq!(fragment, roundtripped);
+
+        // Also verify None round-trips correctly
+        fragment.clustering_metadata = None;
+        let proto = pb::DataFragment::from(&fragment);
+        let roundtripped = Fragment::try_from(proto).unwrap();
+        assert_eq!(fragment, roundtripped);
     }
 }

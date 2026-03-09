@@ -23,7 +23,19 @@ use lance_core::datatypes::Schema;
 use lance_core::{Error, Result};
 use lance_io::object_store::{ObjectStore, ObjectStoreRegistry};
 use lance_io::utils::read_struct;
+use serde::{Deserialize, Serialize};
 use snafu::location;
+
+/// Clustering configuration for a dataset.
+///
+/// Specifies which columns and provider to use when clustering data.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
+pub struct ClusteringFormat {
+    /// The clustering provider (e.g. "hilbert", "zorder").
+    pub provider: String,
+    /// The columns by which data should be clustered.
+    pub columns: Vec<String>,
+}
 
 /// Manifest of a dataset
 ///
@@ -98,6 +110,9 @@ pub struct Manifest {
     /// associated with the table. This is different than configuration, which
     /// is used to tell libraries how to read, write, or manage the table.
     pub table_metadata: HashMap<String, String>,
+
+    /// The clustering format for this dataset.
+    pub clustering_format: Option<ClusteringFormat>,
 
     /* external base paths */
     pub base_paths: HashMap<u32, BasePath>,
@@ -195,6 +210,7 @@ impl Manifest {
             data_storage_format,
             config: HashMap::new(),
             table_metadata: HashMap::new(),
+            clustering_format: None,
             base_paths,
         }
     }
@@ -226,6 +242,7 @@ impl Manifest {
             data_storage_format: previous.data_storage_format.clone(),
             config: previous.config.clone(),
             table_metadata: previous.table_metadata.clone(),
+            clustering_format: previous.clustering_format.clone(),
             base_paths: previous.base_paths.clone(),
         }
     }
@@ -289,6 +306,7 @@ impl Manifest {
                 base_paths
             },
             table_metadata: self.table_metadata.clone(),
+            clustering_format: self.clustering_format.clone(),
         }
     }
 
@@ -934,6 +952,10 @@ impl TryFrom<pb::Manifest> for Manifest {
             data_storage_format,
             config: p.config,
             table_metadata: p.table_metadata,
+            clustering_format: p.clustering_format.map(|cf| ClusteringFormat {
+                provider: cf.provider,
+                columns: cf.columns,
+            }),
             base_paths: p
                 .base_paths
                 .iter()
@@ -1002,6 +1024,12 @@ impl From<&Manifest> for pb::Manifest {
                 })
                 .collect(),
             transaction_section: m.transaction_section.map(|i| i as u64),
+            clustering_format: m.clustering_format.as_ref().map(|cf| {
+                pb::manifest::ClusteringFormat {
+                    provider: cf.provider.clone(),
+                    columns: cf.columns.clone(),
+                }
+            }),
         }
     }
 }
@@ -1332,6 +1360,7 @@ mod tests {
                 physical_rows: None,
                 created_at_version_meta: None,
                 last_updated_at_version_meta: None,
+                clustering_metadata: None,
             },
             Fragment {
                 id: 1,
@@ -1344,6 +1373,7 @@ mod tests {
                 physical_rows: None,
                 created_at_version_meta: None,
                 last_updated_at_version_meta: None,
+                clustering_metadata: None,
             },
         ];
 
@@ -1497,5 +1527,35 @@ mod tests {
         //Just verify the transformation is OK
         let stats_map: BTreeMap<String, String> = deletion_summary.into();
         assert_eq!(stats_map.len(), 7)
+    }
+
+    #[test]
+    fn test_roundtrip_manifest_clustering_format() {
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            arrow_schema::DataType::Int64,
+            false,
+        )]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let mut manifest = Manifest::new(
+            schema,
+            Arc::new(vec![]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        manifest.clustering_format = Some(ClusteringFormat {
+            provider: "hilbert".to_string(),
+            columns: vec!["col_a".to_string(), "col_b".to_string()],
+        });
+
+        let proto = pb::Manifest::from(&manifest);
+        let roundtripped = Manifest::try_from(proto).unwrap();
+        assert_eq!(manifest.clustering_format, roundtripped.clustering_format);
+
+        // Also verify None round-trips correctly
+        manifest.clustering_format = None;
+        let proto = pb::Manifest::from(&manifest);
+        let roundtripped = Manifest::try_from(proto).unwrap();
+        assert_eq!(roundtripped.clustering_format, None);
     }
 }
