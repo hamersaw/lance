@@ -205,6 +205,16 @@ message Manifest {
 
   // The branch of the dataset. None means main branch.
   optional string branch = 20;
+
+  message ClusteringFormat {
+    // The clustering provider (e.g. "hilbert", "zorder").
+    string provider = 1;
+    // The columns by which data should be clustered.
+    repeated string columns = 2;
+  }
+
+  // The clustering format for this dataset.
+  optional ClusteringFormat clustering_format = 22;
 } // Manifest
 
 // external dataset base path
@@ -332,7 +342,20 @@ message DataFragment {
   // deletion tombstones. To compute the current number of rows, subtract
   // `deletion_file.num_deleted_rows` from this value.
   uint64 physical_rows = 4;
+
+  // Clustering metadata for this fragment, if it was produced by a clustered compaction.
+  optional ClusteringMetadata clustering_metadata = 11;
 }
+
+// Metadata about how a fragment's data was clustered during compaction.
+message ClusteringMetadata {
+  // The columns by which this fragment's data is clustered.
+  repeated string columns = 1;
+  // The provider that performed the clustering (e.g. "hilbert", "zorder").
+  string provider = 2;
+  // A UUID identifying the compaction group — all fragments written in the same
+  // compaction task share this value.
+  string group = 3;
 
 message DataFile {
   // Path to the root relative to the dataset's URI.

@@ -650,6 +650,7 @@ impl FromJObjectWithEnv<Fragment> for JObject<'_> {
             row_id_meta,
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
+            clustering_metadata: None,
         })
     }
 }
