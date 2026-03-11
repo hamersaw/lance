@@ -224,8 +224,76 @@ impl Default for CompactionOptions {
     }
 }
 
+/// Config key prefix for compaction options stored in the dataset manifest.
+pub const COMPACTION_CONFIG_PREFIX: &str = "lance.compaction.";
+
 #[allow(deprecated)]
 impl CompactionOptions {
+    /// Create [`CompactionOptions`] by starting with defaults and applying any
+    /// overrides found in the dataset manifest config.
+    ///
+    /// Config keys are prefixed with `lance.compaction.` and map to fields:
+    /// - `lance.compaction.target_rows_per_fragment`
+    /// - `lance.compaction.max_rows_per_group`
+    /// - `lance.compaction.max_bytes_per_file`
+    /// - `lance.compaction.batch_size`
+    /// - `lance.compaction.compaction_mode`
+    /// - `lance.compaction.binary_copy_read_batch_bytes`
+    pub fn from_dataset_config(config: &HashMap<String, String>) -> Result<Self> {
+        let mut opts = Self::default();
+        opts.apply_dataset_config(config)?;
+        Ok(opts)
+    }
+
+    /// Apply overrides from the dataset manifest config to this options struct.
+    ///
+    /// Only fields with corresponding config keys are modified; other fields
+    /// retain their current values.
+    pub fn apply_dataset_config(&mut self, config: &HashMap<String, String>) -> Result<()> {
+        for (key, value) in config {
+            let Some(field) = key.strip_prefix(COMPACTION_CONFIG_PREFIX) else {
+                continue;
+            };
+            match field {
+                "target_rows_per_fragment" => {
+                    self.target_rows_per_fragment = value.parse().map_err(|_| {
+                        Error::invalid_input(format!("Invalid value for {}: {}", key, value))
+                    })?;
+                }
+                "max_rows_per_group" => {
+                    self.max_rows_per_group = value.parse().map_err(|_| {
+                        Error::invalid_input(format!("Invalid value for {}: {}", key, value))
+                    })?;
+                }
+                "max_bytes_per_file" => {
+                    self.max_bytes_per_file = Some(value.parse().map_err(|_| {
+                        Error::invalid_input(format!("Invalid value for {}: {}", key, value))
+                    })?);
+                }
+                "batch_size" => {
+                    self.batch_size = Some(value.parse().map_err(|_| {
+                        Error::invalid_input(format!("Invalid value for {}: {}", key, value))
+                    })?);
+                }
+                "compaction_mode" => {
+                    self.compaction_mode = Some(CompactionMode::try_from(value.as_str())?);
+                }
+                "binary_copy_read_batch_bytes" => {
+                    self.binary_copy_read_batch_bytes = Some(value.parse().map_err(|_| {
+                        Error::invalid_input(format!("Invalid value for {}: {}", key, value))
+                    })?);
+                }
+                _ => {
+                    return Err(Error::invalid_input(format!(
+                        "Unknown compaction config key: {}",
+                        key
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn validate(&mut self) {
         // If threshold is 100%, same as turning off deletion materialization.
         if self.materialize_deletions && self.materialize_deletions_threshold >= 1.0 {
@@ -3977,5 +4045,130 @@ mod tests {
         assert_eq!(plan.read_version, dataset.manifest.version);
         // make sure options.validate() worked
         assert!(!plan.options.materialize_deletions);
+    }
+
+    #[test]
+    fn test_from_dataset_config() {
+        let config = HashMap::from([
+            (
+                "lance.compaction.target_rows_per_fragment".to_string(),
+                "500000".to_string(),
+            ),
+            (
+                "lance.compaction.max_rows_per_group".to_string(),
+                "2048".to_string(),
+            ),
+            (
+                "lance.compaction.max_bytes_per_file".to_string(),
+                "1000000".to_string(),
+            ),
+            (
+                "lance.compaction.batch_size".to_string(),
+                "4096".to_string(),
+            ),
+            (
+                "lance.compaction.compaction_mode".to_string(),
+                "try_binary_copy".to_string(),
+            ),
+            (
+                "lance.compaction.binary_copy_read_batch_bytes".to_string(),
+                "8388608".to_string(),
+            ),
+        ]);
+
+        let opts = CompactionOptions::from_dataset_config(&config).unwrap();
+        assert_eq!(opts.target_rows_per_fragment, 500_000);
+        assert_eq!(opts.max_rows_per_group, 2048);
+        assert_eq!(opts.max_bytes_per_file, Some(1_000_000));
+        assert_eq!(opts.batch_size, Some(4096));
+        assert_eq!(opts.compaction_mode, Some(CompactionMode::TryBinaryCopy));
+        assert_eq!(opts.binary_copy_read_batch_bytes, Some(8_388_608));
+    }
+
+    #[test]
+    fn test_from_dataset_config_partial() {
+        let config = HashMap::from([(
+            "lance.compaction.target_rows_per_fragment".to_string(),
+            "500000".to_string(),
+        )]);
+
+        let opts = CompactionOptions::from_dataset_config(&config).unwrap();
+        assert_eq!(opts.target_rows_per_fragment, 500_000);
+        // Other fields should remain at defaults
+        assert_eq!(opts.max_rows_per_group, 1024);
+        assert_eq!(opts.max_bytes_per_file, None);
+        assert_eq!(opts.batch_size, None);
+        assert_eq!(opts.compaction_mode, None);
+        assert_eq!(opts.binary_copy_read_batch_bytes, Some(16 * 1024 * 1024));
+    }
+
+    #[test]
+    fn test_from_dataset_config_ignores_other_keys() {
+        let config = HashMap::from([
+            (
+                "lance.compaction.target_rows_per_fragment".to_string(),
+                "500000".to_string(),
+            ),
+            (
+                "lance.auto_cleanup.interval".to_string(),
+                "3600".to_string(),
+            ),
+            ("some.other.key".to_string(), "value".to_string()),
+        ]);
+
+        let opts = CompactionOptions::from_dataset_config(&config).unwrap();
+        assert_eq!(opts.target_rows_per_fragment, 500_000);
+    }
+
+    #[test]
+    fn test_from_dataset_config_invalid_value() {
+        let config = HashMap::from([(
+            "lance.compaction.target_rows_per_fragment".to_string(),
+            "not_a_number".to_string(),
+        )]);
+
+        let result = CompactionOptions::from_dataset_config(&config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_from_dataset_config_unknown_compaction_key() {
+        let config = HashMap::from([(
+            "lance.compaction.unknown_key".to_string(),
+            "value".to_string(),
+        )]);
+
+        let result = CompactionOptions::from_dataset_config(&config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_from_dataset_config_invalid_compaction_mode() {
+        let config = HashMap::from([(
+            "lance.compaction.compaction_mode".to_string(),
+            "invalid_mode".to_string(),
+        )]);
+
+        let result = CompactionOptions::from_dataset_config(&config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_apply_dataset_config_overrides() {
+        let config = HashMap::from([(
+            "lance.compaction.target_rows_per_fragment".to_string(),
+            "500000".to_string(),
+        )]);
+
+        let mut opts = CompactionOptions {
+            max_rows_per_group: 4096,
+            ..Default::default()
+        };
+        opts.apply_dataset_config(&config).unwrap();
+
+        // Config value should be applied
+        assert_eq!(opts.target_rows_per_fragment, 500_000);
+        // Explicitly set value should be preserved (config didn't have this key)
+        assert_eq!(opts.max_rows_per_group, 4096);
     }
 }
