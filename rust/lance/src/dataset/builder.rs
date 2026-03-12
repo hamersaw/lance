@@ -70,17 +70,67 @@ impl std::fmt::Debug for DatasetBuilder {
 
 impl DatasetBuilder {
     pub fn from_uri<T: AsRef<str>>(table_uri: T) -> Self {
+        let raw_uri = table_uri.as_ref();
+        let (clean_uri, branch) = Self::parse_branch_from_uri(raw_uri);
+        let version = branch.map(|b| Ref::from((b.as_str(), None::<u64>)));
+
         Self {
             index_cache_size_bytes: DEFAULT_INDEX_CACHE_SIZE,
             metadata_cache_size_bytes: DEFAULT_METADATA_CACHE_SIZE,
-            table_uri: table_uri.as_ref().to_string(),
+            table_uri: clean_uri,
             options: ObjectStoreParams::default(),
             commit_handler: None,
             session: None,
-            version: None,
+            version,
             manifest: None,
             file_reader_options: None,
             storage_options_override: None,
+        }
+    }
+
+    /// Extract a `branch` query parameter from the URI, returning
+    /// the cleaned URI (without the branch param) and the branch name if present.
+    pub fn parse_branch_from_uri(uri: &str) -> (String, Option<String>) {
+        if let Ok(mut parsed) = Url::parse(uri) {
+            let branch = parsed
+                .query_pairs()
+                .find(|(key, _)| key == "branch")
+                .map(|(_, value)| value.into_owned());
+
+            if branch.is_some() {
+                // Remove the branch param, keep other query params
+                let remaining: Vec<(String, String)> = parsed
+                    .query_pairs()
+                    .filter(|(key, _)| key != "branch")
+                    .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                    .collect();
+                if remaining.is_empty() {
+                    parsed.set_query(None);
+                } else {
+                    let query_string: String = remaining
+                        .iter()
+                        .map(|(k, v)| format!("{}={}", k, v))
+                        .collect::<Vec<_>>()
+                        .join("&");
+                    parsed.set_query(Some(&query_string));
+                }
+                return (parsed.to_string(), branch);
+            }
+            return (uri.to_string(), None);
+        }
+
+        // Fallback for URIs that url::Url cannot parse (e.g. bare local paths)
+        if let Some(idx) = uri.find("?branch=") {
+            let base = &uri[..idx];
+            let rest = &uri[idx + "?branch=".len()..];
+            let branch = if let Some(amp) = rest.find('&') {
+                rest[..amp].to_string()
+            } else {
+                rest.to_string()
+            };
+            (base.to_string(), Some(branch))
+        } else {
+            (uri.to_string(), None)
         }
     }
 
@@ -740,5 +790,45 @@ impl DatasetBuilder {
             file_reader_options,
             store_params,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_branch_from_uri() {
+        // Cloud URI with branch
+        let (uri, branch) =
+            DatasetBuilder::parse_branch_from_uri("s3://my-bucket/db/table.lance?branch=main");
+        assert_eq!(uri, "s3://my-bucket/db/table.lance");
+        assert_eq!(branch.as_deref(), Some("main"));
+
+        // Cloud URI without branch
+        let (uri, branch) = DatasetBuilder::parse_branch_from_uri("s3://my-bucket/db/table.lance");
+        assert_eq!(uri, "s3://my-bucket/db/table.lance");
+        assert_eq!(branch, None);
+
+        // Cloud URI with branch and other params
+        let (uri, branch) = DatasetBuilder::parse_branch_from_uri(
+            "s3://my-bucket/db/table.lance?region=us-east-1&branch=dev&timeout=30",
+        );
+        assert_eq!(
+            uri,
+            "s3://my-bucket/db/table.lance?region=us-east-1&timeout=30"
+        );
+        assert_eq!(branch.as_deref(), Some("dev"));
+
+        // Local path with branch (fallback parsing)
+        let (uri, branch) =
+            DatasetBuilder::parse_branch_from_uri("/tmp/my-dataset.lance?branch=feature/x");
+        assert_eq!(uri, "/tmp/my-dataset.lance");
+        assert_eq!(branch.as_deref(), Some("feature/x"));
+
+        // Local path without branch
+        let (uri, branch) = DatasetBuilder::parse_branch_from_uri("/tmp/my-dataset.lance");
+        assert_eq!(uri, "/tmp/my-dataset.lance");
+        assert_eq!(branch, None);
     }
 }

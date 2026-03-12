@@ -149,11 +149,13 @@ pub const DEFAULT_METADATA_CACHE_SIZE: usize = 1024 * 1024 * 1024;
 pub struct Dataset {
     pub object_store: Arc<ObjectStore>,
     pub(crate) commit_handler: Arc<dyn CommitHandler>,
-    /// Uri of the dataset.
+    /// Internal uri of the dataset, including the physical branch path (e.g. tree/<branch>).
     ///
     /// On cloud storage, we can not use [Dataset::base] to build the full uri because the
     /// `bucket` is swallowed in the inner [ObjectStore].
     uri: String,
+    /// Display URI with `?branch=<name>` query parameter, returned by [`Dataset::uri()`].
+    display_uri: String,
     pub(crate) base: Path,
     pub manifest: Arc<Manifest>,
     // Path for the manifest that is loaded. Used to get additional information,
@@ -444,6 +446,7 @@ impl Dataset {
         let (manifest, manifest_location) = self.latest_manifest().await?;
         self.manifest = manifest;
         self.manifest_location = manifest_location;
+        self.display_uri = Self::make_display_uri(&self.branch_location());
         self.fragment_bitmap = Arc::new(
             self.manifest
                 .fragments
@@ -486,7 +489,7 @@ impl Dataset {
             is_shallow: true,
             ref_name: source_branch.clone(),
             ref_version: version_number,
-            ref_path: String::from(self.uri()),
+            ref_path: self.uri.clone(),
             branch_name: Some(branch.to_string()),
         };
         let transaction = Transaction::new(version_number, clone_op, None);
@@ -694,14 +697,16 @@ impl Dataset {
         file_reader_options: Option<FileReaderOptions>,
         store_params: Option<ObjectStoreParams>,
     ) -> Result<Self> {
+        let branch_location = BranchLocation {
+            path: base_path.clone(),
+            uri: uri.clone(),
+            branch: manifest.branch.clone(),
+        };
+        let display_uri = Self::make_display_uri(&branch_location);
         let refs = Refs::new(
             object_store.clone(),
             commit_handler.clone(),
-            BranchLocation {
-                path: base_path.clone(),
-                uri: uri.clone(),
-                branch: manifest.branch.clone(),
-            },
+            branch_location,
         );
         let metadata_cache = Arc::new(session.metadata_cache.for_dataset(&uri));
         let index_cache = Arc::new(session.index_cache.for_dataset(&uri));
@@ -710,6 +715,7 @@ impl Dataset {
             object_store,
             base: base_path,
             uri,
+            display_uri,
             manifest,
             manifest_location,
             commit_handler,
@@ -917,8 +923,33 @@ impl Dataset {
     }
 
     /// Get the fully qualified URI of this dataset.
+    ///
+    /// The returned URI includes a `?branch=<name>` query parameter indicating
+    /// the current branch (e.g. `s3://bucket/table.lance?branch=main`).
+    #[allow(clippy::misnamed_getters)]
     pub fn uri(&self) -> &str {
+        &self.display_uri
+    }
+
+    /// Get the internal/physical URI of this dataset.
+    ///
+    /// This includes the physical branch path (e.g. `tree/<branch>`) and should
+    /// be used for filesystem operations. External callers should use [`Dataset::uri()`]
+    /// instead.
+    pub(crate) fn internal_uri(&self) -> &str {
         &self.uri
+    }
+
+    /// Compute a display URI from a branch location.
+    ///
+    /// The display URI is the root table URI with a `?branch=<name>` query parameter.
+    pub(crate) fn make_display_uri(branch_location: &BranchLocation) -> String {
+        let root_uri = branch_location
+            .find_main()
+            .map(|loc| loc.uri)
+            .unwrap_or_else(|_| branch_location.uri.clone());
+        let branch_name = refs::normalize_branch(branch_location.branch.as_deref());
+        format!("{}?branch={}", root_uri, branch_name)
     }
 
     pub fn branch_location(&self) -> BranchLocation {
@@ -2241,7 +2272,7 @@ impl Dataset {
             is_shallow: false,
             ref_name,
             ref_version,
-            ref_path: src_ds.uri().to_string(),
+            ref_path: src_ds.uri.clone(),
             branch_name: None,
         };
         let txn = Transaction::new(ref_version, clone_op, None);

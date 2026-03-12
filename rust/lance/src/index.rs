@@ -3937,7 +3937,8 @@ mod tests {
             );
 
             // Verify the source location does NOT contain new data
-            let original_indices_dir = PathBuf::from(current_dataset.uri()).join("_indices");
+            let original_indices_dir =
+                PathBuf::from(current_dataset.internal_uri()).join("_indices");
             let wrong_vector_dir = original_indices_dir.join(new_vector_idx.uuid.to_string());
             let wrong_category_dir = original_indices_dir.join(new_category_idx.uuid.to_string());
 

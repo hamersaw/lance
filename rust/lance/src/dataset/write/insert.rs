@@ -332,13 +332,16 @@ impl<'a> InsertBuilder<'a> {
 
     async fn resolve_context(&self) -> Result<WriteContext<'a>> {
         let params = self.params.cloned().unwrap_or_default();
-        let (object_store, base_path, commit_handler) = match &self.dest {
+        let (mut object_store, mut base_path, mut commit_handler) = match &self.dest {
             WriteDestination::Dataset(dataset) => (
                 dataset.object_store.clone(),
                 dataset.base.clone(),
                 dataset.commit_handler.clone(),
             ),
             WriteDestination::Uri(uri) => {
+                // Strip ?branch= query param if present; branch is handled
+                // separately via DatasetBuilder.
+                let (clean_uri, _) = DatasetBuilder::parse_branch_from_uri(uri);
                 let registry = params
                     .session
                     .as_ref()
@@ -346,12 +349,12 @@ impl<'a> InsertBuilder<'a> {
                     .unwrap_or_else(|| Arc::new(Default::default()));
                 let (object_store, base_path) = ObjectStore::from_uri_and_params(
                     registry,
-                    uri,
+                    &clean_uri,
                     &params.store_params.clone().unwrap_or_default(),
                 )
                 .await?;
                 let commit_handler = resolve_commit_handler(
-                    uri,
+                    &clean_uri,
                     params.commit_handler.clone(),
                     &params.store_params,
                 )
@@ -371,7 +374,14 @@ impl<'a> InsertBuilder<'a> {
                 });
 
                 match builder.load().await {
-                    Ok(dataset) => WriteDestination::Dataset(Arc::new(dataset)),
+                    Ok(dataset) => {
+                        // Use the resolved dataset's object store and base path
+                        // so data files are written to the correct branch location.
+                        object_store = dataset.object_store.clone();
+                        base_path = dataset.base.clone();
+                        commit_handler = dataset.commit_handler.clone();
+                        WriteDestination::Dataset(Arc::new(dataset))
+                    }
                     Err(Error::DatasetNotFound { .. } | Error::NotFound { .. }) => {
                         WriteDestination::Uri(uri)
                     }

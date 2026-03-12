@@ -2376,6 +2376,7 @@ class LanceDataset(pa.dataset.Dataset):
         ds = copy.copy(self)
         if version != ds.version:
             ds._ds = self._ds.checkout_version(version)
+            ds._uri = ds._ds.uri
         return ds
 
     def restore(self):

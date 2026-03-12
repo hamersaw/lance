@@ -609,10 +609,13 @@ impl Dataset {
         let dataset = rt().block_on(Some(py), builder.load())?;
 
         match dataset {
-            Ok(ds) => Ok(Self {
-                uri,
-                ds: Arc::new(ds),
-            }),
+            Ok(ds) => {
+                let display_uri = ds.uri().to_string();
+                Ok(Self {
+                    uri: display_uri,
+                    ds: Arc::new(ds),
+                })
+            }
             Err(err) => Err(PyValueError::new_err(err.to_string())),
         }
     }
@@ -1690,6 +1693,7 @@ impl Dataset {
                 Error::NotFound { .. } => PyValueError::new_err(err.to_string()),
                 _ => PyIOError::new_err(err.to_string()),
             })?;
+        self.uri = new_self.uri().to_string();
         self.ds = Arc::new(new_self);
         Ok(())
     }
@@ -2920,9 +2924,10 @@ impl Dataset {
                 _ => PyIOError::new_err(err.to_string()),
             })?;
 
+        let display_uri = ds.uri().to_string();
         Ok(Self {
             ds: Arc::new(ds),
-            uri: self.uri.clone(),
+            uri: display_uri,
         })
     }
 

@@ -560,7 +560,10 @@ async fn test_branch() {
         .create_branch("branch1", original_version, None)
         .await
         .unwrap();
-    assert_eq!(branch1_dataset.uri, format!("{}/tree/branch1", test_uri));
+    assert_eq!(
+        branch1_dataset.uri(),
+        format!("{}?branch=branch1", test_uri)
+    );
 
     branch1_dataset = write_dataset(
         branch1_dataset.uri(),
@@ -580,8 +583,8 @@ async fn test_branch() {
         .await
         .unwrap();
     assert_eq!(
-        branch2_dataset.uri,
-        format!("{}/tree/dev/branch2", test_uri)
+        branch2_dataset.uri(),
+        format!("{}?branch=dev/branch2", test_uri)
     );
 
     branch2_dataset = write_dataset(
@@ -605,8 +608,8 @@ async fn test_branch() {
         .await
         .unwrap();
     assert_eq!(
-        branch3_dataset.uri,
-        format!("{}/tree/feature/nathan/branch3", test_uri)
+        branch3_dataset.uri(),
+        format!("{}?branch=feature/nathan/branch3", test_uri)
     );
 
     branch3_dataset = write_dataset(

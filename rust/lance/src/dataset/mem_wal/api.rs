@@ -218,7 +218,7 @@ impl DatasetMemWalExt for Dataset {
         config.region_id = region_id;
 
         // Get object store and base path
-        let base_uri = self.uri();
+        let base_uri = self.internal_uri();
         let (store, base_path) = ObjectStore::from_uri(base_uri).await?;
 
         // Create RegionWriter

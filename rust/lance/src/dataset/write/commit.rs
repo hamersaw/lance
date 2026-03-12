@@ -193,22 +193,29 @@ impl<'a> CommitBuilder<'a> {
                 dataset.commit_handler.clone(),
             ),
             WriteDestination::Uri(uri) => {
+                // Strip ?branch= query param if present; branch is handled
+                // separately via DatasetBuilder.
+                let (clean_uri, _) = DatasetBuilder::parse_branch_from_uri(uri);
                 let commit_handler = if self.commit_handler.is_some() && self.object_store.is_some()
                 {
                     self.commit_handler.as_ref().unwrap().clone()
                 } else {
-                    resolve_commit_handler(uri, self.commit_handler.clone(), &self.store_params)
-                        .await?
+                    resolve_commit_handler(
+                        &clean_uri,
+                        self.commit_handler.clone(),
+                        &self.store_params,
+                    )
+                    .await?
                 };
                 let (object_store, base_path) = if let Some(passed_store) = self.object_store {
                     (
                         passed_store,
-                        ObjectStore::extract_path_from_uri(session.store_registry(), uri)?,
+                        ObjectStore::extract_path_from_uri(session.store_registry(), &clean_uri)?,
                     )
                 } else {
                     ObjectStore::from_uri_and_params(
                         session.store_registry(),
-                        uri,
+                        &clean_uri,
                         &self.store_params.clone().unwrap_or_default(),
                     )
                     .await?
@@ -371,28 +378,41 @@ impl<'a> CommitBuilder<'a> {
         let fragment_bitmap = Arc::new(manifest.fragments.iter().map(|f| f.id as u32).collect());
 
         match &self.dest {
-            WriteDestination::Dataset(dataset) => Ok(Dataset {
-                manifest: Arc::new(manifest),
-                manifest_location,
-                session,
-                fragment_bitmap,
-                ..dataset.as_ref().clone()
-            }),
+            WriteDestination::Dataset(dataset) => {
+                let manifest = Arc::new(manifest);
+                let branch_location = BranchLocation {
+                    path: dataset.base.clone(),
+                    uri: dataset.uri.clone(),
+                    branch: manifest.branch.clone(),
+                };
+                let display_uri = Dataset::make_display_uri(&branch_location);
+                Ok(Dataset {
+                    manifest,
+                    manifest_location,
+                    session,
+                    fragment_bitmap,
+                    display_uri,
+                    ..dataset.as_ref().clone()
+                })
+            }
             WriteDestination::Uri(uri) => {
+                let branch_location = BranchLocation {
+                    path: base_path.clone(),
+                    uri: uri.to_string(),
+                    branch: manifest.branch.clone(),
+                };
+                let display_uri = Dataset::make_display_uri(&branch_location);
                 let refs = Refs::new(
                     object_store.clone(),
                     commit_handler.clone(),
-                    BranchLocation {
-                        path: base_path.clone(),
-                        uri: uri.to_string(),
-                        branch: manifest.branch.clone(),
-                    },
+                    branch_location,
                 );
 
                 Ok(Dataset {
                     object_store,
                     base: base_path,
                     uri: uri.to_string(),
+                    display_uri,
                     manifest: Arc::new(manifest),
                     manifest_location,
                     session,

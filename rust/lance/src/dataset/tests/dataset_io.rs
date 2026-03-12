@@ -99,7 +99,7 @@ async fn test_with_object_store_clone_preserves_shared_state_and_overrides_store
     };
     let (wrapped_store, _) = ObjectStore::from_uri_and_params(
         dataset.session().store_registry(),
-        dataset.uri(),
+        dataset.internal_uri(),
         &store_params,
     )
     .await
@@ -126,7 +126,7 @@ async fn test_with_object_store_enables_isolated_per_request_io_tracking() {
     };
     let (wrapped_store_a, _) = ObjectStore::from_uri_and_params(
         dataset.session().store_registry(),
-        dataset.uri(),
+        dataset.internal_uri(),
         &store_params_a,
     )
     .await
@@ -140,7 +140,7 @@ async fn test_with_object_store_enables_isolated_per_request_io_tracking() {
     };
     let (wrapped_store_b, _) = ObjectStore::from_uri_and_params(
         dataset.session().store_registry(),
-        dataset.uri(),
+        dataset.internal_uri(),
         &store_params_b,
     )
     .await
@@ -1608,7 +1608,7 @@ async fn test_dataset_uri_roundtrips() {
     .unwrap();
 
     let uri = dataset.uri();
-    assert_eq!(uri, test_uri.as_str());
+    assert_eq!(uri, format!("{}?branch=main", test_uri));
 
     let ds2 = Dataset::open(uri).await.unwrap();
     assert_eq!(

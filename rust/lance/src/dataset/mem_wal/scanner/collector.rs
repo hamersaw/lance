@@ -55,7 +55,7 @@ impl LsmDataSourceCollector {
     pub fn new(base_table: Arc<Dataset>, region_snapshots: Vec<RegionSnapshot>) -> Self {
         // Use the dataset's URI as base path for resolving relative paths.
         // This ensures memory:// and other scheme-based URIs work correctly.
-        let base_path = base_table.uri().trim_end_matches('/').to_string();
+        let base_path = base_table.internal_uri().trim_end_matches('/').to_string();
         Self {
             base_table,
             base_path,
