@@ -236,6 +236,9 @@ impl CompactionOptions {
     /// - `lance.compaction.target_rows_per_fragment`
     /// - `lance.compaction.max_rows_per_group`
     /// - `lance.compaction.max_bytes_per_file`
+    /// - `lance.compaction.materialize_deletions`
+    /// - `lance.compaction.materialize_deletions_threshold`
+    /// - `lance.compaction.defer_index_remap`
     /// - `lance.compaction.batch_size`
     /// - `lance.compaction.compaction_mode`
     /// - `lance.compaction.binary_copy_read_batch_bytes`
@@ -257,22 +260,66 @@ impl CompactionOptions {
             match field {
                 "target_rows_per_fragment" => {
                     self.target_rows_per_fragment = value.parse().map_err(|_| {
-                        Error::invalid_input(format!("Invalid value for {}: {}", key, value))
+                        Error::invalid_input(format!(
+                            "Invalid value for {}: '{}' (expected a non-negative integer)",
+                            key, value
+                        ))
                     })?;
                 }
                 "max_rows_per_group" => {
                     self.max_rows_per_group = value.parse().map_err(|_| {
-                        Error::invalid_input(format!("Invalid value for {}: {}", key, value))
+                        Error::invalid_input(format!(
+                            "Invalid value for {}: '{}' (expected a non-negative integer)",
+                            key, value
+                        ))
                     })?;
                 }
                 "max_bytes_per_file" => {
                     self.max_bytes_per_file = Some(value.parse().map_err(|_| {
-                        Error::invalid_input(format!("Invalid value for {}: {}", key, value))
+                        Error::invalid_input(format!(
+                            "Invalid value for {}: '{}' (expected a non-negative integer)",
+                            key, value
+                        ))
                     })?);
+                }
+                "materialize_deletions" => {
+                    self.materialize_deletions = match value.to_lowercase().as_str() {
+                        "true" => true,
+                        "false" => false,
+                        _ => {
+                            return Err(Error::invalid_input(format!(
+                                "Invalid value for {}: '{}' (expected 'true' or 'false')",
+                                key, value
+                            )));
+                        }
+                    };
+                }
+                "materialize_deletions_threshold" => {
+                    self.materialize_deletions_threshold = value.parse().map_err(|_| {
+                        Error::invalid_input(format!(
+                            "Invalid value for {}: '{}' (expected a float between 0.0 and 1.0)",
+                            key, value
+                        ))
+                    })?;
+                }
+                "defer_index_remap" => {
+                    self.defer_index_remap = match value.to_lowercase().as_str() {
+                        "true" => true,
+                        "false" => false,
+                        _ => {
+                            return Err(Error::invalid_input(format!(
+                                "Invalid value for {}: '{}' (expected 'true' or 'false')",
+                                key, value
+                            )));
+                        }
+                    };
                 }
                 "batch_size" => {
                     self.batch_size = Some(value.parse().map_err(|_| {
-                        Error::invalid_input(format!("Invalid value for {}: {}", key, value))
+                        Error::invalid_input(format!(
+                            "Invalid value for {}: '{}' (expected a non-negative integer)",
+                            key, value
+                        ))
                     })?);
                 }
                 "compaction_mode" => {
@@ -280,7 +327,10 @@ impl CompactionOptions {
                 }
                 "binary_copy_read_batch_bytes" => {
                     self.binary_copy_read_batch_bytes = Some(value.parse().map_err(|_| {
-                        Error::invalid_input(format!("Invalid value for {}: {}", key, value))
+                        Error::invalid_input(format!(
+                            "Invalid value for {}: '{}' (expected a non-negative integer)",
+                            key, value
+                        ))
                     })?);
                 }
                 _ => {
@@ -4063,6 +4113,18 @@ mod tests {
                 "1000000".to_string(),
             ),
             (
+                "lance.compaction.materialize_deletions".to_string(),
+                "false".to_string(),
+            ),
+            (
+                "lance.compaction.materialize_deletions_threshold".to_string(),
+                "0.25".to_string(),
+            ),
+            (
+                "lance.compaction.defer_index_remap".to_string(),
+                "true".to_string(),
+            ),
+            (
                 "lance.compaction.batch_size".to_string(),
                 "4096".to_string(),
             ),
@@ -4080,9 +4142,37 @@ mod tests {
         assert_eq!(opts.target_rows_per_fragment, 500_000);
         assert_eq!(opts.max_rows_per_group, 2048);
         assert_eq!(opts.max_bytes_per_file, Some(1_000_000));
+        assert!(!opts.materialize_deletions);
+        assert!((opts.materialize_deletions_threshold - 0.25).abs() < f32::EPSILON);
+        assert!(opts.defer_index_remap);
         assert_eq!(opts.batch_size, Some(4096));
         assert_eq!(opts.compaction_mode, Some(CompactionMode::TryBinaryCopy));
         assert_eq!(opts.binary_copy_read_batch_bytes, Some(8_388_608));
+    }
+
+    #[test]
+    fn test_from_dataset_config_empty() {
+        let config = HashMap::new();
+        let opts = CompactionOptions::from_dataset_config(&config).unwrap();
+        let defaults = CompactionOptions::default();
+        assert_eq!(
+            opts.target_rows_per_fragment,
+            defaults.target_rows_per_fragment
+        );
+        assert_eq!(opts.max_rows_per_group, defaults.max_rows_per_group);
+        assert_eq!(opts.max_bytes_per_file, defaults.max_bytes_per_file);
+        assert_eq!(opts.materialize_deletions, defaults.materialize_deletions);
+        assert_eq!(
+            opts.materialize_deletions_threshold,
+            defaults.materialize_deletions_threshold
+        );
+        assert_eq!(opts.defer_index_remap, defaults.defer_index_remap);
+        assert_eq!(opts.batch_size, defaults.batch_size);
+        assert_eq!(opts.compaction_mode, defaults.compaction_mode);
+        assert_eq!(
+            opts.binary_copy_read_batch_bytes,
+            defaults.binary_copy_read_batch_bytes
+        );
     }
 
     #[test]
@@ -4095,11 +4185,17 @@ mod tests {
         let opts = CompactionOptions::from_dataset_config(&config).unwrap();
         assert_eq!(opts.target_rows_per_fragment, 500_000);
         // Other fields should remain at defaults
-        assert_eq!(opts.max_rows_per_group, 1024);
-        assert_eq!(opts.max_bytes_per_file, None);
-        assert_eq!(opts.batch_size, None);
-        assert_eq!(opts.compaction_mode, None);
-        assert_eq!(opts.binary_copy_read_batch_bytes, Some(16 * 1024 * 1024));
+        let defaults = CompactionOptions::default();
+        assert_eq!(opts.max_rows_per_group, defaults.max_rows_per_group);
+        assert_eq!(opts.max_bytes_per_file, defaults.max_bytes_per_file);
+        assert_eq!(opts.materialize_deletions, defaults.materialize_deletions);
+        assert_eq!(opts.defer_index_remap, defaults.defer_index_remap);
+        assert_eq!(opts.batch_size, defaults.batch_size);
+        assert_eq!(opts.compaction_mode, defaults.compaction_mode);
+        assert_eq!(
+            opts.binary_copy_read_batch_bytes,
+            defaults.binary_copy_read_batch_bytes
+        );
     }
 
     #[test]
@@ -4128,7 +4224,22 @@ mod tests {
         )]);
 
         let result = CompactionOptions::from_dataset_config(&config);
-        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("target_rows_per_fragment"));
+        assert!(err_msg.contains("not_a_number"));
+    }
+
+    #[test]
+    fn test_from_dataset_config_invalid_bool() {
+        let config = HashMap::from([(
+            "lance.compaction.materialize_deletions".to_string(),
+            "yes".to_string(),
+        )]);
+
+        let result = CompactionOptions::from_dataset_config(&config);
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("materialize_deletions"));
+        assert!(err_msg.contains("yes"));
     }
 
     #[test]
@@ -4139,7 +4250,8 @@ mod tests {
         )]);
 
         let result = CompactionOptions::from_dataset_config(&config);
-        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("unknown_key"));
     }
 
     #[test]
@@ -4150,7 +4262,8 @@ mod tests {
         )]);
 
         let result = CompactionOptions::from_dataset_config(&config);
-        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("invalid_mode"));
     }
 
     #[test]
@@ -4170,5 +4283,64 @@ mod tests {
         assert_eq!(opts.target_rows_per_fragment, 500_000);
         // Explicitly set value should be preserved (config didn't have this key)
         assert_eq!(opts.max_rows_per_group, 4096);
+    }
+
+    #[test]
+    fn test_apply_dataset_config_overwrites_matching_field() {
+        let config = HashMap::from([(
+            "lance.compaction.max_rows_per_group".to_string(),
+            "2048".to_string(),
+        )]);
+
+        let mut opts = CompactionOptions {
+            max_rows_per_group: 4096,
+            ..Default::default()
+        };
+        opts.apply_dataset_config(&config).unwrap();
+
+        // Config value should overwrite the pre-set value
+        assert_eq!(opts.max_rows_per_group, 2048);
+    }
+
+    #[tokio::test]
+    async fn test_compaction_uses_manifest_config() {
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+
+        let data = sample_data();
+        let schema = data.schema();
+
+        // Create dataset with small fragments
+        let reader = RecordBatchIterator::new(vec![Ok(data.clone())], schema.clone());
+        let write_params = WriteParams {
+            max_rows_per_file: 2000,
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        assert_eq!(dataset.get_fragments().len(), 5);
+
+        // Set compaction config in manifest
+        dataset
+            .update_config([
+                ("lance.compaction.target_rows_per_fragment", "5000"),
+                ("lance.compaction.materialize_deletions_threshold", "2.0"),
+            ])
+            .await
+            .unwrap();
+
+        // Build options from the dataset config (as the bindings do)
+        let opts = CompactionOptions::from_dataset_config(&dataset.manifest.config).unwrap();
+        assert_eq!(opts.target_rows_per_fragment, 5000);
+        assert!((opts.materialize_deletions_threshold - 2.0).abs() < f32::EPSILON);
+
+        // Verify the config flows through plan_compaction
+        let plan = plan_compaction(&dataset, &opts).await.unwrap();
+        assert!(!plan.tasks.is_empty());
+        assert_eq!(plan.options.target_rows_per_fragment, 5000);
+        // validate() should have turned off materialize_deletions since threshold >= 1.0
+        assert!(!plan.options.materialize_deletions);
     }
 }

@@ -5365,15 +5365,26 @@ class DatasetOptimizer:
         Explicitly provided parameters take precedence over manifest config
         values, which in turn take precedence over hardcoded defaults.
 
+        Supported config keys: ``lance.compaction.target_rows_per_fragment``,
+        ``lance.compaction.max_rows_per_group``,
+        ``lance.compaction.max_bytes_per_file``,
+        ``lance.compaction.materialize_deletions``,
+        ``lance.compaction.materialize_deletions_threshold``,
+        ``lance.compaction.defer_index_remap``,
+        ``lance.compaction.batch_size``,
+        ``lance.compaction.compaction_mode``,
+        ``lance.compaction.binary_copy_read_batch_bytes``.
+
         Parameters
         ----------
         target_rows_per_fragment: int, optional
             The target number of rows per fragment. This is the number of rows
-            that will be in each fragment after compaction. Default 1024*1024.
+            that will be in each fragment after compaction. If not specified,
+            uses the manifest config value, or 1024*1024.
         max_rows_per_group: int, optional
             Max number of rows per group. This does not affect which fragments
             need compaction, but does affect how they are re-written if selected.
-            Default 1024.
+            If not specified, uses the manifest config value, or 1024.
 
             This setting only affects datasets using the legacy storage format.
             The newer format does not require row groups.
@@ -5386,12 +5397,15 @@ class DatasetOptimizer:
             The default will use the default from ``write_dataset``.
         materialize_deletions: bool, optional
             Whether to compact fragments with soft deleted rows so they are no
-            longer present in the file. Default True.
+            longer present in the file. If not specified, uses the manifest
+            config value, or True.
         materialize_deletions_threshold: float, optional
             The fraction of original rows that are soft deleted in a fragment
-            before the fragment is a candidate for compaction. Default 0.1.
+            before the fragment is a candidate for compaction. If not specified,
+            uses the manifest config value, or 0.1.
         defer_index_remap: bool, optional
-            Whether to defer index remapping during compaction. Default False.
+            Whether to defer index remapping during compaction. If not specified,
+            uses the manifest config value, or False.
         num_threads: int, optional
             The number of threads to use when performing compaction. If not
             specified, defaults to the number of cores on the machine.
