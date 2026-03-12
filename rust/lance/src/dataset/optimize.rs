@@ -108,7 +108,7 @@ use lance_index::frag_reuse::FragReuseGroup;
 use lance_table::format::{Fragment, RowIdMeta};
 use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{info, warn};
 
 mod binary_copy;
 pub mod remapping;
@@ -334,10 +334,7 @@ impl CompactionOptions {
                     })?);
                 }
                 _ => {
-                    return Err(Error::invalid_input(format!(
-                        "Unknown compaction config key: {}",
-                        key
-                    )));
+                    warn!("Ignoring unknown compaction config key: {}", key);
                 }
             }
         }
@@ -4244,14 +4241,19 @@ mod tests {
 
     #[test]
     fn test_from_dataset_config_unknown_compaction_key() {
+        // Unknown keys should be ignored (with a warning) for forwards compatibility
         let config = HashMap::from([(
             "lance.compaction.unknown_key".to_string(),
             "value".to_string(),
         )]);
 
-        let result = CompactionOptions::from_dataset_config(&config);
-        let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("unknown_key"));
+        let opts = CompactionOptions::from_dataset_config(&config).unwrap();
+        // Should return defaults since the unknown key is skipped
+        let defaults = CompactionOptions::default();
+        assert_eq!(
+            opts.target_rows_per_fragment,
+            defaults.target_rows_per_fragment
+        );
     }
 
     #[test]
