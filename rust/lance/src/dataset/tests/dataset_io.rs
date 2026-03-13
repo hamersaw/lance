@@ -1616,3 +1616,84 @@ async fn test_dataset_uri_roundtrips() {
         dataset.latest_version_id().await.unwrap()
     );
 }
+
+#[test]
+fn test_make_display_uri() {
+    use crate::dataset::branch_location::BranchLocation;
+    use object_store::path::Path;
+
+    // Main branch (branch=None) — URI is already the root
+    let loc = BranchLocation {
+        path: Path::from("data/table.lance"),
+        uri: "/tmp/data/table.lance".to_string(),
+        branch: None,
+    };
+    let display = Dataset::make_display_uri(&loc).unwrap();
+    assert_eq!(display, "/tmp/data/table.lance?branch=main");
+
+    // Named branch — URI contains tree/<branch>, find_main strips it
+    let loc = BranchLocation {
+        path: Path::from("data/table.lance/tree/dev"),
+        uri: "/tmp/data/table.lance/tree/dev".to_string(),
+        branch: Some("dev".to_string()),
+    };
+    let display = Dataset::make_display_uri(&loc).unwrap();
+    assert_eq!(display, "/tmp/data/table.lance?branch=dev");
+
+    // Nested branch name
+    let loc = BranchLocation {
+        path: Path::from("data/table.lance/tree/feature/my-branch"),
+        uri: "/tmp/data/table.lance/tree/feature/my-branch".to_string(),
+        branch: Some("feature/my-branch".to_string()),
+    };
+    let display = Dataset::make_display_uri(&loc).unwrap();
+    assert_eq!(display, "/tmp/data/table.lance?branch=feature/my-branch");
+
+    // Malformed branch location (URI does not contain tree/<branch>) returns error
+    let loc = BranchLocation {
+        path: Path::from("data/table.lance"),
+        uri: "/tmp/data/table.lance".to_string(),
+        branch: Some("dev".to_string()),
+    };
+    assert!(Dataset::make_display_uri(&loc).is_err());
+}
+
+#[tokio::test]
+async fn test_checkout_latest_updates_display_uri() {
+    use lance_core::utils::tempfile::TempStrDir;
+
+    let test_uri = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "a",
+        DataType::Int32,
+        false,
+    )]));
+    let data = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(data)], schema.clone());
+    let mut dataset = Dataset::write(reader, &test_uri, None).await.unwrap();
+    assert!(dataset.uri().contains("?branch=main"));
+
+    // Append more data to create a new version
+    let data2 =
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![4, 5]))]).unwrap();
+    let reader2 = RecordBatchIterator::new(vec![Ok(data2)], schema);
+    Dataset::write(
+        reader2,
+        &test_uri,
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    // checkout_latest should update the display_uri
+    dataset.checkout_latest().await.unwrap();
+    assert_eq!(dataset.uri(), format!("{}?branch=main", test_uri));
+    assert_eq!(dataset.version().version, 2);
+}

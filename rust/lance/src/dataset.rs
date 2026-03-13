@@ -149,7 +149,9 @@ pub const DEFAULT_METADATA_CACHE_SIZE: usize = 1024 * 1024 * 1024;
 pub struct Dataset {
     pub object_store: Arc<ObjectStore>,
     pub(crate) commit_handler: Arc<dyn CommitHandler>,
-    /// Internal uri of the dataset, including the physical branch path (e.g. tree/<branch>).
+    /// Internal URI of the dataset. For non-main branches, this includes the physical
+    /// branch path (e.g. `<root>/tree/<branch>`). For the main branch, this is the root
+    /// table URI.
     ///
     /// On cloud storage, we can not use [Dataset::base] to build the full uri because the
     /// `bucket` is swallowed in the inner [ObjectStore].
@@ -446,7 +448,7 @@ impl Dataset {
         let (manifest, manifest_location) = self.latest_manifest().await?;
         self.manifest = manifest;
         self.manifest_location = manifest_location;
-        self.display_uri = Self::make_display_uri(&self.branch_location());
+        self.display_uri = Self::make_display_uri(&self.branch_location())?;
         self.fragment_bitmap = Arc::new(
             self.manifest
                 .fragments
@@ -702,7 +704,7 @@ impl Dataset {
             uri: uri.clone(),
             branch: manifest.branch.clone(),
         };
-        let display_uri = Self::make_display_uri(&branch_location);
+        let display_uri = Self::make_display_uri(&branch_location)?;
         let refs = Refs::new(
             object_store.clone(),
             commit_handler.clone(),
@@ -926,6 +928,8 @@ impl Dataset {
     ///
     /// The returned URI includes a `?branch=<name>` query parameter indicating
     /// the current branch (e.g. `s3://bucket/table.lance?branch=main`).
+    // Named `uri()` for public API compatibility, but returns `self.display_uri`
+    // (the user-facing form) rather than `self.uri` (the internal physical path).
     #[allow(clippy::misnamed_getters)]
     pub fn uri(&self) -> &str {
         &self.display_uri
@@ -933,9 +937,10 @@ impl Dataset {
 
     /// Get the internal/physical URI of this dataset.
     ///
-    /// This includes the physical branch path (e.g. `tree/<branch>`) and should
-    /// be used for filesystem operations. External callers should use [`Dataset::uri()`]
-    /// instead.
+    /// For non-main branches, this includes the physical branch path
+    /// (e.g. `<root>/tree/<branch>`). For main, this is the root table URI.
+    /// Should be used for filesystem operations. External callers should use
+    /// [`Dataset::uri()`] instead.
     pub(crate) fn internal_uri(&self) -> &str {
         &self.uri
     }
@@ -943,13 +948,12 @@ impl Dataset {
     /// Compute a display URI from a branch location.
     ///
     /// The display URI is the root table URI with a `?branch=<name>` query parameter.
-    pub(crate) fn make_display_uri(branch_location: &BranchLocation) -> String {
-        let root_uri = branch_location
-            .find_main()
-            .map(|loc| loc.uri)
-            .unwrap_or_else(|_| branch_location.uri.clone());
+    /// Returns an error if the branch location's URI does not contain the expected
+    /// `tree/<branch>` suffix for non-main branches.
+    pub(crate) fn make_display_uri(branch_location: &BranchLocation) -> Result<String> {
+        let root_uri = branch_location.find_main()?.uri;
         let branch_name = refs::normalize_branch(branch_location.branch.as_deref());
-        format!("{}?branch={}", root_uri, branch_name)
+        Ok(format!("{}?branch={}", root_uri, branch_name))
     }
 
     pub fn branch_location(&self) -> BranchLocation {

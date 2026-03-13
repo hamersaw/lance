@@ -186,6 +186,13 @@ impl<'a> CommitBuilder<'a> {
             .or_else(|| self.dest.dataset().map(|ds| ds.session.clone()))
             .unwrap_or_default();
 
+        // When dest is a URI, strip ?branch= so the URI can be used for object store
+        // resolution. The branch was already extracted during DatasetBuilder::from_uri().
+        let clean_uri = match &self.dest {
+            WriteDestination::Uri(uri) => Some(DatasetBuilder::parse_branch_from_uri(uri).0),
+            _ => None,
+        };
+
         let (object_store, base_path, commit_handler) = match &self.dest {
             WriteDestination::Dataset(dataset) => (
                 dataset.object_store.clone(),
@@ -193,15 +200,13 @@ impl<'a> CommitBuilder<'a> {
                 dataset.commit_handler.clone(),
             ),
             WriteDestination::Uri(uri) => {
-                // Strip ?branch= query param if present; branch is handled
-                // separately via DatasetBuilder.
-                let (clean_uri, _) = DatasetBuilder::parse_branch_from_uri(uri);
+                let clean_uri = clean_uri.as_deref().unwrap_or(uri);
                 let commit_handler = if self.commit_handler.is_some() && self.object_store.is_some()
                 {
                     self.commit_handler.as_ref().unwrap().clone()
                 } else {
                     resolve_commit_handler(
-                        &clean_uri,
+                        clean_uri,
                         self.commit_handler.clone(),
                         &self.store_params,
                     )
@@ -210,12 +215,12 @@ impl<'a> CommitBuilder<'a> {
                 let (object_store, base_path) = if let Some(passed_store) = self.object_store {
                     (
                         passed_store,
-                        ObjectStore::extract_path_from_uri(session.store_registry(), &clean_uri)?,
+                        ObjectStore::extract_path_from_uri(session.store_registry(), clean_uri)?,
                     )
                 } else {
                     ObjectStore::from_uri_and_params(
                         session.store_registry(),
-                        &clean_uri,
+                        clean_uri,
                         &self.store_params.clone().unwrap_or_default(),
                     )
                     .await?
@@ -385,7 +390,7 @@ impl<'a> CommitBuilder<'a> {
                     uri: dataset.uri.clone(),
                     branch: manifest.branch.clone(),
                 };
-                let display_uri = Dataset::make_display_uri(&branch_location);
+                let display_uri = Dataset::make_display_uri(&branch_location)?;
                 Ok(Dataset {
                     manifest,
                     manifest_location,
@@ -395,13 +400,14 @@ impl<'a> CommitBuilder<'a> {
                     ..dataset.as_ref().clone()
                 })
             }
-            WriteDestination::Uri(uri) => {
+            WriteDestination::Uri(_) => {
+                let resolved_uri = clean_uri.unwrap_or_default();
                 let branch_location = BranchLocation {
                     path: base_path.clone(),
-                    uri: uri.to_string(),
+                    uri: resolved_uri.clone(),
                     branch: manifest.branch.clone(),
                 };
-                let display_uri = Dataset::make_display_uri(&branch_location);
+                let display_uri = Dataset::make_display_uri(&branch_location)?;
                 let refs = Refs::new(
                     object_store.clone(),
                     commit_handler.clone(),
@@ -411,7 +417,7 @@ impl<'a> CommitBuilder<'a> {
                 Ok(Dataset {
                     object_store,
                     base: base_path,
-                    uri: uri.to_string(),
+                    uri: resolved_uri,
                     display_uri,
                     manifest: Arc::new(manifest),
                     manifest_location,

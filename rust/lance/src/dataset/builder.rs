@@ -43,6 +43,8 @@ pub struct DatasetBuilder {
     commit_handler: Option<Arc<dyn CommitHandler>>,
     options: ObjectStoreParams,
     version: Option<Ref>,
+    /// Whether `version` was set from a `?branch=` query parameter in the URI.
+    version_from_uri: bool,
     table_uri: String,
     file_reader_options: Option<FileReaderOptions>,
     /// Storage options that override user-provided options (e.g., from namespace)
@@ -72,6 +74,7 @@ impl DatasetBuilder {
     pub fn from_uri<T: AsRef<str>>(table_uri: T) -> Self {
         let raw_uri = table_uri.as_ref();
         let (clean_uri, branch) = Self::parse_branch_from_uri(raw_uri);
+        let version_from_uri = branch.is_some();
         let version = branch.map(|b| Ref::from((b.as_str(), None::<u64>)));
 
         Self {
@@ -82,6 +85,7 @@ impl DatasetBuilder {
             commit_handler: None,
             session: None,
             version,
+            version_from_uri,
             manifest: None,
             file_reader_options: None,
             storage_options_override: None,
@@ -90,14 +94,16 @@ impl DatasetBuilder {
 
     /// Extract a `branch` query parameter from the URI, returning
     /// the cleaned URI (without the branch param) and the branch name if present.
-    pub fn parse_branch_from_uri(uri: &str) -> (String, Option<String>) {
+    ///
+    /// Empty branch values (e.g. `?branch=`) are treated as absent and return `None`.
+    pub(crate) fn parse_branch_from_uri(uri: &str) -> (String, Option<String>) {
         if let Ok(mut parsed) = Url::parse(uri) {
-            let branch = parsed
+            let raw_branch = parsed
                 .query_pairs()
                 .find(|(key, _)| key == "branch")
                 .map(|(_, value)| value.into_owned());
 
-            if branch.is_some() {
+            if raw_branch.is_some() {
                 // Remove the branch param, keep other query params
                 let remaining: Vec<(String, String)> = parsed
                     .query_pairs()
@@ -114,21 +120,49 @@ impl DatasetBuilder {
                         .join("&");
                     parsed.set_query(Some(&query_string));
                 }
+                // Treat empty branch values as absent
+                let branch = raw_branch.filter(|v| !v.is_empty());
                 return (parsed.to_string(), branch);
             }
             return (uri.to_string(), None);
         }
 
-        // Fallback for URIs that url::Url cannot parse (e.g. bare local paths)
-        if let Some(idx) = uri.find("?branch=") {
-            let base = &uri[..idx];
-            let rest = &uri[idx + "?branch=".len()..];
-            let branch = if let Some(amp) = rest.find('&') {
+        // Fallback for URIs that url::Url cannot parse (e.g. bare local paths).
+        // Handles branch as first param (?branch=) or non-first param (&branch=).
+        let branch_start = uri
+            .find("?branch=")
+            .map(|i| (i, i + "?branch=".len()))
+            .or_else(|| uri.find("&branch=").map(|i| (i, i + "&branch=".len())));
+
+        if let Some((param_start, value_start)) = branch_start {
+            let rest = &uri[value_start..];
+            let branch_value = if let Some(amp) = rest.find('&') {
                 rest[..amp].to_string()
             } else {
                 rest.to_string()
             };
-            (base.to_string(), Some(branch))
+            // Reconstruct the URI without the branch param
+            let before = &uri[..param_start];
+            let after_value_end = value_start + branch_value.len();
+            let after = if after_value_end < uri.len() {
+                // There are more params after branch; connect them
+                let remaining = &uri[after_value_end..]; // starts with '&'
+                if before.contains('?') {
+                    remaining.to_string()
+                } else {
+                    // branch was the first param (?branch=...&rest); promote '&' to '?'
+                    format!("?{}", &remaining[1..])
+                }
+            } else {
+                String::new()
+            };
+            let clean_uri = format!("{}{}", before, after);
+            let branch = if branch_value.is_empty() {
+                None
+            } else {
+                Some(branch_value)
+            };
+            (clean_uri, branch)
         } else {
             (uri.to_string(), None)
         }
@@ -262,21 +296,45 @@ impl DatasetBuilder {
         self
     }
 
-    /// Sets `version` for the builder using a version number
+    /// Sets `version` for the builder using a version number.
+    ///
+    /// If a `?branch=` parameter was present in the URI, this overrides it.
     pub fn with_version(mut self, version: u64) -> Self {
+        if self.version_from_uri {
+            tracing::warn!(
+                "Overriding ?branch= from URI with explicit version {}",
+                version
+            );
+            self.version_from_uri = false;
+        }
         self.version = Some(Ref::from(version));
         self
     }
 
-    /// Sets `version` for the builder using a branch and optional version number
-    /// If version_number is null, checkout the latest version
+    /// Sets `version` for the builder using a branch and optional version number.
+    /// If version_number is null, checkout the latest version.
+    ///
+    /// If a `?branch=` parameter was present in the URI, this overrides it.
     pub fn with_branch(mut self, branch: &str, version_number: Option<u64>) -> Self {
+        if self.version_from_uri {
+            tracing::warn!(
+                "Overriding ?branch= from URI with explicit branch '{}'",
+                branch
+            );
+            self.version_from_uri = false;
+        }
         self.version = Some(Ref::from((branch, version_number)));
         self
     }
 
-    /// Sets `version` for the builder using a tag
+    /// Sets `version` for the builder using a tag.
+    ///
+    /// If a `?branch=` parameter was present in the URI, this overrides it.
     pub fn with_tag(mut self, tag: &str) -> Self {
+        if self.version_from_uri {
+            tracing::warn!("Overriding ?branch= from URI with explicit tag '{}'", tag);
+            self.version_from_uri = false;
+        }
         self.version = Some(Ref::from(tag));
         self
     }
@@ -830,5 +888,35 @@ mod tests {
         let (uri, branch) = DatasetBuilder::parse_branch_from_uri("/tmp/my-dataset.lance");
         assert_eq!(uri, "/tmp/my-dataset.lance");
         assert_eq!(branch, None);
+
+        // Empty branch value is treated as absent
+        let (uri, branch) =
+            DatasetBuilder::parse_branch_from_uri("s3://my-bucket/db/table.lance?branch=");
+        assert_eq!(uri, "s3://my-bucket/db/table.lance");
+        assert_eq!(branch, None);
+
+        // Empty branch value in fallback path
+        let (uri, branch) = DatasetBuilder::parse_branch_from_uri("/tmp/my-dataset.lance?branch=");
+        assert_eq!(uri, "/tmp/my-dataset.lance");
+        assert_eq!(branch, None);
+
+        // URL-encoded branch name (e.g. feature%2Fx decodes to feature/x)
+        let (uri, branch) = DatasetBuilder::parse_branch_from_uri(
+            "s3://my-bucket/db/table.lance?branch=feature%2Fx",
+        );
+        assert_eq!(uri, "s3://my-bucket/db/table.lance");
+        assert_eq!(branch.as_deref(), Some("feature/x"));
+
+        // Local path with branch as non-first param (fallback &branch=)
+        let (uri, branch) =
+            DatasetBuilder::parse_branch_from_uri("/tmp/my-dataset.lance?timeout=30&branch=dev");
+        assert_eq!(uri, "/tmp/my-dataset.lance?timeout=30");
+        assert_eq!(branch.as_deref(), Some("dev"));
+
+        // Local path with branch as first param and additional params
+        let (uri, branch) =
+            DatasetBuilder::parse_branch_from_uri("/tmp/my-dataset.lance?branch=dev&timeout=30");
+        assert_eq!(uri, "/tmp/my-dataset.lance?timeout=30");
+        assert_eq!(branch.as_deref(), Some("dev"));
     }
 }

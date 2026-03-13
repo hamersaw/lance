@@ -14,7 +14,7 @@ use lance_table::io::commit::ManifestNamingScheme;
 use crate::dataset::write::{CommitBuilder, WriteMode, WriteParams};
 use arrow_array::RecordBatch;
 use arrow_array::RecordBatchReader;
-use arrow_array::{RecordBatchIterator, UInt32Array, types::Int32Type};
+use arrow_array::{Int32Array, RecordBatchIterator, UInt32Array, types::Int32Type};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance_core::utils::tempfile::{TempDir, TempStdDir, TempStrDir};
 use lance_datagen::{BatchCount, RowCount, array, gen_batch};
@@ -766,4 +766,65 @@ async fn test_branch() {
         .await
         .unwrap();
     assert!(branches.is_empty());
+}
+
+/// Write to a branch using the display URI (`?branch=<name>`) and verify the
+/// data is written to the correct branch location and the returned dataset
+/// has a correct display URI.
+#[tokio::test]
+async fn test_write_via_branch_display_uri() {
+    let test_uri = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "a",
+        DataType::Int32,
+        false,
+    )]));
+
+    // Create initial dataset on main
+    let data = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(data)], schema.clone());
+    let mut dataset = Dataset::write(reader, &test_uri, None).await.unwrap();
+
+    // Create a branch
+    let branch_ds = dataset
+        .create_branch("write-test", dataset.version().version, None)
+        .await
+        .unwrap();
+    let branch_uri = branch_ds.uri().to_string();
+    assert!(branch_uri.contains("?branch=write-test"));
+
+    // Write new data using the display URI (with ?branch=)
+    let data2 = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![4, 5, 6]))],
+    )
+    .unwrap();
+    let reader2 = RecordBatchIterator::new(vec![Ok(data2)], schema.clone());
+    let appended = Dataset::write(
+        reader2,
+        &branch_uri,
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    // Returned dataset should have the correct display URI
+    assert_eq!(appended.uri(), format!("{}?branch=write-test", test_uri));
+    assert_eq!(appended.count_rows(None).await.unwrap(), 6);
+
+    // Re-open via display URI and verify data
+    let reopened = Dataset::open(&branch_uri).await.unwrap();
+    assert_eq!(reopened.count_rows(None).await.unwrap(), 6);
+    assert_eq!(reopened.uri(), format!("{}?branch=write-test", test_uri));
+
+    // Main branch should still have 3 rows
+    let main_ds = Dataset::open(&test_uri).await.unwrap();
+    assert_eq!(main_ds.count_rows(None).await.unwrap(), 3);
 }
