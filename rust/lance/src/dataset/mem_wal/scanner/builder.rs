@@ -13,6 +13,7 @@ use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream};
 use datafusion::prelude::{Expr, SessionContext};
 use futures::TryStreamExt;
 use lance_core::{Error, Result};
+use tracing::instrument;
 use uuid::Uuid;
 
 use super::collector::{ActiveMemTableRef, LsmDataSourceCollector};
@@ -165,6 +166,7 @@ impl LsmScanner {
     }
 
     /// Create the execution plan.
+    #[instrument(level = "debug", skip(self))]
     pub async fn create_plan(&self) -> Result<Arc<dyn ExecutionPlan>> {
         let collector = self.build_collector();
         let base_schema = self.schema();
@@ -183,6 +185,7 @@ impl LsmScanner {
     }
 
     /// Execute the scan and return a stream of record batches.
+    #[instrument(level = "info", skip(self), fields(has_filter = self.filter.is_some(), limit = self.limit, num_shards = self.shard_snapshots.len()))]
     pub async fn try_into_stream(&self) -> Result<SendableRecordBatchStream> {
         let plan = self.create_plan().await?;
         let ctx = SessionContext::new();
