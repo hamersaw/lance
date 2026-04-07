@@ -1013,6 +1013,11 @@ impl ShardWriter {
         );
         wal_flusher.set_object_store(object_store.clone());
 
+        // Write fence barrier to claim WAL positions and fence zombie writers.
+        // Uses PutMode::Create to atomically claim the next WAL position,
+        // scanning forward past any entries left by old (fenced) writers.
+        wal_flusher.write_fence_barrier(&schema).await?;
+
         // Create channels for background tasks
         let (wal_flush_tx, wal_flush_rx) = mpsc::unbounded_channel();
         let (memtable_flush_tx, memtable_flush_rx) = mpsc::unbounded_channel();
@@ -1099,9 +1104,10 @@ impl ShardWriter {
     ///
     /// # Note
     ///
-    /// Fencing is detected lazily during WAL flush via atomic writes.
-    /// If another writer has taken over, the WAL flush will fail with
-    /// `AlreadyExists`, indicating this writer has been fenced.
+    /// Fencing is enforced at WAL flush time via `PutMode::Create` (conditional
+    /// PUT). Each WAL entry is written with put-if-not-exists — if another writer
+    /// already claimed that position, the write fails with a fencing error. A
+    /// fence barrier written at startup ensures old writers are immediately fenced.
     pub async fn put(&self, batches: Vec<RecordBatch>) -> Result<WriteResult> {
         if batches.is_empty() {
             return Err(Error::invalid_input("Cannot write empty batch list"));

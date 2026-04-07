@@ -18,7 +18,9 @@ use arrow_schema::Schema as ArrowSchema;
 use bytes::Bytes;
 use lance_core::{Error, Result};
 use lance_io::object_store::ObjectStore;
+use log::info;
 use object_store::path::Path;
+use object_store::{PutMode, PutOptions};
 use tokio::sync::{mpsc, watch};
 
 use uuid::Uuid;
@@ -389,15 +391,26 @@ impl WalFlusher {
         let wal_data = Bytes::from(buffer);
         let store = object_store.clone();
 
+        // WAL entries use PutMode::Create (put-if-not-exists) for fencing.
+        // If another writer already wrote this position, the put fails with
+        // AlreadyExists, which we map to a fencing error. This is the same
+        // cost as a regular PUT on S3 (If-None-Match header) so adds zero
+        // additional latency.
+        let put_opts = PutOptions {
+            mode: PutMode::Create,
+            ..Default::default()
+        };
+        let shard_id = self.shard_id;
+
         // Returns (overall_duration, per_index_durations)
         let (wal_result, index_result) = if let Some(idx_registry) = indexes {
             let wal_future = async {
                 let start = Instant::now();
                 store
                     .inner
-                    .put(&wal_path, wal_data.into())
+                    .put_opts(&wal_path, wal_data.into(), put_opts)
                     .await
-                    .map_err(|e| Error::io(format!("Failed to write WAL file: {}", e)))?;
+                    .map_err(|e| Self::map_wal_put_error(e, wal_entry_position, shard_id))?;
                 Ok::<_, Error>(start.elapsed())
             };
 
@@ -417,9 +430,9 @@ impl WalFlusher {
                 let start = Instant::now();
                 store
                     .inner
-                    .put(&wal_path, wal_data.into())
+                    .put_opts(&wal_path, wal_data.into(), put_opts)
                     .await
-                    .map_err(|e| Error::io(format!("Failed to write WAL file: {}", e)))?;
+                    .map_err(|e| Self::map_wal_put_error(e, wal_entry_position, shard_id))?;
                 Ok::<_, Error>(start.elapsed())
             };
 
@@ -475,6 +488,87 @@ impl WalFlusher {
     pub fn wal_entry_path(&self, wal_entry_position: u64) -> Path {
         let filename = wal_entry_filename(wal_entry_position);
         self.wal_dir.child(filename.as_str())
+    }
+
+    /// Write a fence barrier at startup to claim WAL positions.
+    ///
+    /// Writes an empty WAL entry (valid Arrow IPC stream, zero batches) using
+    /// `PutMode::Create` at the next expected position. If a zombie writer
+    /// already wrote there, we skip forward until we find an unclaimed slot.
+    /// This immediately fences any old writer still holding stale positions.
+    pub async fn write_fence_barrier(&self, schema: &ArrowSchema) -> Result<()> {
+        let object_store = self
+            .object_store
+            .as_ref()
+            .ok_or_else(|| Error::io("Object store not set on WAL flusher"))?;
+
+        // Build an empty WAL entry (schema + epoch metadata, no batches)
+        let mut metadata = schema.metadata().clone();
+        metadata.insert(WRITER_EPOCH_KEY.to_string(), self.writer_epoch.to_string());
+        let schema_with_epoch = ArrowSchema::new_with_metadata(schema.fields().to_vec(), metadata);
+
+        let mut buffer = Vec::new();
+        {
+            let mut writer =
+                StreamWriter::try_new(&mut buffer, &schema_with_epoch).map_err(|e| {
+                    Error::io(format!("Failed to create fence barrier IPC stream: {}", e))
+                })?;
+            writer.finish().map_err(|e| {
+                Error::io(format!("Failed to finish fence barrier IPC stream: {}", e))
+            })?;
+        }
+        let barrier_data = Bytes::from(buffer);
+
+        let put_opts = PutOptions {
+            mode: PutMode::Create,
+            ..Default::default()
+        };
+
+        // Try to claim positions, scanning forward past any old writer's entries
+        loop {
+            let position = self.next_wal_entry_position.load(Ordering::SeqCst);
+            let path = self.wal_entry_path(position);
+
+            match object_store
+                .inner
+                .put_opts(&path, barrier_data.clone().into(), put_opts.clone())
+                .await
+            {
+                Ok(_) => {
+                    // Claimed this position — advance past it for real writes
+                    self.next_wal_entry_position.fetch_add(1, Ordering::SeqCst);
+                    info!(
+                        "Fence barrier written at WAL position {} for shard {} (epoch {})",
+                        position, self.shard_id, self.writer_epoch
+                    );
+                    return Ok(());
+                }
+                Err(object_store::Error::AlreadyExists { .. }) => {
+                    // Old writer claimed this position — skip forward
+                    self.next_wal_entry_position.fetch_add(1, Ordering::SeqCst);
+                    continue;
+                }
+                Err(e) => {
+                    return Err(Error::io(format!(
+                        "Failed to write fence barrier at position {}: {}",
+                        position, e
+                    )));
+                }
+            }
+        }
+    }
+
+    /// Map an object_store put error to a fencing error when AlreadyExists.
+    fn map_wal_put_error(e: object_store::Error, wal_entry_position: u64, shard_id: Uuid) -> Error {
+        if matches!(e, object_store::Error::AlreadyExists { .. }) {
+            Error::io(format!(
+                "Writer fenced: WAL position {} already exists for shard {} \
+                 (another writer has claimed this position)",
+                wal_entry_position, shard_id
+            ))
+        } else {
+            Error::io(format!("Failed to write WAL file: {}", e))
+        }
     }
 }
 
@@ -695,5 +789,153 @@ mod tests {
         assert_eq!(wal_data.batches.len(), 2);
         assert_eq!(wal_data.batches[0].num_rows(), 10);
         assert_eq!(wal_data.batches[1].num_rows(), 5);
+    }
+
+    // ========================================================================
+    // Conditional PUT fencing tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_wal_flush_rejects_duplicate_position() {
+        let (store, base_path, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+
+        // Writer A and B both start from WAL position 1 (simulating stale manifest)
+        let mut flusher_a = WalFlusher::new(&base_path, shard_id, 1, 1);
+        flusher_a.set_object_store(store.clone());
+
+        let mut flusher_b = WalFlusher::new(&base_path, shard_id, 2, 1);
+        flusher_b.set_object_store(store.clone());
+
+        let schema = create_test_schema();
+
+        // Writer A flushes first — succeeds (claims position 1)
+        let batch_store_a = BatchStore::with_capacity(10);
+        batch_store_a.append(create_test_batch(&schema, 5)).unwrap();
+        let result_a = flusher_a
+            .flush_to_with_index_update(&batch_store_a, batch_store_a.len(), None)
+            .await;
+        assert!(result_a.is_ok(), "First writer should succeed");
+
+        // Writer B tries same position — fails with fencing error
+        let batch_store_b = BatchStore::with_capacity(10);
+        batch_store_b.append(create_test_batch(&schema, 5)).unwrap();
+        let result_b = flusher_b
+            .flush_to_with_index_update(&batch_store_b, batch_store_b.len(), None)
+            .await;
+        assert!(result_b.is_err(), "Second writer should be fenced");
+        assert!(
+            result_b.unwrap_err().to_string().contains("Writer fenced"),
+            "Error should indicate fencing"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fence_barrier_claims_position() {
+        let (store, base_path, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let schema = create_test_schema();
+
+        let mut flusher = WalFlusher::new(&base_path, shard_id, 1, 1);
+        flusher.set_object_store(store.clone());
+
+        // Write fence barrier
+        flusher.write_fence_barrier(&schema).await.unwrap();
+
+        // Next position should have advanced past the barrier
+        assert_eq!(flusher.next_wal_entry_position(), 2);
+
+        // The barrier WAL entry should be readable
+        let wal_path = flusher.wal_entry_path(1);
+        let wal_data = WalEntryData::read(&store, &wal_path).await.unwrap();
+        assert_eq!(wal_data.writer_epoch, 1);
+        assert_eq!(wal_data.batches.len(), 0); // Empty barrier
+    }
+
+    #[tokio::test]
+    async fn test_fence_barrier_skips_past_old_writer_entries() {
+        let (store, base_path, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let schema = create_test_schema();
+
+        // Old writer A wrote WAL entries at positions 1, 2, 3
+        let mut flusher_a = WalFlusher::new(&base_path, shard_id, 1, 1);
+        flusher_a.set_object_store(store.clone());
+        for _ in 0..3 {
+            let batch_store = BatchStore::with_capacity(10);
+            batch_store.append(create_test_batch(&schema, 5)).unwrap();
+            flusher_a
+                .flush_to_with_index_update(&batch_store, batch_store.len(), None)
+                .await
+                .unwrap();
+        }
+        assert_eq!(flusher_a.next_wal_entry_position(), 4);
+
+        // New writer B starts from position 1 (stale manifest) and writes barrier.
+        // Should skip forward past A's entries to position 4.
+        let mut flusher_b = WalFlusher::new(&base_path, shard_id, 2, 1);
+        flusher_b.set_object_store(store.clone());
+        flusher_b.write_fence_barrier(&schema).await.unwrap();
+
+        // B should have skipped positions 1,2,3 and claimed 4, now at 5
+        assert_eq!(flusher_b.next_wal_entry_position(), 5);
+
+        // B can now write real data at position 5
+        let batch_store_b = BatchStore::with_capacity(10);
+        batch_store_b
+            .append(create_test_batch(&schema, 10))
+            .unwrap();
+        let result = flusher_b
+            .flush_to_with_index_update(&batch_store_b, batch_store_b.len(), None)
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().entry.unwrap().position, 5);
+    }
+
+    #[tokio::test]
+    async fn test_fence_barrier_blocks_old_writer_from_continuing() {
+        let (store, base_path, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let schema = create_test_schema();
+
+        // Old writer A starts at position 1 but hasn't flushed yet
+        let mut flusher_a = WalFlusher::new(&base_path, shard_id, 1, 1);
+        flusher_a.set_object_store(store.clone());
+
+        // New writer B starts at position 1 and writes fence barrier
+        let mut flusher_b = WalFlusher::new(&base_path, shard_id, 2, 1);
+        flusher_b.set_object_store(store.clone());
+        flusher_b.write_fence_barrier(&schema).await.unwrap();
+
+        // Old writer A tries to flush — position 1 is taken by B's barrier
+        let batch_store_a = BatchStore::with_capacity(10);
+        batch_store_a.append(create_test_batch(&schema, 5)).unwrap();
+        let result = flusher_a
+            .flush_to_with_index_update(&batch_store_a, batch_store_a.len(), None)
+            .await;
+        assert!(result.is_err(), "Old writer should be fenced by barrier");
+        assert!(result.unwrap_err().to_string().contains("Writer fenced"));
+    }
+
+    #[tokio::test]
+    async fn test_multiple_sequential_flushes_each_claim_unique_position() {
+        let (store, base_path, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+
+        let mut flusher = WalFlusher::new(&base_path, shard_id, 1, 1);
+        flusher.set_object_store(store);
+
+        let schema = create_test_schema();
+
+        // Multiple flushes should each get a unique position
+        for expected_pos in 1..=5 {
+            let batch_store = BatchStore::with_capacity(10);
+            batch_store.append(create_test_batch(&schema, 3)).unwrap();
+            let result = flusher
+                .flush_to_with_index_update(&batch_store, batch_store.len(), None)
+                .await
+                .unwrap();
+            assert_eq!(result.entry.unwrap().position, expected_pos);
+        }
     }
 }
