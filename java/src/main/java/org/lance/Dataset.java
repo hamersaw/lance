@@ -1317,6 +1317,50 @@ public class Dataset implements Closeable {
   private native List<IndexDescription> nativeDescribeIndices(Optional<IndexCriteria> criteria);
 
   /**
+   * Read a file from an index as an Arrow stream.
+   *
+   * <p>This is a low-level API that reads the raw contents of a file within an index directory.
+   * The caller is responsible for interpreting the returned schema and columns.
+   *
+   * <p>Example: reading zonemap statistics for a column:
+   *
+   * <pre>{@code
+   * // Find the zonemap index name via describeIndices()
+   * String indexName = ...;
+   * try (ArrowReader reader = dataset.readIndexFile(indexName, "zonemap.lance")) {
+   *   while (reader.loadNextBatch()) {
+   *     VectorSchemaRoot batch = reader.getVectorSchemaRoot();
+   *     // columns: fragment_id, zone_start, zone_length, min, max, null_count
+   *   }
+   * }
+   * }</pre>
+   *
+   * @param indexName the logical index name (from {@link IndexDescription#getName()})
+   * @param fileName the file within the index directory (e.g. "zonemap.lance")
+   * @return an ArrowReader over the file contents; caller must close it
+   * @throws IllegalArgumentException if indexName or fileName is null/empty, or if the index is
+   *     not found
+   * @throws RuntimeException if the file does not exist within the index
+   */
+  public ArrowReader readIndexFile(String indexName, String fileName) {
+    Preconditions.checkArgument(
+        indexName != null && !indexName.isEmpty(), "indexName cannot be null or empty");
+    Preconditions.checkArgument(
+        fileName != null && !fileName.isEmpty(), "fileName cannot be null or empty");
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      try (ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)) {
+        nativeReadIndexFile(indexName, fileName, stream.memoryAddress());
+        return Data.importArrayStream(allocator, stream);
+      } catch (IOException e) {
+        throw new RuntimeException("Failed to read index file: " + e.getMessage(), e);
+      }
+    }
+  }
+
+  private native void nativeReadIndexFile(String indexName, String fileName, long streamAddress);
+
+  /**
    * Get the table config of the dataset.
    *
    * @return the table config

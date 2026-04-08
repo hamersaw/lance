@@ -3072,3 +3072,75 @@ fn inner_get_session_handle(env: &mut JNIEnv, java_dataset: JObject) -> Result<j
     let session = dataset_guard.inner.session();
     Ok(handle_from_session(session))
 }
+
+/////////////////////////////////
+// Index File Read Methods     //
+/////////////////////////////////
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeReadIndexFile(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+    jindex_name: JString,
+    jfile_name: JString,
+    stream_addr: jlong,
+) {
+    ok_or_throw_without_return!(
+        env,
+        inner_read_index_file(&mut env, java_dataset, jindex_name, jfile_name, stream_addr)
+    );
+}
+
+fn inner_read_index_file(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    jindex_name: JString,
+    jfile_name: JString,
+    stream_addr: jlong,
+) -> Result<()> {
+    use lance::dataset::index::LanceIndexStoreExt;
+    use lance_index::scalar::IndexStore;
+    use lance_index::scalar::lance_format::LanceIndexStore;
+
+    let index_name: String = jindex_name.extract(env)?;
+    let file_name: String = jfile_name.extract(env)?;
+
+    let dataset = {
+        let dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+        dataset_guard.inner.clone()
+    };
+
+    let record_batch = RT.block_on(async {
+        let indices = dataset.load_indices().await.map_err(Error::from)?;
+        let index_meta = indices
+            .iter()
+            .find(|idx| idx.name == index_name)
+            .ok_or_else(|| {
+                Error::input_error(format!("Index '{}' not found in dataset", index_name))
+            })?;
+
+        let index_store = Arc::new(
+            LanceIndexStore::from_dataset_for_existing(&dataset, index_meta)
+                .map_err(Error::from)?,
+        );
+
+        let index_file = index_store
+            .open_index_file(&file_name)
+            .await
+            .map_err(Error::from)?;
+
+        let batch = index_file
+            .read_range(0..index_file.num_rows(), None)
+            .await
+            .map_err(Error::from)?;
+
+        Ok::<_, Error>(batch)
+    })?;
+
+    let schema = Arc::new(record_batch.schema().as_ref().clone());
+    let reader = RecordBatchIterator::new(std::iter::once(Ok(record_batch)), schema);
+    let ffi_stream = FFI_ArrowArrayStream::new(Box::new(reader));
+    unsafe { std::ptr::write_unaligned(stream_addr as *mut FFI_ArrowArrayStream, ffi_stream) }
+    Ok(())
+}
