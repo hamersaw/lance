@@ -943,7 +943,7 @@ impl ShardWriter {
     ///
     /// The `base_path` should come from `ObjectStore::from_uri()` to ensure
     /// WAL files are written inside the dataset directory.
-    #[instrument(level = "info", skip(object_store, base_path, base_uri, schema, index_configs), fields(shard_id = %config.shard_id, index_count = index_configs.len()))]
+    #[instrument(name = "sw_open", level = "info", skip(object_store, base_path, base_uri, schema, index_configs), fields(shard_id = %config.shard_id, index_count = index_configs.len()))]
     pub async fn open(
         object_store: Arc<ObjectStore>,
         base_path: Path,
@@ -1104,7 +1104,7 @@ impl ShardWriter {
     /// Fencing is detected lazily during WAL flush via atomic writes.
     /// If another writer has taken over, the WAL flush will fail with
     /// `AlreadyExists`, indicating this writer has been fenced.
-    #[instrument(level = "info", skip(self, batches), fields(batch_count = batches.len(), shard_id = %self.config.shard_id))]
+    #[instrument(name = "sw_put", level = "info", skip(self, batches), fields(batch_count = batches.len(), shard_id = %self.config.shard_id))]
     pub async fn put(&self, batches: Vec<RecordBatch>) -> Result<WriteResult> {
         if batches.is_empty() {
             return Err(Error::invalid_input("Cannot write empty batch list"));
@@ -1260,7 +1260,7 @@ impl ShardWriter {
     /// Close the writer gracefully.
     ///
     /// Flushes pending data and shuts down background tasks.
-    #[instrument(level = "info", skip(self), fields(shard_id = %self.config.shard_id, epoch = self.epoch))]
+    #[instrument(name = "sw_close", level = "info", skip(self), fields(shard_id = %self.config.shard_id, epoch = self.epoch))]
     pub async fn close(self) -> Result<()> {
         info!("Closing ShardWriter for shard {}", self.config.shard_id);
 
@@ -1378,6 +1378,7 @@ impl WalFlushHandler {
     /// * `indexes` - Optional indexes to update in parallel with WAL I/O
     /// * `end_batch_position` - End batch ID (exclusive). Flush batches in (max_flushed, end_batch_position).
     #[instrument(
+        name = "wal_do_flush",
         level = "debug",
         skip(self, batch_store, indexes),
         fields(end_batch_position)
@@ -1495,7 +1496,7 @@ impl MemTableFlushHandler {
     /// This method waits for the WAL flush to complete (sent at freeze time),
     /// then flushes to Lance storage. The WAL flush is already queued by
     /// freeze_memtable to ensure strict ordering of WAL entries.
-    #[instrument(level = "info", skip(self, memtable), fields(generation = memtable.generation(), row_count = memtable.row_count()))]
+    #[instrument(name = "mt_flush", level = "info", skip(self, memtable), fields(generation = memtable.generation(), row_count = memtable.row_count()))]
     async fn flush_memtable(
         &mut self,
         memtable: Arc<MemTable>,

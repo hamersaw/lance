@@ -342,7 +342,7 @@ impl MemTable {
     /// # Single Writer Requirement
     ///
     /// This method MUST only be called from the single writer task.
-    #[instrument(level = "debug", skip(self, batch), fields(num_rows = batch.num_rows(), generation = self.generation))]
+    #[instrument(name = "mt_insert", level = "debug", skip(self, batch), fields(num_rows = batch.num_rows(), generation = self.generation))]
     pub async fn insert(&mut self, batch: RecordBatch) -> Result<usize> {
         // Validate schema compatibility
         if batch.schema() != self.schema {
@@ -425,7 +425,7 @@ impl MemTable {
     /// # Single Writer Requirement
     ///
     /// This method MUST only be called from the single writer task.
-    #[instrument(level = "debug", skip(self, batches), fields(batch_count = batches.len(), generation = self.generation))]
+    #[instrument(name = "mt_insert_batches", level = "debug", skip(self, batches), fields(batch_count = batches.len(), generation = self.generation))]
     pub async fn insert_batches_only(
         &mut self,
         batches: Vec<RecordBatch>,

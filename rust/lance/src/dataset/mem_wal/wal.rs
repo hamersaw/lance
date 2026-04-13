@@ -298,7 +298,7 @@ impl WalFlusher {
     ///
     /// A `WalFlushResult` with timing metrics and the WAL entry.
     /// Returns empty result if nothing to flush (already flushed past end_batch_position).
-    #[instrument(level = "info", skip(self, batch_store, indexes), fields(shard_id = %self.shard_id, end_batch_position, has_indexes = indexes.is_some()))]
+    #[instrument(name = "wal_flush", level = "info", skip(self, batch_store, indexes), fields(shard_id = %self.shard_id, end_batch_position, has_indexes = indexes.is_some()))]
     pub async fn flush_to_with_index_update(
         &self,
         batch_store: &BatchStore,
@@ -500,7 +500,7 @@ impl WalEntryData {
     /// # Returns
     ///
     /// The parsed WAL entry data, or an error if reading/parsing fails.
-    #[instrument(level = "debug", skip(object_store), fields(path = %path))]
+    #[instrument(name = "wal_entry_read", level = "debug", skip(object_store), fields(path = %path))]
     pub async fn read(object_store: &ObjectStore, path: &Path) -> Result<Self> {
         // Read the file
         let data = object_store

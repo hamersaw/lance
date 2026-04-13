@@ -76,7 +76,7 @@ impl LsmScanPlanner {
     /// - SortPreservingMergeExec is O(N log K) where K is the number of sources
     /// - Memory usage is bounded by the sum of K sort buffers rather than all data
     /// - No extra column for _memtable_gen in the common case
-    #[instrument(level = "debug", skip(self, projection, filter), fields(has_filter = filter.is_some(), limit, offset))]
+    #[instrument(name = "lsm_plan_scan", level = "debug", skip(self, projection, filter), fields(has_filter = filter.is_some(), limit, offset))]
     pub async fn plan_scan(
         &self,
         projection: Option<&[String]>,

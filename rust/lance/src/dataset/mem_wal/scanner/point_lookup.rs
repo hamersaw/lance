@@ -118,7 +118,7 @@ impl LsmPointLookupPlanner {
     ///
     /// An execution plan that returns at most one row - the newest version
     /// of the row with the given primary key.
-    #[instrument(level = "debug", skip(self, pk_values, projection), fields(pk_column_count = self.pk_columns.len()))]
+    #[instrument(name = "lsm_point_lookup", level = "debug", skip(self, pk_values, projection), fields(pk_column_count = self.pk_columns.len()))]
     pub async fn plan_lookup(
         &self,
         pk_values: &[ScalarValue],
