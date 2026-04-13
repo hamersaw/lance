@@ -92,7 +92,7 @@ impl ShardManifestStore {
     /// Read the latest manifest version.
     ///
     /// Returns `None` if no manifest exists (new shard).
-    #[instrument(name = "manifest_read_latest", level = "debug", skip(self), fields(shard_id = %self.shard_id))]
+    #[instrument(name = "manifest_read_latest", level = "debug", skip_all, fields(shard_id = %self.shard_id))]
     pub async fn read_latest(&self) -> Result<Option<ShardManifest>> {
         let version = self.find_latest_version().await?;
         if version == 0 {
@@ -136,7 +136,7 @@ impl ShardManifestStore {
     /// # Errors
     ///
     /// Returns `Error::AlreadyExists` if another writer already wrote this version.
-    #[instrument(name = "manifest_write", level = "debug", skip(self, manifest), fields(shard_id = %self.shard_id, version = manifest.version, epoch = manifest.writer_epoch))]
+    #[instrument(name = "manifest_write", level = "debug", skip_all, fields(shard_id = %self.shard_id, version = manifest.version, epoch = manifest.writer_epoch))]
     pub async fn write(&self, manifest: &ShardManifest) -> Result<u64> {
         let version = manifest.version;
         let filename = manifest_filename(version);
@@ -372,7 +372,7 @@ impl ShardManifestStore {
     /// # Errors
     ///
     /// Returns an error if another writer already claimed the shard.
-    #[instrument(name = "manifest_claim_epoch", level = "info", skip(self), fields(shard_id = %self.shard_id, shard_spec_id))]
+    #[instrument(name = "manifest_claim_epoch", level = "info", skip_all, fields(shard_id = %self.shard_id, shard_spec_id))]
     pub async fn claim_epoch(&self, shard_spec_id: u32) -> Result<(u64, ShardManifest)> {
         let current = self.read_latest().await?;
 
@@ -419,7 +419,7 @@ impl ShardManifestStore {
     ///
     /// Loads the current manifest and compares epochs. If the stored epoch
     /// is higher than the local epoch, the writer has been fenced.
-    #[instrument(name = "manifest_check_fenced", level = "debug", skip(self), fields(shard_id = %self.shard_id, local_epoch))]
+    #[instrument(name = "manifest_check_fenced", level = "debug", skip_all, fields(shard_id = %self.shard_id, local_epoch))]
     pub async fn check_fenced(&self, local_epoch: u64) -> Result<()> {
         let current = self.read_latest().await?;
         Self::check_fenced_against(&current, local_epoch, self.shard_id)
@@ -457,7 +457,7 @@ impl ShardManifestStore {
     /// # Returns
     ///
     /// The successfully written manifest.
-    #[instrument(name = "manifest_commit_update", level = "debug", skip(self, prepare_fn), fields(shard_id = %self.shard_id, local_epoch))]
+    #[instrument(name = "manifest_commit_update", level = "debug", skip_all, fields(shard_id = %self.shard_id, local_epoch))]
     pub async fn commit_update<F>(&self, local_epoch: u64, prepare_fn: F) -> Result<ShardManifest>
     where
         F: Fn(&ShardManifest) -> ShardManifest,

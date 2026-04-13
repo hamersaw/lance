@@ -145,7 +145,7 @@ impl LsmVectorSearchPlanner {
     ///
     /// An execution plan that returns the top-K nearest neighbors across all
     /// LSM levels, with stale results filtered out.
-    #[instrument(name = "lsm_vector_search", level = "info", skip(self, query_vector, projection), fields(k, nprobes, vector_column = %self.vector_column, distance_type = ?self.distance_type))]
+    #[instrument(name = "lsm_vector_search", level = "info", skip_all, fields(k, nprobes, vector_column = %self.vector_column, distance_type = ?self.distance_type))]
     pub async fn plan_search(
         &self,
         query_vector: &FixedSizeListArray,
