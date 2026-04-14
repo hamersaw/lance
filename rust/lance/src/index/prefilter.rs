@@ -70,8 +70,9 @@ impl DatasetPreFilter {
                 fragments |= idx.fragment_bitmap.as_ref().unwrap();
             });
         }
-        let deleted_ids =
-            Self::create_deletion_mask(dataset, fragments).map(SharedPrerequisite::spawn);
+        let index_uses_stable = indices.iter().all(|idx| idx.stable_row_ids == Some(true));
+        let deleted_ids = Self::create_deletion_mask(dataset, fragments, index_uses_stable)
+            .map(SharedPrerequisite::spawn);
         let filtered_ids = filter
             .map(|filtered_ids| SharedPrerequisite::spawn(filtered_ids.load().in_current_span()));
         Self {
@@ -198,6 +199,7 @@ impl DatasetPreFilter {
     pub fn create_deletion_mask(
         dataset: Arc<Dataset>,
         fragments: RoaringBitmap,
+        index_uses_stable_row_ids: bool,
     ) -> Option<BoxFuture<'static, Result<Arc<RowAddrMask>>>> {
         let mut missing_frags = Vec::new();
         let mut frags_with_deletion_files = Vec::new();
@@ -220,7 +222,7 @@ impl DatasetPreFilter {
         }
         if missing_frags.is_empty() && frags_with_deletion_files.is_empty() {
             None
-        } else if dataset.manifest.uses_stable_row_ids() {
+        } else if index_uses_stable_row_ids {
             Some(Self::do_create_deletion_mask_row_id(dataset.clone()).boxed())
         } else {
             Some(
@@ -364,6 +366,7 @@ mod test {
         let mask = DatasetPreFilter::create_deletion_mask(
             datasets.no_deletions.clone(),
             RoaringBitmap::from_iter(0..3),
+            false,
         );
         assert!(mask.is_none());
 
@@ -371,6 +374,7 @@ mod test {
         let mask = DatasetPreFilter::create_deletion_mask(
             datasets.deletions_no_missing_frags.clone(),
             RoaringBitmap::from_iter(0..3),
+            false,
         );
         assert!(mask.is_some());
         let mask = mask.unwrap().await.unwrap();
@@ -380,6 +384,7 @@ mod test {
         let mask = DatasetPreFilter::create_deletion_mask(
             datasets.deletions_missing_frags.clone(),
             RoaringBitmap::from_iter(0..3),
+            false,
         );
         assert!(mask.is_some());
         let mask = mask.unwrap().await.unwrap();
@@ -391,6 +396,7 @@ mod test {
         let mask = DatasetPreFilter::create_deletion_mask(
             datasets.deletions_missing_frags.clone(),
             RoaringBitmap::from_iter(2..3),
+            false,
         );
         assert!(mask.is_some());
         let mask = mask.unwrap().await.unwrap();
@@ -400,6 +406,7 @@ mod test {
         let mask = DatasetPreFilter::create_deletion_mask(
             datasets.only_missing_frags.clone(),
             RoaringBitmap::from_iter(0..3),
+            false,
         );
         assert!(mask.is_some());
         let mask = mask.unwrap().await.unwrap();
@@ -418,6 +425,7 @@ mod test {
         let mask = DatasetPreFilter::create_deletion_mask(
             datasets.no_deletions.clone(),
             RoaringBitmap::from_iter(0..3),
+            true,
         );
         assert!(mask.is_none());
 
@@ -425,6 +433,7 @@ mod test {
         let mask = DatasetPreFilter::create_deletion_mask(
             datasets.deletions_no_missing_frags.clone(),
             RoaringBitmap::from_iter(0..3),
+            true,
         );
         assert!(mask.is_some());
         let mask = mask.unwrap().await.unwrap();
@@ -435,6 +444,7 @@ mod test {
         let mask = DatasetPreFilter::create_deletion_mask(
             datasets.deletions_missing_frags.clone(),
             RoaringBitmap::from_iter(0..2),
+            true,
         );
         assert!(mask.is_some());
         let mask = mask.unwrap().await.unwrap();
@@ -444,6 +454,7 @@ mod test {
         let mask = DatasetPreFilter::create_deletion_mask(
             datasets.only_missing_frags.clone(),
             RoaringBitmap::from_iter(0..3),
+            true,
         );
         assert!(mask.is_some());
         let mask = mask.unwrap().await.unwrap();

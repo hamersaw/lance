@@ -340,8 +340,11 @@ impl MapIndexExec {
             .load_scalar_index(IndexCriteria::default().with_name(&index_name))
             .await?
             .unwrap();
-        let deletion_mask_fut =
-            DatasetPreFilter::create_deletion_mask(dataset.clone(), index.fragment_bitmap.unwrap());
+        let deletion_mask_fut = DatasetPreFilter::create_deletion_mask(
+            dataset.clone(),
+            index.fragment_bitmap.unwrap(),
+            dataset.manifest.uses_stable_row_ids(),
+        );
         let deletion_mask = if let Some(deletion_mask_fut) = deletion_mask_fut {
             Some(deletion_mask_fut.await?)
         } else {
@@ -540,7 +543,11 @@ impl MaterializeIndexExec {
             // The user-requested `fragments` is guaranteed to be stricter than the index's fragment
             // bitmap.  This node only runs on indexed fragments and any fragments that were deleted
             // when the index was trained will still be deleted when the index is queried.
-            DatasetPreFilter::create_deletion_mask(dataset.clone(), fragment_bitmap)
+            DatasetPreFilter::create_deletion_mask(
+                dataset.clone(),
+                fragment_bitmap,
+                dataset.manifest.uses_stable_row_ids(),
+            )
         });
         let mask = if let Some(prefilter) = prefilter {
             let (expr_result, prefilter) = futures::try_join!(expr_result, prefilter)?;

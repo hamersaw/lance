@@ -35,8 +35,8 @@ use datafusion_physical_expr::{Distribution, EquivalenceProperties};
 use datafusion_physical_plan::metrics::{BaselineMetrics, Count, Time};
 use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt, future, stream};
 use itertools::Itertools;
-use lance_core::ROW_ID;
 use lance_core::utils::futures::FinallyStreamExt;
+use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID};
 use lance_core::{ROW_ID_FIELD, utils::tokio::get_num_compute_intensive_cpus};
 use lance_datafusion::utils::{
     DELTAS_SEARCHED_METRIC, ExecutionPlanMetricsSetExt, FIND_PARTITIONS_ELAPSED_METRIC,
@@ -303,6 +303,24 @@ pub static KNN_INDEX_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
         ROW_ID_FIELD.clone(),
     ]))
 });
+
+/// Schema for index results that contain row addresses instead of row IDs.
+static KNN_INDEX_ADDR_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(Schema::new(vec![
+        Field::new(DIST_COL, DataType::Float32, true),
+        ROW_ADDR_FIELD.clone(),
+    ]))
+});
+
+/// Returns the appropriate KNN output schema based on whether the indices
+/// use stable row IDs or row addresses.
+fn knn_output_schema(indices: &[IndexMetadata]) -> SchemaRef {
+    if indices.iter().all(|idx| idx.stable_row_ids == Some(true)) {
+        KNN_INDEX_SCHEMA.clone()
+    } else {
+        KNN_INDEX_ADDR_SCHEMA.clone()
+    }
+}
 
 pub static KNN_PARTITION_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(Schema::new(vec![
@@ -603,6 +621,10 @@ pub struct ANNIvfSubIndexExec {
     /// Prefiltering input
     prefilter_source: PreFilterSource,
 
+    /// Whether the indices use row addresses (not stable row IDs).
+    /// When true, output uses `_rowaddr` instead of `_rowid`.
+    is_address_based: bool,
+
     /// Datafusion Plan Properties
     properties: PlanProperties,
 
@@ -623,8 +645,10 @@ impl ANNIvfSubIndexExec {
                 PART_ID_COLUMN
             )));
         }
+        let is_address_based = !indices.iter().all(|idx| idx.stable_row_ids == Some(true));
+        let output_schema = knn_output_schema(&indices);
         let properties = PlanProperties::new(
-            EquivalenceProperties::new(KNN_INDEX_SCHEMA.clone()),
+            EquivalenceProperties::new(output_schema),
             Partitioning::RoundRobinBatch(1),
             EmissionType::Final,
             Boundedness::Bounded,
@@ -635,6 +659,7 @@ impl ANNIvfSubIndexExec {
             indices,
             query,
             prefilter_source,
+            is_address_based,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         })
@@ -954,6 +979,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                 indices: self.indices.clone(),
                 query: self.query.clone(),
                 prefilter_source,
+                is_address_based: self.is_address_based,
                 properties: self.properties.clone(),
                 metrics: ExecutionPlanMetricsSet::new(),
             }
@@ -1036,6 +1062,8 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
         ));
 
         let state = Arc::new(ANNIvfEarlySearchResults::new(indices.len(), query.k));
+        let is_address_based = self.is_address_based;
+        let output_schema = schema.clone();
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             schema,
@@ -1079,6 +1107,17 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                 // Each delta stream is split into an early and late search.  The late search
                 // will not start until the early search is complete across all deltas.
                 .try_flatten_unordered(None)
+                .map(move |batch_result| {
+                    if is_address_based {
+                        // Rename _rowid → _rowaddr so TakeExec uses addresses directly
+                        batch_result.map(|batch| {
+                            RecordBatch::try_new(output_schema.clone(), batch.columns().to_vec())
+                                .expect("schema has same number of columns")
+                        })
+                    } else {
+                        batch_result
+                    }
+                })
                 .finally(move || {
                     metrics_clone
                         .baseline_metrics
@@ -1156,8 +1195,13 @@ pub struct MultivectorScoringExec {
 
 impl MultivectorScoringExec {
     pub fn try_new(inputs: Vec<Arc<dyn ExecutionPlan>>, query: Query) -> Result<Self> {
+        // Propagate schema from inputs: if inputs use _rowaddr, so do we
+        let output_schema = inputs
+            .first()
+            .map(|i| i.schema())
+            .unwrap_or_else(|| KNN_INDEX_SCHEMA.clone());
         let properties = PlanProperties::new(
-            EquivalenceProperties::new(KNN_INDEX_SCHEMA.clone()),
+            EquivalenceProperties::new(output_schema),
             Partitioning::RoundRobinBatch(1),
             EmissionType::Final,
             Boundedness::Bounded,
@@ -1229,13 +1273,21 @@ impl ExecutionPlan for MultivectorScoringExec {
             .map(|input| input.execute(partition, context.clone()))
             .collect::<DataFusionResult<Vec<_>>>()?;
 
+        let output_schema = self.schema();
+        // Determine the row column name from the schema (_rowid or _rowaddr)
+        let row_col = if output_schema.field_with_name(ROW_ADDR).is_ok() {
+            ROW_ADDR
+        } else {
+            ROW_ID
+        };
+
         // collect the top k results from each stream,
         // and max-reduce for each query,
         // records the minimum distance for each query as estimation.
         let mut reduced_inputs = stream::select_all(inputs.into_iter().map(|stream| {
-            stream.map(|batch| {
+            stream.map(move |batch| {
                 let batch = batch?;
-                let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
+                let row_ids = batch[row_col].as_primitive::<UInt64Type>();
                 let dists = batch[DIST_COL].as_primitive::<Float32Type>();
                 debug_assert_eq!(dists.null_count(), 0);
 
@@ -1262,12 +1314,7 @@ impl ExecutionPlan for MultivectorScoringExec {
                 let new_row_ids = UInt64Array::from(new_row_ids);
                 let new_dists = Float32Array::from(new_sims);
 
-                let batch = RecordBatch::try_new(
-                    KNN_INDEX_SCHEMA.clone(),
-                    vec![Arc::new(new_dists), Arc::new(new_row_ids)],
-                )?;
-
-                Ok::<_, DataFusionError>((min_sim, batch))
+                Ok::<_, DataFusionError>((min_sim, new_dists, new_row_ids))
             })
         }));
 
@@ -1278,10 +1325,7 @@ impl ExecutionPlan for MultivectorScoringExec {
             // at most, we will have k * refine_factor results for each query
             let mut results = HashMap::with_capacity(k * refactor);
             let mut missed_sim_sum = 0.0;
-            while let Some((min_sim, batch)) = reduced_inputs.try_next().await? {
-                let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
-                let sims = batch[DIST_COL].as_primitive::<Float32Type>();
-
+            while let Some((min_sim, sims, row_ids)) = reduced_inputs.try_next().await? {
                 let query_results = row_ids
                     .values()
                     .iter()
@@ -1316,7 +1360,7 @@ impl ExecutionPlan for MultivectorScoringExec {
             let row_ids = UInt64Array::from(row_ids);
             let dists = Float32Array::from(dists);
             let batch = RecordBatch::try_new(
-                KNN_INDEX_SCHEMA.clone(),
+                output_schema.clone(),
                 vec![Arc::new(dists), Arc::new(row_ids)],
             )?;
             Ok::<_, DataFusionError>(batch)
