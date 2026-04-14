@@ -1686,4 +1686,78 @@ mod tests {
                     && idx.fragment_bitmap.as_ref().unwrap().len() == 1)
         );
     }
+
+    fn make_int_batch(n: usize) -> RecordBatch {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "x",
+            DataType::Int32,
+            false,
+        )]));
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from_iter_values(0..n as i32))],
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_stable_row_ids_default_follows_dataset() {
+        // On a stable-row-ID dataset, default should be Some(true).
+        let batch = make_int_batch(100);
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+            "memory://test/stable_default",
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let idx = dataset
+            .create_index_builder(&["x"], IndexType::Scalar, &ScalarIndexParams::default())
+            .await
+            .unwrap();
+        assert_eq!(idx.stable_row_ids, Some(true));
+
+        // On a non-stable dataset, default should be Some(false).
+        let batch2 = make_int_batch(100);
+        let mut dataset2 = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch2.clone())], batch2.schema()),
+            "memory://test/nonstable_default",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let idx2 = dataset2
+            .create_index_builder(&["x"], IndexType::Scalar, &ScalarIndexParams::default())
+            .await
+            .unwrap();
+        assert_eq!(idx2.stable_row_ids, Some(false));
+    }
+
+    #[tokio::test]
+    async fn test_stable_row_ids_explicit_true_on_nonstable_errors() {
+        let batch = make_int_batch(100);
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+            "memory://test/stable_err",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let result = dataset
+            .create_index_builder(&["x"], IndexType::Scalar, &ScalarIndexParams::default())
+            .use_stable_row_ids(true)
+            .await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("stable row IDs"),
+            "Expected error about stable row IDs, got: {err_msg}"
+        );
+    }
 }

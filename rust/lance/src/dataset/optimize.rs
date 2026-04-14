@@ -2470,6 +2470,74 @@ mod tests {
         assert_eq!(before_scalar_result, after_scalar_result);
     }
 
+    /// On a stable-row-ID dataset, compaction should NOT remap indices
+    /// (they default to stable_row_ids=true). On a non-stable dataset,
+    /// compaction MUST remap. This test verifies both behaviors and that
+    /// the per-index stable_row_ids field is set correctly by default.
+    #[rstest::rstest]
+    #[case(true)]
+    #[case(false)]
+    #[tokio::test]
+    async fn test_compaction_respects_per_index_stable_row_ids(#[case] use_stable: bool) {
+        let mut data_gen =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("i".to_owned())));
+
+        let uri = format!("memory://test/per_index_stable_{use_stable}");
+        let mut dataset = Dataset::write(
+            data_gen.batch(500),
+            &uri,
+            Some(WriteParams {
+                enable_stable_row_ids: use_stable,
+                max_rows_per_file: 100,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        dataset
+            .create_index(
+                &["i"],
+                IndexType::Scalar,
+                Some("scalar".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let idx = dataset.load_index_by_name("scalar").await.unwrap().unwrap();
+        assert_eq!(idx.stable_row_ids, Some(use_stable));
+        let uuid_before = idx.uuid;
+
+        let options = CompactionOptions {
+            target_rows_per_fragment: 500,
+            ..Default::default()
+        };
+        compact_files(&mut dataset, options, None).await.unwrap();
+
+        let idx_after = dataset.load_index_by_name("scalar").await.unwrap().unwrap();
+        if use_stable {
+            // Stable indices should NOT be remapped
+            assert_eq!(uuid_before, idx_after.uuid);
+        } else {
+            // Address-based indices should be remapped
+            assert_ne!(uuid_before, idx_after.uuid);
+        }
+        // Setting is preserved after compaction
+        assert_eq!(idx_after.stable_row_ids, Some(use_stable));
+
+        // Query should work regardless
+        let result = dataset
+            .scan()
+            .filter("i = 42")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(result.num_rows(), 1);
+    }
+
     // Regression test for https://github.com/lancedb/lance/issues/6161
     // When FragReuseIndexDetails exceeds 204800 bytes it is written to an external
     // file. Previously the file was silently dropped (temp file deleted) because
