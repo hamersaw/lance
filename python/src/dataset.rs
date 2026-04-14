@@ -3500,6 +3500,9 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
                 ExternalBlobMode::try_from(external_blob_mode.as_str()).infer_error()?,
             );
         }
+        if let Some(max_bytes) = get_dict_opt::<usize>(options, "blob_max_pack_file_bytes")? {
+            p = p.with_blob_max_pack_file_bytes(max_bytes);
+        }
 
         // Handle properties
         if let Some(props) =

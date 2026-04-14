@@ -52,6 +52,7 @@ pub fn extract_write_params(
     initial_bases: &JObject,                     // Optional<BasePath>
     target_bases: &JObject,                      // Optional<String>
     allow_external_blob_outside_bases: &JObject, // Optional<Boolean>
+    blob_max_pack_file_bytes: &JObject,          // Optional<Long>
 ) -> Result<WriteParams> {
     let mut write_params = WriteParams::default();
 
@@ -100,6 +101,9 @@ pub fn extract_write_params(
 
     if let Some(allow) = env.get_boolean_opt(allow_external_blob_outside_bases)? {
         write_params.allow_external_blob_outside_bases = allow;
+    }
+    if let Some(max_bytes) = env.get_long_opt(blob_max_pack_file_bytes)? {
+        write_params.blob_max_pack_file_bytes = Some(max_bytes as usize);
     }
 
     // Create storage options accessor from static storage_options
