@@ -1152,13 +1152,18 @@ async fn rewrite_files(
         .iter()
         .map(|f| f.physical_rows.unwrap() as u64)
         .sum::<u64>();
-    // We need to track row addresses for remapping if any index uses row addresses.
-    // When stable_row_ids is None (legacy), fall back to the dataset-level flag.
+    // We need to track row addresses for index remapping.  Row addresses are
+    // needed whenever the dataset doesn't use stable row IDs (non-stable
+    // datasets default to address-based indices) OR when any existing index
+    // explicitly uses row addresses.  This covers deferred-remap scenarios
+    // where no indices exist yet but will be created later on a non-stable
+    // dataset.
     let indices = dataset.load_indices().await?;
     let dataset_uses_stable = dataset.manifest.uses_stable_row_ids();
-    let needs_remapping = indices
+    let any_address_based = indices
         .iter()
         .any(|idx| !idx.uses_stable_row_ids(dataset_uses_stable));
+    let needs_remapping = !dataset_uses_stable || any_address_based;
     let mut new_fragments: Vec<Fragment>;
     let task_id = uuid::Uuid::new_v4();
     log::info!(
@@ -1537,7 +1542,7 @@ pub async fn commit_compaction(
                 );
                 row_id_map.extend(transposed);
             }
-        } else if options.defer_index_remap {
+        } else if options.defer_index_remap && any_address_based {
             let changed_row_addrs = task.row_addrs.ok_or_else(|| {
                 Error::internal(
                     "defer_index_remap requires row_addrs but none were provided".to_string(),

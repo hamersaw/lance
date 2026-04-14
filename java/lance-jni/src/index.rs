@@ -128,10 +128,17 @@ impl IntoJava for &IndexMetadata {
         // Determine index type from index_details type_url
         let index_type = determine_index_type(env, &self.index_details)?;
 
+        // Convert stable_row_ids from Option<bool> to Boolean for Java
+        let stable_row_ids = if let Some(val) = self.stable_row_ids {
+            env.new_object("java/lang/Boolean", "(Z)V", &[JValue::Bool(val as u8)])?
+        } else {
+            JObject::null()
+        };
+
         // Create Index object
         Ok(env.new_object(
             "org/lance/index/Index",
-            "(Ljava/util/UUID;Ljava/util/List;Ljava/lang/String;JLjava/util/List;[BILjava/time/Instant;Ljava/lang/Integer;Lorg/lance/index/IndexType;)V",
+            "(Ljava/util/UUID;Ljava/util/List;Ljava/lang/String;JLjava/util/List;[BILjava/time/Instant;Ljava/lang/Integer;Lorg/lance/index/IndexType;Ljava/lang/Boolean;)V",
             &[
                 JValue::Object(&uuid),
                 JValue::Object(&fields),
@@ -143,6 +150,7 @@ impl IntoJava for &IndexMetadata {
                 JValue::Object(&created_at),
                 JValue::Object(&base_id),
                 JValue::Object(&index_type),
+                JValue::Object(&stable_row_ids),
             ],
         )?)
     }

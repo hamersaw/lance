@@ -203,6 +203,10 @@ impl FromJObjectWithEnv<IndexMetadata> for JObject<'_> {
                 Ok(DateTime::from_timestamp(seconds, nanos).unwrap())
             })?;
         let base_id = env.get_optional_u32_from_method(self, "baseId")?;
+        let stable_row_ids =
+            env.get_optional_from_method(self, "stableRowIds", |env, bool_obj| {
+                Ok(env.call_method(bool_obj, "booleanValue", "()Z", &[])?.z()?)
+            })?;
 
         Ok(IndexMetadata {
             uuid,
@@ -215,6 +219,7 @@ impl FromJObjectWithEnv<IndexMetadata> for JObject<'_> {
             created_at,
             base_id,
             files: None,
+            stable_row_ids,
         })
     }
 }

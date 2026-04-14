@@ -37,6 +37,7 @@ public class Index {
   private final Instant createdAt;
   private final Integer baseId;
   private final IndexType indexType;
+  private final Boolean stableRowIds;
 
   private Index(
       UUID uuid,
@@ -48,7 +49,8 @@ public class Index {
       int indexVersion,
       Instant createdAt,
       Integer baseId,
-      IndexType indexType) {
+      IndexType indexType,
+      Boolean stableRowIds) {
     this.uuid = uuid;
     this.fields = fields;
     this.name = name;
@@ -59,6 +61,7 @@ public class Index {
     this.createdAt = createdAt;
     this.baseId = baseId;
     this.indexType = indexType;
+    this.stableRowIds = stableRowIds;
   }
 
   public UUID uuid() {
@@ -131,6 +134,17 @@ public class Index {
     return indexType;
   }
 
+  /**
+   * Whether this index references rows by stable row ID ({@code true}) or physical row address
+   * ({@code false}/{@code null}). When true, the index does not need remapping during compaction.
+   * Null means row-address-based (legacy/backward compat).
+   *
+   * @return the stable row IDs setting, or null if not set
+   */
+  public Optional<Boolean> stableRowIds() {
+    return Optional.ofNullable(stableRowIds);
+  }
+
   @Override
   public boolean equals(Object o) {
     if (this == o) return true;
@@ -145,7 +159,8 @@ public class Index {
         && Arrays.equals(indexDetails, index.indexDetails)
         && Objects.equals(createdAt, index.createdAt)
         && Objects.equals(baseId, index.baseId)
-        && indexType == index.indexType;
+        && indexType == index.indexType
+        && Objects.equals(stableRowIds, index.stableRowIds);
   }
 
   @Override
@@ -160,7 +175,8 @@ public class Index {
             createdAt,
             baseId,
             fragments,
-            indexType);
+            indexType,
+            stableRowIds);
     result = 31 * result + Arrays.hashCode(indexDetails);
     return result;
   }
@@ -176,6 +192,7 @@ public class Index {
         .add("indexType", indexType)
         .add("createdAt", createdAt)
         .add("baseId", baseId)
+        .add("stableRowIds", stableRowIds)
         .toString();
   }
 
@@ -200,6 +217,7 @@ public class Index {
     private Instant createdAt;
     private Integer baseId;
     private IndexType indexType;
+    private Boolean stableRowIds;
 
     private Builder() {}
 
@@ -253,6 +271,11 @@ public class Index {
       return this;
     }
 
+    public Builder stableRowIds(Boolean stableRowIds) {
+      this.stableRowIds = stableRowIds;
+      return this;
+    }
+
     public Index build() {
       return new Index(
           uuid,
@@ -264,7 +287,8 @@ public class Index {
           indexVersion,
           createdAt,
           baseId,
-          indexType);
+          indexType,
+          stableRowIds);
     }
   }
 }

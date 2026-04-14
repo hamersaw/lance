@@ -1921,12 +1921,23 @@ impl Transaction {
                     rewritten_indices.iter().map(|ri| ri.new_id).collect();
                 Self::handle_rewrite_indices(&mut final_indices, rewritten_indices, groups)?;
 
-                // Recalculate fragment bitmaps for non-remapped indices
-                // (stable-row-id indices and any others not touched by remapping)
+                // Recalculate fragment bitmaps for indices that don't need
+                // remapping.  When deferring index remap (`frag_reuse_index` is
+                // set), only stable-row-ID indices have their bitmaps updated
+                // here — address-based indices keep their old bitmaps until the
+                // deferred remap runs.  When not deferring, all non-rewritten
+                // indices (i.e., stable-row-ID indices) get bitmap updates.
+                let is_deferring = frag_reuse_index.is_some();
                 for index in final_indices.iter_mut() {
-                    if !rewritten_new_ids.contains(&index.uuid)
-                        && let Some(fragment_bitmap) = &mut index.fragment_bitmap
-                    {
+                    if rewritten_new_ids.contains(&index.uuid) {
+                        continue;
+                    }
+                    // Skip address-based indices when deferring — their bitmaps
+                    // will be updated by the deferred remap.
+                    if is_deferring && !index.stable_row_ids.unwrap_or(next_row_id.is_some()) {
+                        continue;
+                    }
+                    if let Some(fragment_bitmap) = &mut index.fragment_bitmap {
                         *fragment_bitmap =
                             Self::recalculate_fragment_bitmap(fragment_bitmap, groups)?;
                     }
