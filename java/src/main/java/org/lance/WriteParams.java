@@ -41,7 +41,7 @@ public class WriteParams {
   private final Optional<List<BasePath>> initialBases;
   private final Optional<List<String>> targetBases;
   private final Optional<Boolean> allowExternalBlobOutsideBases;
-  private final Optional<Long> blobMaxPackFileBytes;
+  private final Optional<Long> blobPackFileSizeThreshold;
 
   private WriteParams(
       Optional<Integer> maxRowsPerFile,
@@ -55,7 +55,7 @@ public class WriteParams {
       Optional<List<BasePath>> initialBases,
       Optional<List<String>> targetBases,
       Optional<Boolean> allowExternalBlobOutsideBases,
-      Optional<Long> blobMaxPackFileBytes) {
+      Optional<Long> blobPackFileSizeThreshold) {
     this.maxRowsPerFile = maxRowsPerFile;
     this.maxRowsPerGroup = maxRowsPerGroup;
     this.maxBytesPerFile = maxBytesPerFile;
@@ -67,7 +67,7 @@ public class WriteParams {
     this.initialBases = initialBases;
     this.targetBases = targetBases;
     this.allowExternalBlobOutsideBases = allowExternalBlobOutsideBases;
-    this.blobMaxPackFileBytes = blobMaxPackFileBytes;
+    this.blobPackFileSizeThreshold = blobPackFileSizeThreshold;
   }
 
   public Optional<Integer> getMaxRowsPerFile() {
@@ -134,8 +134,8 @@ public class WriteParams {
    *
    * @return Optional containing the max pack file size in bytes, or empty if not set
    */
-  public Optional<Long> getBlobMaxPackFileBytes() {
-    return blobMaxPackFileBytes;
+  public Optional<Long> getBlobPackFileSizeThreshold() {
+    return blobPackFileSizeThreshold;
   }
 
   @Override
@@ -162,7 +162,7 @@ public class WriteParams {
     private Optional<List<BasePath>> initialBases = Optional.empty();
     private Optional<List<String>> targetBases = Optional.empty();
     private Optional<Boolean> allowExternalBlobOutsideBases = Optional.empty();
-    private Optional<Long> blobMaxPackFileBytes = Optional.empty();
+    private Optional<Long> blobPackFileSizeThreshold = Optional.empty();
 
     public Builder withMaxRowsPerFile(int maxRowsPerFile) {
       this.maxRowsPerFile = Optional.of(maxRowsPerFile);
@@ -237,8 +237,8 @@ public class WriteParams {
      * @param maxBytes maximum pack file size in bytes
      * @return this builder
      */
-    public Builder withBlobMaxPackFileBytes(long maxBytes) {
-      this.blobMaxPackFileBytes = Optional.of(maxBytes);
+    public Builder withBlobPackFileSizeThreshold(long maxBytes) {
+      this.blobPackFileSizeThreshold = Optional.of(maxBytes);
       return this;
     }
 
@@ -255,7 +255,7 @@ public class WriteParams {
           initialBases,
           targetBases,
           allowExternalBlobOutsideBases,
-          blobMaxPackFileBytes);
+          blobPackFileSizeThreshold);
     }
   }
 }

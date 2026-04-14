@@ -281,7 +281,7 @@ public class Fragment {
           namespaceClient,
           tableId,
           params.getAllowExternalBlobOutsideBases(),
-          params.getBlobMaxPackFileBytes());
+          params.getBlobPackFileSizeThreshold());
     }
   }
 
@@ -308,7 +308,7 @@ public class Fragment {
         namespaceClient,
         tableId,
         params.getAllowExternalBlobOutsideBases(),
-        params.getBlobMaxPackFileBytes());
+        params.getBlobPackFileSizeThreshold());
   }
 
   /** Create a fragment from the given arrow array and schema. */
@@ -326,7 +326,7 @@ public class Fragment {
       LanceNamespace namespaceClient,
       List<String> tableId,
       Optional<Boolean> allowExternalBlobOutsideBases,
-      Optional<Long> blobMaxPackFileBytes);
+      Optional<Long> blobPackFileSizeThreshold);
 
   /** Create a fragment from the given arrow stream. */
   private static native List<FragmentMetadata> createWithFfiStream(
@@ -342,5 +342,5 @@ public class Fragment {
       LanceNamespace namespaceClient,
       List<String> tableId,
       Optional<Boolean> allowExternalBlobOutsideBases,
-      Optional<Long> blobMaxPackFileBytes);
+      Optional<Long> blobPackFileSizeThreshold);
 }

@@ -308,14 +308,14 @@ impl BlobPreprocessor {
         external_blob_mode: ExternalBlobMode,
         source_store_registry: Arc<ObjectStoreRegistry>,
         source_store_params: ObjectStoreParams,
-        max_pack_file_bytes: Option<usize>,
+        pack_file_size_threshold: Option<usize>,
     ) -> Self {
         let mut pack_writer = PackWriter::new(
             object_store.clone(),
             data_dir.clone(),
             data_file_key.clone(),
         );
-        if let Some(max_bytes) = max_pack_file_bytes {
+        if let Some(max_bytes) = pack_file_size_threshold {
             pack_writer.max_pack_size = max_bytes;
         }
         let arrow_schema = arrow_schema::Schema::from(schema);
