@@ -1065,6 +1065,7 @@ impl DatasetIndexExt for Dataset {
                 created_at: Some(chrono::Utc::now()),
                 base_id: None, // New merged index file locates in the cloned dataset.
                 files: res.files,
+                stable_row_ids: last_idx.stable_row_ids,
             };
             removed_indices.extend(res.removed_indices.iter().map(|&idx| idx.clone()));
             new_indices.push(new_idx);
@@ -2265,6 +2266,7 @@ mod tests {
                 path: INDEX_FILE_NAME.to_string(),
                 size_bytes: payload.len() as u64,
             }]),
+            stable_row_ids: None,
         }
     }
 

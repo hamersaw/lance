@@ -1916,17 +1916,20 @@ impl Transaction {
                     next_row_id.as_ref(),
                 )?;
 
-                if next_row_id.is_some() {
-                    // We can re-use indices, but need to rewrite the fragment bitmaps
-                    debug_assert!(rewritten_indices.is_empty());
-                    for index in final_indices.iter_mut() {
-                        if let Some(fragment_bitmap) = &mut index.fragment_bitmap {
-                            *fragment_bitmap =
-                                Self::recalculate_fragment_bitmap(fragment_bitmap, groups)?;
-                        }
+                // Handle remapped (address-based) indices
+                let rewritten_new_ids: HashSet<Uuid> =
+                    rewritten_indices.iter().map(|ri| ri.new_id).collect();
+                Self::handle_rewrite_indices(&mut final_indices, rewritten_indices, groups)?;
+
+                // Recalculate fragment bitmaps for non-remapped indices
+                // (stable-row-id indices and any others not touched by remapping)
+                for index in final_indices.iter_mut() {
+                    if !rewritten_new_ids.contains(&index.uuid)
+                        && let Some(fragment_bitmap) = &mut index.fragment_bitmap
+                    {
+                        *fragment_bitmap =
+                            Self::recalculate_fragment_bitmap(fragment_bitmap, groups)?;
                     }
-                } else {
-                    Self::handle_rewrite_indices(&mut final_indices, rewritten_indices, groups)?;
                 }
 
                 if let Some(frag_reuse_index) = frag_reuse_index {
@@ -3514,6 +3517,7 @@ mod tests {
             created_at: Some(Utc::now()),
             base_id: None,
             files: None,
+            stable_row_ids: None,
         }
     }
 
@@ -4021,6 +4025,7 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            stable_row_ids: None,
         }
     }
 
@@ -4043,6 +4048,7 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            stable_row_ids: None,
         }
     }
 

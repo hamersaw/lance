@@ -64,6 +64,7 @@ impl IndexRemapper for DatasetIndexRemapper {
         let mut remapped = Vec::with_capacity(indices.len());
         for index in indices.iter() {
             let needs_remapped = index.name != FRAG_REUSE_INDEX_NAME
+                && index.stable_row_ids != Some(true)
                 && match &index.fragment_bitmap {
                     None => true,
                     Some(fragment_bitmap) => fragment_bitmap

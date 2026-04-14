@@ -477,6 +477,7 @@ impl MemTableFlusher {
                 created_at: None,
                 base_id: None,
                 files: None,
+                stable_row_ids: None,
             };
 
             // Commit the index to the dataset
@@ -721,6 +722,7 @@ impl MemTableFlusher {
             created_at: Some(chrono::Utc::now()),
             index_version: 1,
             files: None,
+            stable_row_ids: None,
         };
 
         Ok(index_meta)

@@ -286,6 +286,12 @@ message IndexMetadata {
   // of index sizes without extra IO.
   // If this is empty, the index files sizes are unknown.
   repeated IndexFile files = 10;
+
+  // Whether this index references rows by stable row ID (true) or physical
+  // row address (false). When true, the index does not need remapping during
+  // compaction since stable row IDs survive fragment rewrites.
+  // If absent, the index is assumed to use row addresses (legacy behavior).
+  optional bool stable_row_ids = 11;
 }
 
 // Metadata about a single file within an index segment.

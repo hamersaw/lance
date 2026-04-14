@@ -76,6 +76,12 @@ pub struct IndexMetadata {
     /// This is None if the file sizes are unknown. This happens for indices created
     /// before this field was added.
     pub files: Option<Vec<IndexFile>>,
+
+    /// Whether this index references rows by stable row ID (`Some(true)`) or
+    /// physical row address (`Some(false)` / `None`).
+    /// When true, the index does not need remapping during compaction.
+    /// None means row-address-based (legacy/backward compat).
+    pub stable_row_ids: Option<bool>,
 }
 
 impl IndexMetadata {
@@ -132,6 +138,7 @@ impl DeepSizeOf for IndexMetadata {
                 .map(|fragment_bitmap| fragment_bitmap.serialized_size())
                 .unwrap_or(0)
             + self.files.deep_size_of_children(context)
+            + self.stable_row_ids.deep_size_of_children(context)
     }
 }
 
@@ -178,6 +185,7 @@ impl TryFrom<pb::IndexMetadata> for IndexMetadata {
             }),
             base_id: proto.base_id,
             files,
+            stable_row_ids: proto.stable_row_ids,
         })
     }
 }
@@ -222,6 +230,7 @@ impl From<&IndexMetadata> for pb::IndexMetadata {
             created_at: idx.created_at.map(|dt| dt.timestamp_millis() as u64),
             base_id: idx.base_id,
             files,
+            stable_row_ids: idx.stable_row_ids,
         }
     }
 }
@@ -319,6 +328,7 @@ mod tests {
                     path: "index.idx".to_string(),
                     size_bytes: 1024,
                 }]),
+                stable_row_ids: Some(true),
             },
             IndexMetadata {
                 uuid: Uuid::new_v4(),
@@ -331,6 +341,7 @@ mod tests {
                 created_at: None,
                 base_id: Some(7),
                 files: None,
+                stable_row_ids: None,
             },
         ];
 
@@ -363,6 +374,7 @@ mod tests {
             assert_eq!(orig.index_version, rec.index_version);
             assert_eq!(orig.base_id, rec.base_id);
             assert_eq!(orig.files, rec.files);
+            assert_eq!(orig.stable_row_ids, rec.stable_row_ids);
         }
     }
 }

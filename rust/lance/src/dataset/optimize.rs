@@ -1152,8 +1152,10 @@ async fn rewrite_files(
         .iter()
         .map(|f| f.physical_rows.unwrap() as u64)
         .sum::<u64>();
-    // If we aren't using stable row ids, then we need to remap indices.
-    let needs_remapping = !dataset.manifest.uses_stable_row_ids();
+    // We need to track row addresses for remapping if any index uses row addresses
+    // (i.e. does not have stable_row_ids == Some(true)).
+    let indices = dataset.load_indices().await?;
+    let needs_remapping = indices.iter().any(|idx| idx.stable_row_ids != Some(true));
     let mut new_fragments: Vec<Fragment>;
     let task_id = uuid::Uuid::new_v4();
     log::info!(
@@ -1485,8 +1487,10 @@ pub async fn commit_compaction(
         return Ok(CompactionMetrics::default());
     }
 
-    // If we aren't using stable row ids, then we need to remap indices.
-    let needs_remapping = !dataset.manifest.uses_stable_row_ids() && !options.defer_index_remap;
+    // We need to remap indices that use row addresses (not stable row IDs).
+    let indices = dataset.load_indices().await?;
+    let any_address_based = indices.iter().any(|idx| idx.stable_row_ids != Some(true));
+    let needs_remapping = any_address_based && !options.defer_index_remap;
 
     let mut completed_tasks = completed_tasks;
 

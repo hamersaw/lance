@@ -1442,6 +1442,24 @@ impl Dataset {
         TakeBuilder::try_new_from_ids(self.clone(), row_ids.to_vec(), projection.into())
     }
 
+    /// Take rows by their physical row addresses.
+    ///
+    /// Row addresses are `(fragment_id << 32) | row_offset` values. Unlike row
+    /// IDs, addresses may change after compaction.
+    pub async fn take_by_addresses(
+        &self,
+        addresses: &[u64],
+        projection: impl Into<ProjectionRequest>,
+    ) -> Result<RecordBatch> {
+        TakeBuilder::try_new_from_addresses_request(
+            Arc::new(self.clone()),
+            addresses.to_vec(),
+            projection.into(),
+        )?
+        .execute()
+        .await
+    }
+
     /// Take [BlobFile] by row IDs.
     pub async fn take_blobs(
         self: &Arc<Self>,

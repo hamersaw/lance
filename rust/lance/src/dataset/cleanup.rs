@@ -1582,6 +1582,7 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            stable_row_ids: None,
         }
     }
 

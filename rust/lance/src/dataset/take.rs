@@ -500,6 +500,16 @@ impl TakeBuilder {
         })
     }
 
+    /// Create a new `TakeBuilder` for taking by address from a [ProjectionRequest].
+    pub fn try_new_from_addresses_request(
+        dataset: Arc<Dataset>,
+        addresses: Vec<u64>,
+        projection: ProjectionRequest,
+    ) -> Result<Self> {
+        let plan = Arc::new(projection.into_projection_plan(dataset.clone())?);
+        Self::try_new_from_addresses(dataset, addresses, plan)
+    }
+
     /// Adds row addresses to the output
     pub fn with_row_address(mut self, with_row_address: bool) -> Self {
         self.with_row_address = with_row_address;

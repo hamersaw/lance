@@ -286,6 +286,7 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
                     created_at: curr_index_meta.created_at,
                     base_id: None,
                     files: curr_index_meta.files.clone(),
+                    stable_row_ids: curr_index_meta.stable_row_ids,
                 },
                 RemapResult::Remapped(remapped_index) => IndexMetadata {
                     uuid: remapped_index.new_id,
@@ -298,6 +299,7 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
                     created_at: curr_index_meta.created_at,
                     base_id: None,
                     files: remapped_index.files,
+                    stable_row_ids: curr_index_meta.stable_row_ids,
                 },
             };
 

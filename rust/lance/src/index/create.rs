@@ -57,6 +57,8 @@ pub struct CreateIndexBuilder<'a> {
     progress: Arc<dyn IndexBuildProgress>,
     /// Transaction properties to store with this commit.
     transaction_properties: Option<Arc<HashMap<String, String>>>,
+    /// Whether the index should use stable row IDs instead of row addresses.
+    use_stable_row_ids: Option<bool>,
 }
 
 impl<'a> CreateIndexBuilder<'a> {
@@ -79,6 +81,7 @@ impl<'a> CreateIndexBuilder<'a> {
             preprocessed_data: None,
             progress: Arc::new(NoopIndexBuildProgress),
             transaction_properties: None,
+            use_stable_row_ids: None,
         }
     }
 
@@ -127,6 +130,14 @@ impl<'a> CreateIndexBuilder<'a> {
     /// (e.g., job_id for tracking completed index jobs).
     pub fn transaction_properties(mut self, properties: HashMap<String, String>) -> Self {
         self.transaction_properties = Some(Arc::new(properties));
+        self
+    }
+
+    /// Whether the index should reference rows by stable row ID (`true`) or
+    /// row address (`false`). If not set, defaults to `true` when the dataset
+    /// has stable row IDs enabled, `false` otherwise.
+    pub fn use_stable_row_ids(mut self, v: bool) -> Self {
+        self.use_stable_row_ids = Some(v);
         self
     }
 
@@ -455,6 +466,20 @@ impl<'a> CreateIndexBuilder<'a> {
             created_at: Some(chrono::Utc::now()),
             base_id: None,
             files: created_index.files,
+            stable_row_ids: match self.use_stable_row_ids {
+                Some(true) => {
+                    if !self.dataset.manifest.uses_stable_row_ids() {
+                        return Err(Error::index(
+                            "Cannot create stable-row-ID index: dataset does not have \
+                             stable row IDs enabled"
+                                .to_string(),
+                        ));
+                    }
+                    Some(true)
+                }
+                Some(false) => Some(false),
+                None => Some(self.dataset.manifest.uses_stable_row_ids()),
+            },
         })
     }
 

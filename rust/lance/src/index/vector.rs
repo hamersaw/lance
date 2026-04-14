@@ -1795,6 +1795,7 @@ pub async fn initialize_vector_index(
         created_at: Some(chrono::Utc::now()),
         base_id: None,
         files: Some(files),
+        stable_row_ids: source_index.stable_row_ids,
     };
 
     let transaction = Transaction::new(
