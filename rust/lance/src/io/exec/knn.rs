@@ -314,8 +314,14 @@ static KNN_INDEX_ADDR_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 
 /// Returns the appropriate KNN output schema based on whether the indices
 /// use stable row IDs or row addresses.
-fn knn_output_schema(indices: &[IndexMetadata]) -> SchemaRef {
-    if indices.iter().all(|idx| idx.stable_row_ids == Some(true)) {
+///
+/// `dataset_uses_stable` is the dataset-level fallback when an index has
+/// `stable_row_ids: None` (backward compat with pre-existing indexes).
+fn knn_output_schema(indices: &[IndexMetadata], dataset_uses_stable: bool) -> SchemaRef {
+    if indices
+        .iter()
+        .all(|idx| idx.uses_stable_row_ids(dataset_uses_stable))
+    {
         KNN_INDEX_SCHEMA.clone()
     } else {
         KNN_INDEX_ADDR_SCHEMA.clone()
@@ -645,8 +651,11 @@ impl ANNIvfSubIndexExec {
                 PART_ID_COLUMN
             )));
         }
-        let is_address_based = !indices.iter().all(|idx| idx.stable_row_ids == Some(true));
-        let output_schema = knn_output_schema(&indices);
+        let dataset_uses_stable = dataset.manifest.uses_stable_row_ids();
+        let is_address_based = !indices
+            .iter()
+            .all(|idx| idx.uses_stable_row_ids(dataset_uses_stable));
+        let output_schema = knn_output_schema(&indices, dataset_uses_stable);
         let properties = PlanProperties::new(
             EquivalenceProperties::new(output_schema),
             Partitioning::RoundRobinBatch(1),

@@ -70,7 +70,10 @@ impl DatasetPreFilter {
                 fragments |= idx.fragment_bitmap.as_ref().unwrap();
             });
         }
-        let index_uses_stable = indices.iter().all(|idx| idx.stable_row_ids == Some(true));
+        let dataset_uses_stable = dataset.manifest.uses_stable_row_ids();
+        let index_uses_stable = indices
+            .iter()
+            .all(|idx| idx.uses_stable_row_ids(dataset_uses_stable));
         let deleted_ids = Self::create_deletion_mask(dataset, fragments, index_uses_stable)
             .map(SharedPrerequisite::spawn);
         let filtered_ids = filter

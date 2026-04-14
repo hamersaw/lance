@@ -61,10 +61,11 @@ impl IndexRemapper for DatasetIndexRemapper {
     ) -> Result<Vec<RemappedIndex>> {
         let affected_frag_ids = HashSet::<u64>::from_iter(affected_fragment_ids.iter().copied());
         let indices = self.dataset.load_indices().await?;
+        let dataset_uses_stable = self.dataset.manifest.uses_stable_row_ids();
         let mut remapped = Vec::with_capacity(indices.len());
         for index in indices.iter() {
             let needs_remapped = index.name != FRAG_REUSE_INDEX_NAME
-                && index.stable_row_ids != Some(true)
+                && !index.uses_stable_row_ids(dataset_uses_stable)
                 && match &index.fragment_bitmap {
                     None => true,
                     Some(fragment_bitmap) => fragment_bitmap

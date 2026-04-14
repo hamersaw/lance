@@ -85,6 +85,15 @@ pub struct IndexMetadata {
 }
 
 impl IndexMetadata {
+    /// Whether this index uses stable row IDs.
+    ///
+    /// If `stable_row_ids` is explicitly set, returns that value.
+    /// Otherwise falls back to the dataset-level setting for backward
+    /// compatibility with indexes created before this field existed.
+    pub fn uses_stable_row_ids(&self, dataset_uses_stable: bool) -> bool {
+        self.stable_row_ids.unwrap_or(dataset_uses_stable)
+    }
+
     pub fn effective_fragment_bitmap(
         &self,
         existing_fragments: &RoaringBitmap,
