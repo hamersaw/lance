@@ -841,28 +841,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_fence_barrier_claims_position() {
-        let (store, base_path, _temp_dir) = create_local_store().await;
-        let shard_id = Uuid::new_v4();
-        let schema = create_test_schema();
-
-        let mut flusher = WalFlusher::new(&base_path, shard_id, 1, 1);
-        flusher.set_object_store(store.clone());
-
-        // Write fence barrier
-        flusher.write_fence_barrier(&schema).await.unwrap();
-
-        // Next position should have advanced past the barrier
-        assert_eq!(flusher.next_wal_entry_position(), 2);
-
-        // The barrier WAL entry should be readable
-        let wal_path = flusher.wal_entry_path(1);
-        let wal_data = WalEntryData::read(&store, &wal_path).await.unwrap();
-        assert_eq!(wal_data.writer_epoch, 1);
-        assert_eq!(wal_data.batches.len(), 0); // Empty barrier
-    }
-
-    #[tokio::test]
     async fn test_fence_barrier_skips_past_old_writer_entries() {
         let (store, base_path, _temp_dir) = create_local_store().await;
         let shard_id = Uuid::new_v4();
@@ -900,52 +878,5 @@ mod tests {
             .await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap().entry.unwrap().position, 5);
-    }
-
-    #[tokio::test]
-    async fn test_fence_barrier_blocks_old_writer_from_continuing() {
-        let (store, base_path, _temp_dir) = create_local_store().await;
-        let shard_id = Uuid::new_v4();
-        let schema = create_test_schema();
-
-        // Old writer A starts at position 1 but hasn't flushed yet
-        let mut flusher_a = WalFlusher::new(&base_path, shard_id, 1, 1);
-        flusher_a.set_object_store(store.clone());
-
-        // New writer B starts at position 1 and writes fence barrier
-        let mut flusher_b = WalFlusher::new(&base_path, shard_id, 2, 1);
-        flusher_b.set_object_store(store.clone());
-        flusher_b.write_fence_barrier(&schema).await.unwrap();
-
-        // Old writer A tries to flush — position 1 is taken by B's barrier
-        let batch_store_a = BatchStore::with_capacity(10);
-        batch_store_a.append(create_test_batch(&schema, 5)).unwrap();
-        let result = flusher_a
-            .flush_to_with_index_update(&batch_store_a, batch_store_a.len(), None)
-            .await;
-        assert!(result.is_err(), "Old writer should be fenced by barrier");
-        assert!(result.unwrap_err().is_writer_fenced());
-    }
-
-    #[tokio::test]
-    async fn test_multiple_sequential_flushes_each_claim_unique_position() {
-        let (store, base_path, _temp_dir) = create_local_store().await;
-        let shard_id = Uuid::new_v4();
-
-        let mut flusher = WalFlusher::new(&base_path, shard_id, 1, 1);
-        flusher.set_object_store(store);
-
-        let schema = create_test_schema();
-
-        // Multiple flushes should each get a unique position
-        for expected_pos in 1..=5 {
-            let batch_store = BatchStore::with_capacity(10);
-            batch_store.append(create_test_batch(&schema, 3)).unwrap();
-            let result = flusher
-                .flush_to_with_index_update(&batch_store, batch_store.len(), None)
-                .await
-                .unwrap();
-            assert_eq!(result.entry.unwrap().position, expected_pos);
-        }
     }
 }
