@@ -427,8 +427,8 @@ impl ShardManifestStore {
         shard_id: Uuid,
     ) -> Result<()> {
         match manifest {
-            Some(m) if m.writer_epoch > local_epoch => Err(Error::io(format!(
-                "Writer fenced: local epoch {} < stored epoch {} for shard {}",
+            Some(m) if m.writer_epoch > local_epoch => Err(Error::writer_fenced(format!(
+                "local epoch {} < stored epoch {} for shard {}",
                 local_epoch, m.writer_epoch, shard_id
             ))),
             _ => Ok(()),
@@ -643,8 +643,8 @@ mod tests {
         let result = manifest_store.check_fenced(epoch_a).await;
         assert!(result.is_err(), "Writer A should be fenced");
         assert!(
-            result.unwrap_err().to_string().contains("Writer fenced"),
-            "Error should mention fencing"
+            result.unwrap_err().is_writer_fenced(),
+            "Error should be WriterFenced"
         );
 
         // Writer B's epoch (2) is still valid
@@ -719,8 +719,9 @@ mod tests {
         // Local epoch lower than stored — should fail
         let result = manifest_store.check_fenced(3).await;
         assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("Writer fenced"));
+        let err = result.unwrap_err();
+        assert!(err.is_writer_fenced());
+        let err_msg = err.to_string();
         assert!(err_msg.contains("local epoch 3"));
         assert!(err_msg.contains("stored epoch 5"));
     }
@@ -744,7 +745,7 @@ mod tests {
             })
             .await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Writer fenced"));
+        assert!(result.unwrap_err().is_writer_fenced());
     }
 
     #[tokio::test]

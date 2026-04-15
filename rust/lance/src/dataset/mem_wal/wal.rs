@@ -151,7 +151,8 @@ impl std::fmt::Debug for TriggerWalFlush {
 pub struct WalFlusher {
     /// Watch channel sender for durable watermark.
     /// Broadcasts the highest batch_position that is now durable.
-    durable_watermark_tx: watch::Sender<usize>,
+    /// Wrapped in Mutex<Option<>> so it can be dropped on fencing to unblock waiters.
+    durable_watermark_tx: std::sync::Mutex<Option<watch::Sender<usize>>>,
     /// Watch channel receiver for creating new watchers.
     durable_watermark_rx: watch::Receiver<usize>,
     /// Object store for writing WAL files.
@@ -193,7 +194,7 @@ impl WalFlusher {
         // Create initial WAL flush cell for backpressure
         let wal_flush_cell = WatchableOnceCell::new();
         Self {
-            durable_watermark_tx,
+            durable_watermark_tx: std::sync::Mutex::new(Some(durable_watermark_tx)),
             durable_watermark_rx,
             object_store: None,
             shard_id,
@@ -228,6 +229,13 @@ impl WalFlusher {
     /// Get the current durable watermark.
     pub fn durable_watermark(&self) -> usize {
         *self.durable_watermark_rx.borrow()
+    }
+
+    /// Close the durable watermark channel, unblocking all waiters with an error.
+    /// Called when the writer is fenced to prevent durable put() callers from
+    /// hanging indefinitely.
+    pub fn close_watermark(&self) {
+        let _ = self.durable_watermark_tx.lock().unwrap().take();
     }
 
     /// Get a watcher for WAL flush completion.
@@ -393,9 +401,9 @@ impl WalFlusher {
 
         // WAL entries use PutMode::Create (put-if-not-exists) for fencing.
         // If another writer already wrote this position, the put fails with
-        // AlreadyExists, which we map to a fencing error. This is the same
-        // cost as a regular PUT on S3 (If-None-Match header) so adds zero
-        // additional latency.
+        // AlreadyExists, which we map to a fencing error. Note: conditional
+        // PUTs on S3 carry higher latency than regular PUTs due to server-side
+        // coordination overhead.
         let put_opts = PutOptions {
             mode: PutMode::Create,
             ..Default::default()
@@ -449,7 +457,9 @@ impl WalFlusher {
         batch_store.set_max_flushed_batch_position(end_batch_position - 1);
 
         // Notify durability waiters (global channel)
-        let _ = self.durable_watermark_tx.send(end_batch_position);
+        if let Some(tx) = self.durable_watermark_tx.lock().unwrap().as_ref() {
+            let _ = tx.send(end_batch_position);
+        }
         // Signal WAL flush completion for backpressure waiters
         self.signal_wal_flush_complete();
 
@@ -561,8 +571,8 @@ impl WalFlusher {
     /// Map an object_store put error to a fencing error when AlreadyExists.
     fn map_wal_put_error(e: object_store::Error, wal_entry_position: u64, shard_id: Uuid) -> Error {
         if matches!(e, object_store::Error::AlreadyExists { .. }) {
-            Error::io(format!(
-                "Writer fenced: WAL position {} already exists for shard {} \
+            Error::writer_fenced(format!(
+                "WAL position {} already exists for shard {} \
                  (another writer has claimed this position)",
                 wal_entry_position, shard_id
             ))
@@ -825,7 +835,7 @@ mod tests {
             .await;
         assert!(result_b.is_err(), "Second writer should be fenced");
         assert!(
-            result_b.unwrap_err().to_string().contains("Writer fenced"),
+            result_b.unwrap_err().is_writer_fenced(),
             "Error should indicate fencing"
         );
     }
@@ -914,7 +924,7 @@ mod tests {
             .flush_to_with_index_update(&batch_store_a, batch_store_a.len(), None)
             .await;
         assert!(result.is_err(), "Old writer should be fenced by barrier");
-        assert!(result.unwrap_err().to_string().contains("Writer fenced"));
+        assert!(result.unwrap_err().is_writer_fenced());
     }
 
     #[tokio::test]

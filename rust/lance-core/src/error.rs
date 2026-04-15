@@ -229,6 +229,13 @@ pub enum Error {
     #[snafu(transparent)]
     External { source: BoxedError },
 
+    #[snafu(display("Writer fenced: {message}, {location}"))]
+    WriterFenced {
+        message: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
     /// A requested field was not found in a schema.
     #[snafu(transparent)]
     FieldNotFound { source: FieldNotFoundError },
@@ -360,6 +367,19 @@ impl Error {
             difference: difference.into(),
         }
         .build()
+    }
+
+    #[track_caller]
+    pub fn writer_fenced(message: impl Into<String>) -> Self {
+        WriterFencedSnafu {
+            message: message.into(),
+        }
+        .build()
+    }
+
+    /// Returns true if this error is a writer fencing error.
+    pub fn is_writer_fenced(&self) -> bool {
+        matches!(self, Self::WriterFenced { .. })
     }
 
     #[track_caller]

@@ -940,6 +940,11 @@ pub struct ShardWriter {
 impl ShardWriter {
     /// Open or create a ShardWriter.
     ///
+    /// Claims an epoch via the shard manifest and writes a fence barrier to
+    /// the WAL using a conditional PUT. The barrier claims the next WAL
+    /// position, scanning forward past any stale entries, which fences any
+    /// previous writer on the same shard.
+    ///
     /// The `base_path` should come from `ObjectStore::from_uri()` to ensure
     /// WAL files are written inside the dataset directory.
     pub async fn open(
@@ -1359,12 +1364,22 @@ impl MessageHandler<TriggerWalFlush> for WalFlushHandler {
             .do_flush(batch_store, indexes, end_batch_position)
             .await;
 
+        let is_fenced = result.as_ref().is_err_and(|e| e.is_writer_fenced());
+
         // Notify completion if requested
         if let Some(cell) = done {
             cell.write(result.map_err(|e| e.to_string()));
         }
 
-        Ok(())
+        // Fencing errors are fatal — close the watermark channel to unblock
+        // durable waiters, then kill the flush loop. Non-fencing errors are
+        // returned via the completion cell but don't bring down the loop.
+        if is_fenced {
+            self.wal_flusher.close_watermark();
+            Err(Error::writer_fenced("WAL writer fenced, shutting down"))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -2123,6 +2138,126 @@ mod tests {
         let snapshot = stats.snapshot();
         assert_eq!(snapshot.put_count, 0);
         assert_eq!(snapshot.wal_flush_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_fenced_writer_durable_put_fails() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = create_test_schema();
+        let shard_id = Uuid::new_v4();
+
+        let config = ShardWriterConfig {
+            shard_id,
+            shard_spec_id: 0,
+            durable_write: true,
+            sync_indexed_write: false,
+            max_wal_buffer_size: 1024 * 1024,
+            max_wal_flush_interval: None,
+            max_memtable_size: 64 * 1024 * 1024,
+            manifest_scan_batch_size: 2,
+            ..Default::default()
+        };
+
+        // Writer A opens the shard
+        let writer_a = ShardWriter::open(
+            store.clone(),
+            base_path.clone(),
+            base_uri.clone(),
+            config.clone(),
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        // Writer A does a durable write — should succeed
+        let batch = create_test_batch(&schema, 0, 10);
+        writer_a.put(vec![batch]).await.unwrap();
+
+        // Writer B opens the same shard — fences writer A via barrier
+        let writer_b = ShardWriter::open(
+            store.clone(),
+            base_path.clone(),
+            base_uri.clone(),
+            config.clone(),
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        // Writer A tries a durable write — should fail because B's barrier
+        // claimed a WAL position that A will collide with.
+        let batch = create_test_batch(&schema, 100, 10);
+        let result = writer_a.put(vec![batch]).await;
+        assert!(result.is_err(), "Fenced writer's durable put should fail");
+
+        // Writer B should still work fine
+        let batch = create_test_batch(&schema, 200, 10);
+        writer_b.put(vec![batch]).await.unwrap();
+
+        writer_b.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_fenced_writer_nondurable_put_silently_buffers() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = create_test_schema();
+        let shard_id = Uuid::new_v4();
+
+        let config = ShardWriterConfig {
+            shard_id,
+            shard_spec_id: 0,
+            durable_write: false,
+            sync_indexed_write: false,
+            max_wal_buffer_size: 1024 * 1024,
+            max_wal_flush_interval: None,
+            max_memtable_size: 64 * 1024 * 1024,
+            manifest_scan_batch_size: 2,
+            ..Default::default()
+        };
+
+        // Writer A opens the shard
+        let writer_a = ShardWriter::open(
+            store.clone(),
+            base_path.clone(),
+            base_uri.clone(),
+            config.clone(),
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        // Writer A does a non-durable write — succeeds (buffered in MemTable)
+        let batch = create_test_batch(&schema, 0, 10);
+        writer_a.put(vec![batch]).await.unwrap();
+
+        // Writer B opens the same shard — fences writer A
+        let _writer_b = ShardWriter::open(
+            store.clone(),
+            base_path.clone(),
+            base_uri.clone(),
+            config.clone(),
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        // Writer A's non-durable put still returns Ok because it only buffers
+        // in memory — the fencing error surfaces asynchronously when the WAL
+        // flush loop tries to write.
+        let batch = create_test_batch(&schema, 100, 10);
+        let result = writer_a.put(vec![batch]).await;
+        assert!(
+            result.is_ok(),
+            "Non-durable put buffers in memory, doesn't hit WAL immediately"
+        );
+
+        // Data is in the MemTable but will never be persisted
+        let stats = writer_a.memtable_stats().await;
+        assert_eq!(stats.row_count, 20);
     }
 }
 
