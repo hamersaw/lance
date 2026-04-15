@@ -21,9 +21,10 @@ use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
 use tokio::sync::{mpsc, watch};
 
-use tracing::instrument;
+use tracing::{info, instrument};
 use uuid::Uuid;
 
+use super::memtable::MemTable;
 use super::util::{WatchableOnceCell, shard_wal_path, wal_entry_filename};
 
 use super::index::IndexStore;
@@ -478,6 +479,75 @@ impl WalFlusher {
         let filename = wal_entry_filename(wal_entry_position);
         self.wal_dir.child(filename.as_str())
     }
+
+    /// Replay WAL entries into the memtable on restart.
+    ///
+    /// Scans WAL entries from `replay_after + 1` forward until a missing entry
+    /// is found. Non-empty entries are inserted into the memtable. Empty entries
+    /// (e.g. from prior fence barriers) are skipped.
+    ///
+    /// Also advances `next_wal_entry_position` past any replayed entries so
+    /// new writes don't collide.
+    ///
+    /// Returns the number of entries replayed.
+    pub async fn replay_wal_entries(
+        &self,
+        memtable: &mut MemTable,
+        replay_after: u64,
+    ) -> Result<u64> {
+        let object_store = self
+            .object_store
+            .as_ref()
+            .ok_or_else(|| Error::io("Object store not set on WAL flusher"))?;
+
+        let mut replayed = 0u64;
+        let mut position = replay_after + 1;
+
+        loop {
+            let path = self.wal_entry_path(position);
+            match object_store.inner.get(&path).await {
+                Err(object_store::Error::NotFound { .. }) => break,
+                Err(e) => {
+                    return Err(Error::io(format!(
+                        "Failed to read WAL entry at position {}: {}",
+                        position, e
+                    )));
+                }
+                Ok(_) => {}
+            }
+
+            let entry = WalEntryData::read(object_store, &path).await?;
+            if !entry.batches.is_empty() {
+                // WAL entries store writer epoch in schema metadata, but the
+                // memtable schema doesn't have it. Re-wrap batches with the
+                // memtable's schema so the equality check passes.
+                let memtable_schema = memtable.schema();
+                let batches = entry
+                    .batches
+                    .into_iter()
+                    .map(|b| RecordBatch::try_new(memtable_schema.clone(), b.columns().to_vec()))
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(|e| Error::io(format!("Failed to re-schema WAL batch: {}", e)))?;
+                memtable.insert_batches_only(batches).await?;
+                replayed += 1;
+                info!(
+                    "Replayed WAL entry at position {} (epoch {}) for shard {}",
+                    position, entry.writer_epoch, self.shard_id
+                );
+            }
+
+            position += 1;
+        }
+
+        // Advance next_wal_entry_position past replayed entries
+        let current = self.next_wal_entry_position.load(Ordering::SeqCst);
+        if position > current {
+            self.next_wal_entry_position
+                .store(position, Ordering::SeqCst);
+        }
+
+        Ok(replayed)
+    }
 }
 
 /// A WAL entry read from storage for replay.
@@ -544,6 +614,7 @@ impl WalEntryData {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dataset::mem_wal::memtable::CacheConfig;
     use arrow_array::{Int32Array, StringArray};
     use arrow_schema::{DataType, Field, Schema};
     use std::sync::Arc;
@@ -698,5 +769,107 @@ mod tests {
         assert_eq!(wal_data.batches.len(), 2);
         assert_eq!(wal_data.batches[0].num_rows(), 10);
         assert_eq!(wal_data.batches[1].num_rows(), 5);
+    }
+
+    #[tokio::test]
+    async fn test_replay_wal_entries() {
+        let (store, base_path, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let schema = create_test_schema();
+
+        // Write 3 WAL entries starting at position 1
+        let mut flusher = WalFlusher::new(&base_path, shard_id, 1, 1);
+        flusher.set_object_store(store.clone());
+
+        for i in 0..3 {
+            let batch_store = BatchStore::with_capacity(10);
+            batch_store
+                .append(create_test_batch(&schema, 10 + i))
+                .unwrap();
+            let _watcher = flusher.track_batch(0);
+            flusher
+                .flush_to_with_index_update(&batch_store, batch_store.len(), None)
+                .await
+                .unwrap();
+        }
+        // WAL entries at positions 1, 2, 3; next_wal_entry_position = 4
+
+        // Simulate restart: new flusher starting at position 1
+        // (manifest.wal_entry_position_last_seen + 1, but we want to replay from 0+1=1)
+        let mut new_flusher = WalFlusher::new(&base_path, shard_id, 2, 1);
+        new_flusher.set_object_store(store.clone());
+
+        let mut memtable =
+            MemTable::with_capacity(schema, 1, vec![], CacheConfig::default(), 100).unwrap();
+
+        // Replay from position 0 (replay_after=0 means start at 1)
+        let replayed = new_flusher
+            .replay_wal_entries(&mut memtable, 0)
+            .await
+            .unwrap();
+
+        assert_eq!(replayed, 3);
+        assert_eq!(memtable.row_count(), 10 + 11 + 12);
+        // next_wal_entry_position should be advanced past replayed entries
+        assert_eq!(new_flusher.next_wal_entry_position(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_replay_wal_entries_skips_already_flushed() {
+        let (store, base_path, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let schema = create_test_schema();
+
+        // Write 3 WAL entries at positions 1, 2, 3
+        let mut flusher = WalFlusher::new(&base_path, shard_id, 1, 1);
+        flusher.set_object_store(store.clone());
+
+        for i in 0..3 {
+            let batch_store = BatchStore::with_capacity(10);
+            batch_store
+                .append(create_test_batch(&schema, 10 + i))
+                .unwrap();
+            let _watcher = flusher.track_batch(0);
+            flusher
+                .flush_to_with_index_update(&batch_store, batch_store.len(), None)
+                .await
+                .unwrap();
+        }
+
+        // Simulate restart where positions 1 and 2 were already flushed to a generation
+        // (replay_after=2 means start at 3)
+        let mut new_flusher = WalFlusher::new(&base_path, shard_id, 2, 3);
+        new_flusher.set_object_store(store.clone());
+
+        let mut memtable =
+            MemTable::with_capacity(schema, 1, vec![], CacheConfig::default(), 100).unwrap();
+
+        let replayed = new_flusher
+            .replay_wal_entries(&mut memtable, 2)
+            .await
+            .unwrap();
+
+        // Only position 3 should be replayed
+        assert_eq!(replayed, 1);
+        assert_eq!(memtable.row_count(), 12);
+    }
+
+    #[tokio::test]
+    async fn test_replay_wal_entries_nothing_to_replay() {
+        let (store, base_path, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let schema = create_test_schema();
+
+        let mut flusher = WalFlusher::new(&base_path, shard_id, 1, 1);
+        flusher.set_object_store(store.clone());
+
+        let mut memtable =
+            MemTable::with_capacity(schema, 1, vec![], CacheConfig::default(), 100).unwrap();
+
+        // No WAL entries exist — replay should return 0
+        let replayed = flusher.replay_wal_entries(&mut memtable, 0).await.unwrap();
+
+        assert_eq!(replayed, 0);
+        assert_eq!(memtable.row_count(), 0);
     }
 }

@@ -996,6 +996,26 @@ impl ShardWriter {
             memtable.set_indexes_arc(indexes);
         }
 
+        // Create WAL flusher (before WriterState so we can replay into memtable)
+        let mut wal_flusher = WalFlusher::new(
+            &base_path,
+            shard_id,
+            epoch,
+            manifest.wal_entry_position_last_seen + 1,
+        );
+        wal_flusher.set_object_store(object_store.clone());
+
+        // Replay unflushed WAL entries into the memtable
+        let replayed = wal_flusher
+            .replay_wal_entries(&mut memtable, manifest.replay_after_wal_entry_position)
+            .await?;
+        if replayed > 0 {
+            info!(
+                "Replayed {} WAL entries into memtable for shard {} (epoch {})",
+                replayed, shard_id, epoch
+            );
+        }
+
         let state = Arc::new(RwLock::new(WriterState {
             memtable,
             last_flushed_wal_entry_position: manifest.wal_entry_position_last_seen,
@@ -1005,15 +1025,6 @@ impl ShardWriter {
             wal_flush_trigger_count: 0,
             last_wal_flush_trigger_time: 0,
         }));
-
-        // Create WAL flusher
-        let mut wal_flusher = WalFlusher::new(
-            &base_path,
-            shard_id,
-            epoch,
-            manifest.wal_entry_position_last_seen + 1,
-        );
-        wal_flusher.set_object_store(object_store.clone());
 
         // Create channels for background tasks
         let (wal_flush_tx, wal_flush_rx) = mpsc::unbounded_channel();
