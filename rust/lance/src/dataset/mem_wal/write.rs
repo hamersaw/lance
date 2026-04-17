@@ -45,7 +45,9 @@ pub use super::memtable::scanner::MemTableScanner;
 pub use super::util::{WatchableOnceCell, WatchableOnceCellReader};
 pub use super::wal::{WalEntry, WalEntryData, WalFlushResult, WalFlusher};
 
+use super::gc::WalGcHandler;
 use super::memtable::flush::TriggerMemTableFlush;
+use super::util::shard_wal_path;
 use super::wal::TriggerWalFlush;
 
 use super::manifest::ShardManifestStore;
@@ -181,6 +183,14 @@ pub struct ShardWriterConfig {
     ///
     /// Default: 60 seconds
     pub stats_log_interval: Option<Duration>,
+
+    /// Interval for WAL entry garbage collection.
+    ///
+    /// Flushed WAL entries (position <= `replay_after_wal_entry_position`)
+    /// are periodically deleted from object store. Set to None to disable.
+    ///
+    /// Default: 300 seconds (5 minutes)
+    pub wal_gc_interval: Option<Duration>,
 }
 
 impl Default for ShardWriterConfig {
@@ -202,6 +212,7 @@ impl Default for ShardWriterConfig {
             async_index_buffer_rows: 10_000,
             async_index_interval: Duration::from_secs(1),
             stats_log_interval: Some(Duration::from_secs(60)), // 1 minute
+            wal_gc_interval: Some(Duration::from_secs(300)),   // 5 minutes
         }
     }
 }
@@ -302,6 +313,12 @@ impl ShardWriterConfig {
     /// Set stats logging interval. Use None to disable periodic stats logging.
     pub fn with_stats_log_interval(mut self, interval: Option<Duration>) -> Self {
         self.stats_log_interval = interval;
+        self
+    }
+
+    /// Set WAL GC interval. Use None to disable WAL entry garbage collection.
+    pub fn with_wal_gc_interval(mut self, interval: Option<Duration>) -> Self {
+        self.wal_gc_interval = interval;
         self
     }
 }
@@ -1022,6 +1039,9 @@ impl ShardWriter {
         wal_flusher.set_flush_channel(wal_flush_tx.clone());
         let wal_flusher = Arc::new(wal_flusher);
 
+        // Capture WAL dir before base_path is moved
+        let wal_dir = shard_wal_path(&base_path, &shard_id);
+
         // Create flusher
         let flusher = Arc::new(MemTableFlusher::new(
             object_store.clone(),
@@ -1056,6 +1076,18 @@ impl ShardWriter {
             Box::new(memtable_handler),
             memtable_flush_rx,
         )?;
+
+        // Start background WAL GC handler
+        if let Some(wal_gc_interval) = config.wal_gc_interval {
+            let (_wal_gc_tx, wal_gc_rx) = mpsc::unbounded_channel();
+            let wal_gc_handler = WalGcHandler::new(
+                object_store.clone(),
+                manifest_store.clone(),
+                wal_dir,
+                wal_gc_interval,
+            );
+            task_executor.add_handler("wal_gc".to_string(), Box::new(wal_gc_handler), wal_gc_rx)?;
+        }
 
         // Create shared writer state for put() operations
         let writer_state = Arc::new(SharedWriterState::new(
