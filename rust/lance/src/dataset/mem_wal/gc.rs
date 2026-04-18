@@ -63,33 +63,37 @@ impl WalGcHandler {
             return Ok(0);
         }
 
-        // List all WAL entry files
-        let entries: Vec<_> = self
+        // Stream eligible WAL entry paths into the batch-delete API so object
+        // stores that support multi-key deletes (e.g. S3's up-to-1000-per-request
+        // bulk delete) aren't reduced to one round-trip per file.
+        let paths = self
             .object_store
             .inner
             .list(Some(&self.wal_dir))
-            .collect::<Vec<_>>()
-            .await;
-
-        let mut deleted = 0usize;
-        for item in entries {
-            match item {
-                Ok(meta) => {
-                    if let Some(filename) = meta.location.filename()
-                        && filename.ends_with(".arrow")
-                        && let Some(position) = parse_bit_reversed_filename(filename)
-                        && position <= gc_before
-                    {
-                        if let Err(e) = self.object_store.delete(&meta.location).await {
-                            warn!("Failed to delete WAL entry {}: {}", position, e);
-                        } else {
-                            deleted += 1;
+            .filter_map(move |item| async move {
+                match item {
+                    Ok(meta) => {
+                        let filename = meta.location.filename()?;
+                        if !filename.ends_with(".arrow") {
+                            return None;
                         }
+                        let position = parse_bit_reversed_filename(filename)?;
+                        (position <= gc_before).then_some(Ok(meta.location))
+                    }
+                    Err(e) => {
+                        warn!("Error listing WAL directory: {}", e);
+                        None
                     }
                 }
-                Err(e) => {
-                    warn!("Error listing WAL directory: {}", e);
-                }
+            })
+            .boxed();
+
+        let mut delete_stream = self.object_store.remove_stream(paths);
+        let mut deleted = 0usize;
+        while let Some(result) = delete_stream.next().await {
+            match result {
+                Ok(_) => deleted += 1,
+                Err(e) => warn!("Failed to delete WAL entry: {}", e),
             }
         }
 

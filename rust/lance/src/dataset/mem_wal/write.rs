@@ -45,7 +45,7 @@ pub use super::memtable::scanner::MemTableScanner;
 pub use super::util::{WatchableOnceCell, WatchableOnceCellReader};
 pub use super::wal::{WalEntry, WalEntryData, WalFlushResult, WalFlusher};
 
-use super::gc::WalGcHandler;
+use super::gc::{TriggerWalGc, WalGcHandler};
 use super::memtable::flush::TriggerMemTableFlush;
 use super::util::shard_wal_path;
 use super::wal::TriggerWalFlush;
@@ -953,6 +953,10 @@ pub struct ShardWriter {
     stats: SharedWriteStats,
     writer_state: Arc<SharedWriterState>,
     backpressure: BackpressureController,
+    // Held only to keep the WAL GC channel open; the handler is ticker-driven
+    // and never receives messages, but dropping the sender would close the
+    // channel and cause `TaskDispatcher` to exit before the first tick fires.
+    _wal_gc_tx: Option<mpsc::UnboundedSender<TriggerWalGc>>,
 }
 
 impl ShardWriter {
@@ -1078,8 +1082,8 @@ impl ShardWriter {
         )?;
 
         // Start background WAL GC handler
-        if let Some(wal_gc_interval) = config.wal_gc_interval {
-            let (_wal_gc_tx, wal_gc_rx) = mpsc::unbounded_channel();
+        let wal_gc_tx = if let Some(wal_gc_interval) = config.wal_gc_interval {
+            let (wal_gc_tx, wal_gc_rx) = mpsc::unbounded_channel();
             let wal_gc_handler = WalGcHandler::new(
                 object_store.clone(),
                 manifest_store.clone(),
@@ -1087,7 +1091,10 @@ impl ShardWriter {
                 wal_gc_interval,
             );
             task_executor.add_handler("wal_gc".to_string(), Box::new(wal_gc_handler), wal_gc_rx)?;
-        }
+            Some(wal_gc_tx)
+        } else {
+            None
+        };
 
         // Create shared writer state for put() operations
         let writer_state = Arc::new(SharedWriterState::new(
@@ -1114,6 +1121,7 @@ impl ShardWriter {
             stats,
             writer_state,
             backpressure,
+            _wal_gc_tx: wal_gc_tx,
         })
     }
 
