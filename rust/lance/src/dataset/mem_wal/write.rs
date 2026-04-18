@@ -2169,7 +2169,8 @@ mod tests {
             ..Default::default()
         };
 
-        // Writer A opens the shard
+        // Writer A opens the shard and enqueues several durable puts so the
+        // flush loop has real work in flight when fencing happens.
         let writer_a = ShardWriter::open(
             store.clone(),
             base_path.clone(),
@@ -2181,9 +2182,10 @@ mod tests {
         .await
         .unwrap();
 
-        // Writer A does a durable write — should succeed
-        let batch = create_test_batch(&schema, 0, 10);
-        writer_a.put(vec![batch]).await.unwrap();
+        for i in 0..3 {
+            let batch = create_test_batch(&schema, i * 10, 10);
+            writer_a.put(vec![batch]).await.unwrap();
+        }
 
         // Writer B opens the same shard — fences writer A via barrier
         let writer_b = ShardWriter::open(
@@ -2197,11 +2199,58 @@ mod tests {
         .await
         .unwrap();
 
-        // Writer A tries a durable write — should fail because B's barrier
-        // claimed a WAL position that A will collide with.
+        // Writer A's next durable put fails with WriterFenced. The watcher
+        // must surface the correct error variant — generic IO would break
+        // downstream retry/takeover logic keyed off `is_writer_fenced`.
         let batch = create_test_batch(&schema, 100, 10);
-        let result = writer_a.put(vec![batch]).await;
-        assert!(result.is_err(), "Fenced writer's durable put should fail");
+        let fenced_result =
+            tokio::time::timeout(std::time::Duration::from_secs(5), writer_a.put(vec![batch]))
+                .await
+                .expect("fenced put hung — deadlock regression");
+        let err = fenced_result.expect_err("fenced writer's durable put should fail");
+        assert!(
+            err.is_writer_fenced(),
+            "fenced durable put must surface WriterFenced, got: {err}"
+        );
+
+        // Loop-shutdown regression guard: after fencing, the WalFlushHandler
+        // must return Err to break the dispatcher loop. Once that happens the
+        // flush channel's receiver is dropped, so direct `trigger_flush` calls
+        // start returning Err (channel closed). Poll until we observe that.
+        let batch_store = {
+            let state = writer_a.state.read().await;
+            state.memtable.batch_store()
+        };
+        let poll_start = std::time::Instant::now();
+        let mut loop_exited = false;
+        while poll_start.elapsed() < std::time::Duration::from_secs(5) {
+            if writer_a
+                .wal_flusher
+                .trigger_flush(batch_store.clone(), None, usize::MAX, None)
+                .is_err()
+            {
+                loop_exited = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            loop_exited,
+            "flush dispatcher did not terminate after fencing — loop shutdown regression"
+        );
+
+        // Further puts on the fenced writer must fail fast (no hang, no panic).
+        for i in 0..3 {
+            let batch = create_test_batch(&schema, 500 + i * 10, 10);
+            let result =
+                tokio::time::timeout(std::time::Duration::from_secs(2), writer_a.put(vec![batch]))
+                    .await
+                    .expect("post-shutdown put hung");
+            assert!(
+                result.is_err(),
+                "put on fenced writer must fail, got Ok at iteration {i}"
+            );
+        }
 
         // Writer B should still work fine
         let batch = create_test_batch(&schema, 200, 10);

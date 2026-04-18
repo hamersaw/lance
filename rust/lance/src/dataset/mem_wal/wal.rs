@@ -8,7 +8,7 @@
 
 use std::io::Cursor;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 use arrow_array::RecordBatch;
@@ -44,30 +44,45 @@ pub struct BatchDurableWatcher {
     rx: watch::Receiver<usize>,
     /// Target batch ID to wait for.
     target_batch_position: usize,
+    /// Shared flag set when the writer is fenced. Used to classify channel-closed
+    /// errors as `WriterFenced` instead of generic IO.
+    fenced: Arc<AtomicBool>,
 }
 
 impl BatchDurableWatcher {
     /// Create a new watcher for a specific batch ID.
-    pub fn new(rx: watch::Receiver<usize>, target_batch_position: usize) -> Self {
+    pub fn new(
+        rx: watch::Receiver<usize>,
+        target_batch_position: usize,
+        fenced: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             rx,
             target_batch_position,
+            fenced,
         }
     }
 
     /// Wait until the batch is durable.
     ///
-    /// Returns Ok(()) when `durable_watermark >= target_batch_position`.
+    /// Returns `Ok(())` when `durable_watermark >= target_batch_position`.
+    /// If the sender was dropped due to fencing, returns `Error::WriterFenced`
+    /// so callers can distinguish fencing from a plain IO failure.
     pub async fn wait(&mut self) -> Result<()> {
         loop {
             let current = *self.rx.borrow();
             if current >= self.target_batch_position {
                 return Ok(());
             }
-            self.rx
-                .changed()
-                .await
-                .map_err(|_| Error::io("Durable watermark channel closed"))?;
+            if self.rx.changed().await.is_err() {
+                return if self.fenced.load(Ordering::Acquire) {
+                    Err(Error::writer_fenced(
+                        "durable watermark channel closed: writer fenced",
+                    ))
+                } else {
+                    Err(Error::io("Durable watermark channel closed"))
+                };
+            }
         }
     }
 
@@ -156,6 +171,9 @@ pub struct WalFlusher {
     durable_watermark_tx: std::sync::Mutex<Option<watch::Sender<usize>>>,
     /// Watch channel receiver for creating new watchers.
     durable_watermark_rx: watch::Receiver<usize>,
+    /// Set to true when the writer is fenced. Shared with `BatchDurableWatcher`
+    /// so a dropped sender is reported as `WriterFenced` rather than generic IO.
+    fenced: Arc<AtomicBool>,
     /// Object store for writing WAL files.
     object_store: Option<Arc<ObjectStore>>,
     /// Shard ID.
@@ -197,6 +215,7 @@ impl WalFlusher {
         Self {
             durable_watermark_tx: std::sync::Mutex::new(Some(durable_watermark_tx)),
             durable_watermark_rx,
+            fenced: Arc::new(AtomicBool::new(false)),
             object_store: None,
             shard_id,
             writer_epoch,
@@ -224,7 +243,11 @@ impl WalFlusher {
     pub fn track_batch(&self, batch_position: usize) -> BatchDurableWatcher {
         // Return a watcher that waits for this batch to become durable
         // batch_position is 0-indexed, so we wait for watermark > batch_position (i.e., >= batch_position + 1)
-        BatchDurableWatcher::new(self.durable_watermark_rx.clone(), batch_position + 1)
+        BatchDurableWatcher::new(
+            self.durable_watermark_rx.clone(),
+            batch_position + 1,
+            self.fenced.clone(),
+        )
     }
 
     /// Get the current durable watermark.
@@ -232,10 +255,13 @@ impl WalFlusher {
         *self.durable_watermark_rx.borrow()
     }
 
-    /// Close the durable watermark channel, unblocking all waiters with an error.
-    /// Called when the writer is fenced to prevent durable put() callers from
-    /// hanging indefinitely.
+    /// Mark the flusher as fenced and close the durable watermark channel,
+    /// unblocking all waiters with a `WriterFenced` error. Called when the
+    /// writer is fenced to prevent durable `put()` callers from hanging
+    /// indefinitely. The fenced flag is set *before* the sender is dropped
+    /// so waiters observing the closed channel see the flag already set.
     pub fn close_watermark(&self) {
+        self.fenced.store(true, Ordering::Release);
         let _ = self.durable_watermark_tx.lock().unwrap().take();
     }
 
@@ -339,7 +365,11 @@ impl WalFlusher {
             .as_ref()
             .ok_or_else(|| Error::io("Object store not set on WAL flusher"))?;
 
-        let wal_entry_position = self.next_wal_entry_position.fetch_add(1, Ordering::SeqCst);
+        // Don't pre-reserve the position: if the put fails transiently we'd
+        // burn the slot, leaving a hole that breaks contiguity assumptions on
+        // replay. Load the current position, do the put, then advance only
+        // after success (see post-put `fetch_add` below).
+        let wal_entry_position = self.next_wal_entry_position.load(Ordering::SeqCst);
         let final_path = self.wal_entry_path(wal_entry_position);
 
         // Collect batches in range [start_batch_position, end_batch_position)
@@ -454,6 +484,11 @@ impl WalFlusher {
 
         let wal_io_duration = wal_result?;
         let (index_update_duration, index_update_duration_breakdown) = index_result?;
+
+        // Put succeeded — now claim the position. A transient failure above
+        // would have returned early without advancing, so a caller retry hits
+        // the same slot again.
+        self.next_wal_entry_position.fetch_add(1, Ordering::SeqCst);
 
         // Update per-memtable watermark (inclusive: last batch ID that was flushed)
         batch_store.set_max_flushed_batch_position(end_batch_position - 1);
@@ -840,6 +875,44 @@ mod tests {
         assert!(
             result_b.unwrap_err().is_writer_fenced(),
             "Error should indicate fencing"
+        );
+    }
+
+    // Regression test: close_watermark() must unblock a BatchDurableWatcher that
+    // is sleeping in `rx.changed().await`, and the error must be classified as
+    // WriterFenced (not generic IO) so callers can branch on `is_writer_fenced`.
+    // If `close_watermark` stops dropping the sender, or `wait()` stops mapping
+    // the closed channel to WriterFenced, the assertions below fail.
+    #[tokio::test]
+    async fn test_close_watermark_unblocks_waiter_with_writer_fenced() {
+        let (store, base_path, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let mut flusher = WalFlusher::new(&base_path, shard_id, 1, 1);
+        flusher.set_object_store(store);
+        let flusher = Arc::new(flusher);
+
+        let mut watcher = flusher.track_batch(0);
+
+        // Spawn a waiter that will block on the watermark channel.
+        let wait_task = tokio::spawn(async move { watcher.wait().await });
+
+        // Give the waiter a moment to register on `rx.changed()`.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(!wait_task.is_finished(), "waiter should still be blocked");
+
+        // Fencing path: drop the sender. The waiter must unblock with
+        // WriterFenced within a short timeout (no deadlock).
+        flusher.close_watermark();
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(500), wait_task)
+            .await
+            .expect("waiter did not unblock after close_watermark — deadlock regression")
+            .expect("waiter task panicked");
+
+        let err = result.expect_err("waiter should return an error after fencing");
+        assert!(
+            err.is_writer_fenced(),
+            "closed watermark after fencing must surface WriterFenced, got: {err}"
         );
     }
 
