@@ -3,9 +3,11 @@
 
 //! Garbage collection for WAL entries.
 //!
-//! Periodically deletes WAL entries that have been flushed to storage,
-//! using `replay_after_wal_entry_position` from the shard manifest to
-//! determine which entries are safe to remove.
+//! Periodically deletes WAL entries that have been flushed to storage.
+//! The current `replay_after_wal_entry_position` is delivered via a watch
+//! channel fed by `MemTableFlusher`, so the handler neither re-reads the
+//! manifest nor re-lists the WAL directory on idle ticks — it only does work
+//! when the flusher has advanced the watermark since the last successful sweep.
 
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -17,9 +19,9 @@ use lance_core::Result;
 use lance_io::object_store::ObjectStore;
 use log::{debug, info, warn};
 use object_store::path::Path;
+use tokio::sync::watch;
 use tracing::instrument;
 
-use super::manifest::ShardManifestStore;
 use super::util::parse_bit_reversed_filename;
 use super::write::MessageHandler;
 
@@ -32,40 +34,49 @@ pub struct TriggerWalGc;
 /// Background handler that periodically deletes flushed WAL entries.
 pub struct WalGcHandler {
     object_store: Arc<ObjectStore>,
-    manifest_store: Arc<ShardManifestStore>,
     wal_dir: Path,
     interval: Duration,
+    replay_after_rx: watch::Receiver<u64>,
+    // Highest `replay_after_wal_entry_position` for which a sweep has completed
+    // without any list/delete errors. Ticks short-circuit when the watch value
+    // hasn't advanced past this; a failed sweep leaves it unchanged so retries
+    // happen naturally on the next tick.
+    last_gc_position: u64,
 }
 
 impl WalGcHandler {
     pub fn new(
         object_store: Arc<ObjectStore>,
-        manifest_store: Arc<ShardManifestStore>,
         wal_dir: Path,
         interval: Duration,
+        replay_after_rx: watch::Receiver<u64>,
     ) -> Self {
         Self {
             object_store,
-            manifest_store,
             wal_dir,
             interval,
+            replay_after_rx,
+            last_gc_position: 0,
         }
     }
 
     #[instrument(name = "wal_gc", level = "debug", skip_all)]
-    async fn collect(&self) -> Result<usize> {
-        let Some(manifest) = self.manifest_store.read_latest().await? else {
-            return Ok(0);
-        };
-
-        let gc_before = manifest.replay_after_wal_entry_position;
-        if gc_before == 0 {
+    async fn collect(&mut self) -> Result<usize> {
+        let gc_before = *self.replay_after_rx.borrow();
+        if gc_before == 0 || gc_before <= self.last_gc_position {
             return Ok(0);
         }
+
+        let mut saw_error = false;
 
         // Stream eligible WAL entry paths into the batch-delete API so object
         // stores that support multi-key deletes (e.g. S3's up-to-1000-per-request
         // bulk delete) aren't reduced to one round-trip per file.
+        //
+        // Bit-reversed filenames mean the list order is not monotonic in
+        // position, so we can't terminate the scan early — but with the
+        // watermark cache above we only list when new entries have become
+        // eligible since the last successful sweep.
         let paths = self
             .object_store
             .inner
@@ -93,7 +104,10 @@ impl WalGcHandler {
         while let Some(result) = delete_stream.next().await {
             match result {
                 Ok(_) => deleted += 1,
-                Err(e) => warn!("Failed to delete WAL entry: {}", e),
+                Err(e) => {
+                    saw_error = true;
+                    warn!("Failed to delete WAL entry: {}", e);
+                }
             }
         }
 
@@ -104,6 +118,12 @@ impl WalGcHandler {
             );
         } else {
             debug!("WAL GC: no entries to collect");
+        }
+
+        // Only advance the watermark when the sweep completed cleanly, so any
+        // entry we missed gets retried on the next tick.
+        if !saw_error {
+            self.last_gc_position = gc_before;
         }
 
         Ok(deleted)
@@ -127,7 +147,6 @@ impl MessageHandler<TriggerWalGc> for WalGcHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dataset::mem_wal::manifest::ShardManifestStore;
     use crate::dataset::mem_wal::util::shard_wal_path;
     use crate::dataset::mem_wal::wal::WalFlusher;
     use crate::dataset::mem_wal::write::BatchStore;
@@ -155,66 +174,39 @@ mod tests {
         .unwrap()
     }
 
+    async fn write_wal_entries(
+        store: &Arc<ObjectStore>,
+        base_path: &Path,
+        shard_id: Uuid,
+        count: usize,
+    ) {
+        let schema = create_test_schema();
+        let mut flusher = WalFlusher::new(base_path, shard_id, 1, 1);
+        flusher.set_object_store(store.clone());
+
+        let batch_store = BatchStore::with_capacity(10);
+        for _ in 0..count {
+            batch_store.append(create_test_batch(&schema, 5)).unwrap();
+        }
+
+        for i in 0..count {
+            let _ = flusher.track_batch(i);
+            flusher
+                .flush_to_with_index_update(&batch_store, i + 1, None)
+                .await
+                .unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn test_wal_gc_deletes_flushed_entries() {
         let temp_dir = tempfile::tempdir().unwrap();
         let uri = format!("file://{}", temp_dir.path().display());
         let (store, base_path) = ObjectStore::from_uri(&uri).await.unwrap();
-        // store is already Arc<ObjectStore> from from_uri
         let shard_id = Uuid::new_v4();
 
-        // Write 3 WAL entries
-        let schema = create_test_schema();
-        let mut flusher = WalFlusher::new(&base_path, shard_id, 1, 1);
-        flusher.set_object_store(store.clone());
+        write_wal_entries(&store, &base_path, shard_id, 3).await;
 
-        let batch_store = BatchStore::with_capacity(10);
-        for _ in 0..3 {
-            batch_store.append(create_test_batch(&schema, 5)).unwrap();
-        }
-
-        // Flush batches one at a time to create 3 separate WAL entries
-        let _ = flusher.track_batch(0);
-        flusher
-            .flush_to_with_index_update(&batch_store, 1, None)
-            .await
-            .unwrap(); // position 1
-
-        let _ = flusher.track_batch(1);
-        flusher
-            .flush_to_with_index_update(&batch_store, 2, None)
-            .await
-            .unwrap(); // position 2
-
-        let _ = flusher.track_batch(2);
-        flusher
-            .flush_to_with_index_update(&batch_store, 3, None)
-            .await
-            .unwrap(); // position 3
-
-        // Create manifest store and write a manifest with replay_after = 2
-        // (positions 1 and 2 are safe to delete)
-        let manifest_store = Arc::new(ShardManifestStore::new(
-            store.clone(),
-            &base_path,
-            shard_id,
-            2,
-        ));
-        let (_, _manifest) = manifest_store.claim_epoch(0).await.unwrap();
-
-        // Update manifest to set replay_after_wal_entry_position = 2
-        manifest_store
-            .commit_update(1, |current| {
-                let mut updated = current.clone();
-                updated.version = current.version + 1;
-                updated.replay_after_wal_entry_position = 2;
-                updated.wal_entry_position_last_seen = 3;
-                updated
-            })
-            .await
-            .unwrap();
-
-        // Verify all 3 WAL files exist
         let wal_dir = shard_wal_path(&base_path, &shard_id);
         let entries: Vec<_> = store
             .inner
@@ -226,17 +218,14 @@ mod tests {
             .collect();
         assert_eq!(entries.len(), 3);
 
-        // Run GC
-        let handler = WalGcHandler::new(
-            store.clone(),
-            manifest_store,
-            wal_dir.clone(),
-            Duration::from_secs(60),
-        );
+        // Positions 1 and 2 are safe to delete; position 3 must remain.
+        let (_tx, rx) = watch::channel(2u64);
+
+        let mut handler =
+            WalGcHandler::new(store.clone(), wal_dir.clone(), Duration::from_secs(60), rx);
         let deleted = handler.collect().await.unwrap();
         assert_eq!(deleted, 2);
 
-        // Verify only position 3 remains
         let remaining: Vec<_> = store
             .inner
             .list(Some(&wal_dir))
@@ -253,25 +242,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_wal_gc_no_manifest() {
+    async fn test_wal_gc_initial_watermark_zero() {
         let temp_dir = tempfile::tempdir().unwrap();
         let uri = format!("file://{}", temp_dir.path().display());
         let (store, base_path) = ObjectStore::from_uri(&uri).await.unwrap();
-        // store is already Arc<ObjectStore> from from_uri
         let shard_id = Uuid::new_v4();
 
-        let manifest_store = Arc::new(ShardManifestStore::new(
-            store.clone(),
-            &base_path,
-            shard_id,
-            2,
-        ));
-
+        let (_tx, rx) = watch::channel(0u64);
         let wal_dir = shard_wal_path(&base_path, &shard_id);
-        let handler = WalGcHandler::new(store, manifest_store, wal_dir, Duration::from_secs(60));
+        let mut handler = WalGcHandler::new(store, wal_dir, Duration::from_secs(60), rx);
 
-        // Should return 0 when no manifest exists
+        // With replay_after == 0 nothing has been flushed; GC must no-op.
         let deleted = handler.collect().await.unwrap();
         assert_eq!(deleted, 0);
+    }
+
+    #[tokio::test]
+    async fn test_wal_gc_skips_unchanged_watermark() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let uri = format!("file://{}", temp_dir.path().display());
+        let (store, base_path) = ObjectStore::from_uri(&uri).await.unwrap();
+        let shard_id = Uuid::new_v4();
+
+        write_wal_entries(&store, &base_path, shard_id, 2).await;
+
+        let wal_dir = shard_wal_path(&base_path, &shard_id);
+        let (tx, rx) = watch::channel(2u64);
+        let mut handler =
+            WalGcHandler::new(store.clone(), wal_dir.clone(), Duration::from_secs(60), rx);
+
+        // First sweep deletes both entries.
+        assert_eq!(handler.collect().await.unwrap(), 2);
+        assert_eq!(handler.last_gc_position, 2);
+
+        // Re-listing would surface no candidates, but we shouldn't even bother:
+        // write another entry and confirm it survives a tick that hasn't seen
+        // the watermark advance.
+        write_wal_entries(&store, &base_path, shard_id, 1).await;
+        assert_eq!(handler.collect().await.unwrap(), 0);
+        let remaining: Vec<_> = store
+            .inner
+            .list(Some(&wal_dir))
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(remaining.len(), 1);
+
+        // Once the watermark advances, the new entry is swept.
+        tx.send_replace(3);
+        assert_eq!(handler.collect().await.unwrap(), 1);
+        assert_eq!(handler.last_gc_position, 3);
     }
 }

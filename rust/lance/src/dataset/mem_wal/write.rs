@@ -1046,14 +1046,22 @@ impl ShardWriter {
         // Capture WAL dir before base_path is moved
         let wal_dir = shard_wal_path(&base_path, &shard_id);
 
+        // Watch channel fed by MemTableFlusher whenever the manifest advances,
+        // consumed by the WAL GC handler so it can skip ticks where nothing new
+        // has become eligible for deletion.
+        let (replay_after_tx, replay_after_rx) =
+            tokio::sync::watch::channel(manifest.replay_after_wal_entry_position);
+
         // Create flusher
-        let flusher = Arc::new(MemTableFlusher::new(
+        let mut flusher = MemTableFlusher::new(
             object_store.clone(),
             base_path,
             base_uri,
             shard_id,
             manifest_store.clone(),
-        ));
+        );
+        flusher.set_replay_after_watch(replay_after_tx);
+        let flusher = Arc::new(flusher);
 
         // Create stats collector
         let stats = new_shared_stats();
@@ -1086,9 +1094,9 @@ impl ShardWriter {
             let (wal_gc_tx, wal_gc_rx) = mpsc::unbounded_channel();
             let wal_gc_handler = WalGcHandler::new(
                 object_store.clone(),
-                manifest_store.clone(),
                 wal_dir,
                 wal_gc_interval,
+                replay_after_rx,
             );
             task_executor.add_handler("wal_gc".to_string(), Box::new(wal_gc_handler), wal_gc_rx)?;
             Some(wal_gc_tx)

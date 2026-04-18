@@ -15,6 +15,7 @@ use lance_io::object_store::ObjectStore;
 use lance_table::format::IndexMetadata;
 use log::info;
 use object_store::path::Path;
+use tokio::sync::watch;
 use tracing::instrument;
 use uuid::Uuid;
 
@@ -37,6 +38,7 @@ pub struct MemTableFlusher {
     base_uri: String,
     shard_id: Uuid,
     manifest_store: Arc<ShardManifestStore>,
+    replay_after_tx: Option<watch::Sender<u64>>,
 }
 
 impl MemTableFlusher {
@@ -53,7 +55,17 @@ impl MemTableFlusher {
             base_uri: base_uri.into(),
             shard_id,
             manifest_store,
+            replay_after_tx: None,
         }
+    }
+
+    /// Install a watch sender that is notified with the new
+    /// `replay_after_wal_entry_position` after every successful manifest commit.
+    ///
+    /// The WAL GC handler subscribes to this to avoid re-reading the manifest
+    /// or re-listing the WAL directory when nothing has advanced.
+    pub fn set_replay_after_watch(&mut self, tx: watch::Sender<u64>) {
+        self.replay_after_tx = Some(tx);
     }
 
     /// Construct a full URI for a path within the base dataset.
@@ -740,7 +752,8 @@ impl MemTableFlusher {
     ) -> Result<ShardManifest> {
         let gen_path = gen_path.to_string();
 
-        self.manifest_store
+        let new_manifest = self
+            .manifest_store
             .commit_update(epoch, |current| {
                 let mut flushed_generations = current.flushed_generations.clone();
                 flushed_generations.push(FlushedGeneration {
@@ -759,7 +772,13 @@ impl MemTableFlusher {
                     ..current.clone()
                 }
             })
-            .await
+            .await?;
+
+        if let Some(tx) = &self.replay_after_tx {
+            tx.send_replace(new_manifest.replay_after_wal_entry_position);
+        }
+
+        Ok(new_manifest)
     }
 }
 
