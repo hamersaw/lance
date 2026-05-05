@@ -8,6 +8,7 @@
 
 use std::io::Cursor;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
@@ -19,7 +20,6 @@ use bytes::Bytes;
 use futures::StreamExt;
 use lance_core::{Error, Result};
 use lance_io::object_store::ObjectStore;
-use log::info;
 use object_store::ObjectStoreExt;
 use object_store::path::Path;
 use object_store::{PutMode, PutOptions};
@@ -135,18 +135,45 @@ pub struct WalFlushResult {
     pub wal_bytes: usize,
 }
 
-/// Message to trigger a WAL flush for a specific batch store.
+/// Source for a WAL flush — either a `BatchStore` range (MemTable mode) or
+/// a drainable in-memory pending queue (WAL-only mode).
+pub enum WalFlushSource {
+    /// MemTable mode: read a `[max_flushed+1, end_batch_position)` range
+    /// from a `BatchStore`. Indexes are updated in parallel with the WAL
+    /// append.
+    BatchStore {
+        batch_store: Arc<BatchStore>,
+        indexes: Option<Arc<IndexStore>>,
+    },
+    /// WAL-only mode: drain all pending batches from the shared
+    /// `WalOnlyState`. There are no in-memory indexes to update.
+    WalOnly { state: Arc<WalOnlyState> },
+}
+
+impl WalFlushSource {
+    fn pending_count(&self) -> usize {
+        match self {
+            Self::BatchStore { batch_store, .. } => batch_store.pending_wal_flush_count(),
+            Self::WalOnly { state } => state
+                .pending
+                .lock()
+                .ok()
+                .map(|p| p.batches.len())
+                .unwrap_or(0),
+        }
+    }
+}
+
+/// Message to trigger a WAL flush.
 ///
-/// This unified message handles both:
-/// - Normal periodic flushes (specific end_batch_position)
-/// - Freeze-time flushes (end_batch_position = usize::MAX to flush all)
+/// Carries a `source` describing where to read batches from (BatchStore range
+/// or pending queue) and an optional `done` cell for completion notification.
 pub struct TriggerWalFlush {
-    /// The batch store to flush from.
-    pub batch_store: Arc<BatchStore>,
-    /// The indexes to update in parallel (for WAL-coupled index updates).
-    pub indexes: Option<Arc<IndexStore>>,
-    /// End batch position (exclusive) - flush batches after max_wal_flushed_batch_position up to this.
-    /// Use usize::MAX to flush all pending batches.
+    pub source: WalFlushSource,
+    /// End batch position (exclusive). For `BatchStore`, flush batches after
+    /// `max_flushed_batch_position` up to this. For `WalOnly`, indicates the
+    /// position the durability watermark must reach for callers waiting on
+    /// this flush. Use `usize::MAX` to flush all pending batches.
     pub end_batch_position: usize,
     /// Optional cell to write completion result.
     /// Uses Result<WalFlushResult, String> since Error doesn't implement Clone.
@@ -156,19 +183,134 @@ pub struct TriggerWalFlush {
 impl std::fmt::Debug for TriggerWalFlush {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TriggerWalFlush")
-            .field(
-                "pending_batches",
-                &self.batch_store.pending_wal_flush_count(),
-            )
+            .field("pending_batches", &self.source.pending_count())
             .field("end_batch_position", &self.end_batch_position)
             .finish()
     }
 }
 
-/// Buffer for WAL operations.
+/// Drainable pending-batch queue used by `ShardWriter` in WAL-only mode.
 ///
-/// Durability is tracked via a watch channel that broadcasts the durable watermark.
-/// The actual flush watermark is stored in `BatchStore.max_flushed_batch_position`.
+/// Lives in `wal.rs` (not `write.rs`) so the WAL flush plumbing can name it
+/// without a circular dependency.
+#[derive(Debug, Default)]
+pub struct WalOnlyState {
+    pub pending: StdMutex<PendingWalBatches>,
+}
+
+#[derive(Debug, Default)]
+pub struct PendingWalBatches {
+    /// Batches accumulated since the last successful flush. Each entry
+    /// pairs the `RecordBatch` with its memory footprint so we can keep
+    /// `estimated_bytes` accurate when the front of the queue is committed
+    /// after a successful append.
+    batches: Vec<(RecordBatch, usize)>,
+    /// Sum of memory footprints of batches currently in `batches`. Drives
+    /// the size-based flush trigger.
+    estimated_bytes: usize,
+    /// Cumulative count of batches pushed since the writer was opened.
+    /// Drives the monotonic batch positions returned in `WriteResult`.
+    next_batch_position: usize,
+}
+
+/// Snapshot of the pending queue used by the flush handler to attempt a
+/// WAL append without removing the batches first. On success the handler
+/// calls `WalOnlyState::commit_flushed(snapshot.count)` to remove the front
+/// of the queue; on failure the batches stay in the queue so a later flush
+/// can retry them, instead of being silently lost.
+#[derive(Debug)]
+pub struct WalOnlySnapshot {
+    pub batches: Vec<RecordBatch>,
+    pub count: usize,
+}
+
+impl WalOnlyState {
+    /// Push batches and return the assigned `[start, end)` position range.
+    /// Holds the lock for the entire push so position assignment is atomic.
+    pub fn push(&self, batches: Vec<RecordBatch>) -> std::ops::Range<usize> {
+        let mut pending = self
+            .pending
+            .lock()
+            .expect("WalOnlyState pending mutex poisoned");
+        let start = pending.next_batch_position;
+        let count = batches.len();
+        for batch in batches.into_iter() {
+            let bytes = batch.get_array_memory_size();
+            pending.estimated_bytes += bytes;
+            pending.batches.push((batch, bytes));
+        }
+        pending.next_batch_position += count;
+        start..pending.next_batch_position
+    }
+
+    /// Snapshot the pending queue for an attempted WAL append. Clones the
+    /// `RecordBatch` handles (cheap; `RecordBatch` is `Arc`-backed) without
+    /// removing them. The caller must call `commit_flushed(snapshot.count)`
+    /// on success; on failure, the batches remain in the queue for the next
+    /// flush attempt.
+    pub fn snapshot_pending(&self) -> WalOnlySnapshot {
+        let pending = self
+            .pending
+            .lock()
+            .expect("WalOnlyState pending mutex poisoned");
+        let batches: Vec<RecordBatch> = pending.batches.iter().map(|(b, _)| b.clone()).collect();
+        let count = batches.len();
+        WalOnlySnapshot { batches, count }
+    }
+
+    /// Remove the first `count` batches from the pending queue and decrement
+    /// `estimated_bytes` accordingly. Called by the flush handler after the
+    /// WAL append for those batches succeeded.
+    pub fn commit_flushed(&self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let mut pending = self
+            .pending
+            .lock()
+            .expect("WalOnlyState pending mutex poisoned");
+        let take = count.min(pending.batches.len());
+        let bytes_removed: usize = pending.batches.drain(0..take).map(|(_, bytes)| bytes).sum();
+        pending.estimated_bytes = pending.estimated_bytes.saturating_sub(bytes_removed);
+    }
+
+    /// Pending batch count (for stats / triggers).
+    pub fn batch_count(&self) -> usize {
+        self.pending
+            .lock()
+            .ok()
+            .map(|p| p.batches.len())
+            .unwrap_or(0)
+    }
+
+    /// Pending bytes (for size-based flush trigger).
+    pub fn estimated_size(&self) -> usize {
+        self.pending
+            .lock()
+            .ok()
+            .map(|p| p.estimated_bytes)
+            .unwrap_or(0)
+    }
+
+    /// Position the next pushed batch will get. Equivalent to "total pushed
+    /// since open."
+    pub fn next_batch_position(&self) -> usize {
+        self.pending
+            .lock()
+            .ok()
+            .map(|p| p.next_batch_position)
+            .unwrap_or(0)
+    }
+}
+
+/// Background WAL flush coordinator for `ShardWriter`.
+///
+/// `WalFlusher` owns the durability watermark watch channel, the trigger
+/// channel for the background flush handler, and the wal-flush completion
+/// cell used by backpressure waiters. It does **not** own the object store,
+/// the writer epoch, or the next-position counter — those live on the
+/// shared `WalAppender`. The flusher delegates the actual WAL write to the
+/// appender, optionally running a parallel index update in MemTable mode.
 pub struct WalFlusher {
     /// Watch channel sender for durable watermark.
     /// Broadcasts the highest batch_position that is now durable.
@@ -179,18 +321,13 @@ pub struct WalFlusher {
     /// Set to true when the writer is fenced. Shared with `BatchDurableWatcher`
     /// so a dropped sender is reported as `WriterFenced` rather than generic IO.
     fenced: Arc<AtomicBool>,
-    /// Object store for writing WAL files.
-    object_store: Option<Arc<ObjectStore>>,
-    /// Shard ID.
+    /// Underlying WAL append primitive — owns object store, epoch, and
+    /// position discovery.
+    wal_appender: Arc<WalAppender>,
+    /// Shard ID (cached for tracing; same as `wal_appender.shard_id()`).
     shard_id: Uuid,
-    /// Writer epoch (stored in WAL entries for fencing).
-    writer_epoch: u64,
-    /// Next WAL entry ID to use.
-    next_wal_entry_position: AtomicU64,
     /// Channel to send flush messages.
     flush_tx: Option<mpsc::UnboundedSender<TriggerWalFlush>>,
-    /// WAL directory path.
-    wal_dir: Path,
     /// Cell for WAL flush completion notification.
     /// Created at construction and recreated after each flush.
     /// Used by backpressure to wait for WAL flushes.
@@ -198,21 +335,13 @@ pub struct WalFlusher {
 }
 
 impl WalFlusher {
-    /// Create a new WAL flusher.
+    /// Create a new WAL flusher backed by an existing `WalAppender`.
     ///
-    /// # Arguments
-    ///
-    /// * `base_path` - Base path within the object store (from ObjectStore::from_uri)
-    /// * `shard_id` - Shard UUID
-    /// * `writer_epoch` - Current writer epoch
-    /// * `next_wal_entry_position` - Next WAL entry ID (from recovery or 1 for new shard)
-    pub fn new(
-        base_path: &Path,
-        shard_id: Uuid,
-        writer_epoch: u64,
-        next_wal_entry_position: u64,
-    ) -> Self {
-        let wal_dir = shard_wal_path(base_path, &shard_id);
+    /// The appender owns object store, epoch, and position state. The
+    /// flusher adds the durability watermark, trigger channel, and
+    /// completion cell on top.
+    pub fn new(wal_appender: Arc<WalAppender>) -> Self {
+        let shard_id = wal_appender.shard_id();
         // Initialize durable watermark at 0 (no batches durable yet)
         let (durable_watermark_tx, durable_watermark_rx) = watch::channel(0);
         // Create initial WAL flush cell for backpressure
@@ -221,24 +350,21 @@ impl WalFlusher {
             durable_watermark_tx: std::sync::Mutex::new(Some(durable_watermark_tx)),
             durable_watermark_rx,
             fenced: Arc::new(AtomicBool::new(false)),
-            object_store: None,
+            wal_appender,
             shard_id,
-            writer_epoch,
-            next_wal_entry_position: AtomicU64::new(next_wal_entry_position),
             flush_tx: None,
-            wal_dir,
             wal_flush_cell: std::sync::Mutex::new(Some(wal_flush_cell)),
         }
-    }
-
-    /// Set the object store for WAL file operations.
-    pub fn set_object_store(&mut self, object_store: Arc<ObjectStore>) {
-        self.object_store = Some(object_store);
     }
 
     /// Set the flush channel for background flush handler.
     pub fn set_flush_channel(&mut self, tx: mpsc::UnboundedSender<TriggerWalFlush>) {
         self.flush_tx = Some(tx);
+    }
+
+    /// Underlying WAL appender (for tests and debug accessors).
+    pub fn wal_appender(&self) -> &Arc<WalAppender> {
+        &self.wal_appender
     }
 
     /// Track a batch for WAL durability.
@@ -297,25 +423,23 @@ impl WalFlusher {
         *guard = Some(WatchableOnceCell::new());
     }
 
-    /// Trigger an immediate flush for a specific batch store up to a specific batch ID.
+    /// Trigger an immediate WAL flush.
     ///
     /// # Arguments
     ///
-    /// * `batch_store` - The batch store to flush from
-    /// * `indexes` - Optional indexes to update in parallel with WAL I/O
-    /// * `end_batch_position` - End batch ID (exclusive). Use usize::MAX to flush all pending.
-    /// * `done` - Optional cell to write completion result
+    /// * `source` - Where the flush should pull batches from (BatchStore range or pending queue).
+    /// * `end_batch_position` - End batch position (exclusive); for `BatchStore`, the
+    ///   range to flush; for `WalOnly`, the watermark callers are waiting for.
+    /// * `done` - Optional cell to write completion result.
     pub fn trigger_flush(
         &self,
-        batch_store: Arc<BatchStore>,
-        indexes: Option<Arc<IndexStore>>,
+        source: WalFlushSource,
         end_batch_position: usize,
         done: Option<WatchableOnceCell<std::result::Result<WalFlushResult, String>>>,
     ) -> Result<()> {
         if let Some(tx) = &self.flush_tx {
             tx.send(TriggerWalFlush {
-                batch_store,
-                indexes,
+                source,
                 end_batch_position,
                 done,
             })
@@ -324,27 +448,36 @@ impl WalFlusher {
         Ok(())
     }
 
-    /// Flush batches up to a specific end_batch_position with index updates.
+    /// Flush from the given source up to `end_batch_position`, optionally
+    /// updating in-memory indexes in parallel with the WAL append.
     ///
-    /// This method flushes batches from `(max_wal_flushed_batch_position + 1)` to `end_batch_position`,
-    /// allowing each trigger to flush only the batches that existed at trigger time.
+    /// Delegates the actual WAL write to the underlying `WalAppender`
+    /// (atomic put-if-not-exists, conflict retry, fence-on-write).
     ///
-    /// # Arguments
-    ///
-    /// * `batch_store` - The BatchStore to read batches from
-    /// * `end_batch_position` - End batch ID (exclusive) - flush up to this batch
-    /// * `indexes` - Optional IndexStore to update
-    ///
-    /// # Returns
-    ///
-    /// A `WalFlushResult` with timing metrics and the WAL entry.
-    /// Returns empty result if nothing to flush (already flushed past end_batch_position).
-    #[instrument(name = "wal_flush", level = "info", skip_all, fields(shard_id = %self.shard_id, end_batch_position, has_indexes = indexes.is_some()))]
-    pub async fn flush_to_with_index_update(
+    /// Returns an empty `WalFlushResult` if there is nothing to flush.
+    #[instrument(name = "wal_flush", level = "info", skip_all, fields(shard_id = %self.shard_id, end_batch_position))]
+    pub async fn flush(
+        &self,
+        source: &WalFlushSource,
+        end_batch_position: usize,
+    ) -> Result<WalFlushResult> {
+        match source {
+            WalFlushSource::BatchStore {
+                batch_store,
+                indexes,
+            } => {
+                self.flush_from_batch_store(batch_store, indexes.clone(), end_batch_position)
+                    .await
+            }
+            WalFlushSource::WalOnly { state } => self.flush_from_wal_only(state).await,
+        }
+    }
+
+    async fn flush_from_batch_store(
         &self,
         batch_store: &BatchStore,
-        end_batch_position: usize,
         indexes: Option<Arc<IndexStore>>,
+        end_batch_position: usize,
     ) -> Result<WalFlushResult> {
         // Get current flush position from per-memtable watermark (inclusive)
         // start_batch_position is the first batch to flush
@@ -355,27 +488,8 @@ impl WalFlusher {
 
         // If we've already flushed past this end, nothing to do
         if start_batch_position >= end_batch_position {
-            return Ok(WalFlushResult {
-                entry: None,
-                wal_io_duration: std::time::Duration::ZERO,
-                index_update_duration: std::time::Duration::ZERO,
-                index_update_duration_breakdown: std::collections::HashMap::new(),
-                rows_indexed: 0,
-                wal_bytes: 0,
-            });
+            return Ok(empty_flush_result());
         }
-
-        let object_store = self
-            .object_store
-            .as_ref()
-            .ok_or_else(|| Error::io("Object store not set on WAL flusher"))?;
-
-        // Don't pre-reserve the position: if the put fails transiently we'd
-        // burn the slot, leaving a hole that breaks contiguity assumptions on
-        // replay. Load the current position, do the put, then advance only
-        // after success (see post-put `fetch_add` below).
-        let wal_entry_position = self.next_wal_entry_position.load(Ordering::SeqCst);
-        let final_path = self.wal_entry_path(wal_entry_position);
 
         // Collect batches in range [start_batch_position, end_batch_position)
         let mut stored_batches: Vec<StoredBatch> =
@@ -388,77 +502,20 @@ impl WalFlusher {
         }
 
         if stored_batches.is_empty() {
-            return Ok(WalFlushResult {
-                entry: None,
-                wal_io_duration: std::time::Duration::ZERO,
-                index_update_duration: std::time::Duration::ZERO,
-                index_update_duration_breakdown: std::collections::HashMap::new(),
-                rows_indexed: 0,
-                wal_bytes: 0,
-            });
+            return Ok(empty_flush_result());
         }
 
         let rows_to_index: usize = stored_batches.iter().map(|b| b.num_rows).sum();
-        let num_batches = stored_batches.len();
+        let record_batches: Vec<RecordBatch> =
+            stored_batches.iter().map(|s| s.data.clone()).collect();
 
-        // Prepare WAL I/O data
-        let schema = stored_batches[0].data.schema();
-        let mut metadata = schema.metadata().clone();
-        metadata.insert(WRITER_EPOCH_KEY.to_string(), self.writer_epoch.to_string());
-        let schema_with_epoch = Arc::new(ArrowSchema::new_with_metadata(
-            schema.fields().to_vec(),
-            metadata,
-        ));
-
-        // Serialize WAL data as IPC stream (schema at start, no footer)
-        let mut buffer = Vec::new();
-        {
-            let mut writer =
-                StreamWriter::try_new(&mut buffer, &schema_with_epoch).map_err(|e| {
-                    Error::io(format!("Failed to create Arrow IPC stream writer: {}", e))
-                })?;
-
-            for stored in &stored_batches {
-                writer.write(&stored.data).map_err(|e| {
-                    Error::io(format!("Failed to write batch to Arrow IPC stream: {}", e))
-                })?;
-            }
-
-            writer
-                .finish()
-                .map_err(|e| Error::io(format!("Failed to finish Arrow IPC stream: {}", e)))?;
-        }
-
-        let wal_bytes = buffer.len();
-
-        // WAL I/O and index update in parallel
-        let wal_path = final_path.clone();
-        let wal_data = Bytes::from(buffer);
-        let store = object_store.clone();
-
-        // WAL entries use PutMode::Create (put-if-not-exists) for fencing.
-        // If another writer already wrote this position, the put fails with
-        // AlreadyExists, which we map to a fencing error. Note: conditional
-        // PUTs on S3 carry higher latency than regular PUTs due to server-side
-        // coordination overhead.
-        let put_opts = PutOptions {
-            mode: PutMode::Create,
-            ..Default::default()
-        };
-        let shard_id = self.shard_id;
-
-        // Returns (overall_duration, per_index_durations)
-        let (wal_result, index_result) = if let Some(idx_registry) = indexes {
-            let wal_future = async {
+        let appender = self.wal_appender.clone();
+        let (append_result, index_result) = if let Some(idx_registry) = indexes {
+            let wal_future = async move {
                 let start = Instant::now();
-                store
-                    .inner
-                    .put_opts(&wal_path, wal_data.into(), put_opts)
-                    .await
-                    .map_err(|e| Self::map_wal_put_error(e, wal_entry_position, shard_id))?;
-                Ok::<_, Error>(start.elapsed())
+                let r = appender.append(record_batches).await?;
+                Ok::<_, Error>((r, start.elapsed()))
             };
-
             let index_future = async {
                 let start = Instant::now();
                 let per_index = tokio::task::spawn_blocking(move || {
@@ -468,62 +525,87 @@ impl WalFlusher {
                 .map_err(|e| Error::internal(format!("Index update task panicked: {}", e)))??;
                 Ok::<_, Error>((start.elapsed(), per_index))
             };
-
             tokio::join!(wal_future, index_future)
         } else {
-            let wal_future = async {
+            let wal_future = async move {
                 let start = Instant::now();
-                store
-                    .inner
-                    .put_opts(&wal_path, wal_data.into(), put_opts)
-                    .await
-                    .map_err(|e| Self::map_wal_put_error(e, wal_entry_position, shard_id))?;
-                Ok::<_, Error>(start.elapsed())
+                let r = appender.append(record_batches).await?;
+                Ok::<_, Error>((r, start.elapsed()))
             };
-
             (
                 wal_future.await,
                 Ok((std::time::Duration::ZERO, std::collections::HashMap::new())),
             )
         };
 
-        let wal_io_duration = wal_result?;
+        let (append_result, wal_io_duration) = append_result?;
         let (index_update_duration, index_update_duration_breakdown) = index_result?;
-
-        // Put succeeded — now claim the position. A transient failure above
-        // would have returned early without advancing, so a caller retry hits
-        // the same slot again.
-        self.next_wal_entry_position.fetch_add(1, Ordering::SeqCst);
 
         // Update per-memtable watermark (inclusive: last batch ID that was flushed)
         batch_store.set_max_flushed_batch_position(end_batch_position - 1);
 
-        // Notify durability waiters (global channel)
+        // Notify durability waiters (global channel). Sender is wrapped in
+        // Mutex<Option<>> so close_watermark() can drop it on fencing to
+        // unblock waiters with WriterFenced.
         if let Some(tx) = self.durable_watermark_tx.lock().unwrap().as_ref() {
             let _ = tx.send(end_batch_position);
         }
         // Signal WAL flush completion for backpressure waiters
         self.signal_wal_flush_complete();
 
-        let entry = WalEntry {
-            position: wal_entry_position,
-            writer_epoch: self.writer_epoch,
-            num_batches,
-        };
-
         Ok(WalFlushResult {
-            entry: Some(entry),
+            entry: Some(WalEntry {
+                position: append_result.entry_position,
+                writer_epoch: self.wal_appender.writer_epoch(),
+                num_batches: append_result.num_batches,
+            }),
             wal_io_duration,
             index_update_duration,
             index_update_duration_breakdown,
             rows_indexed: rows_to_index,
-            wal_bytes,
+            wal_bytes: append_result.wal_bytes,
         })
     }
 
-    /// Get the current WAL ID (last written + 1).
+    async fn flush_from_wal_only(&self, state: &Arc<WalOnlyState>) -> Result<WalFlushResult> {
+        // Snapshot the pending queue (clone-only; cheap because RecordBatch
+        // is Arc-backed). If the append fails the batches stay in the queue
+        // for the next flush attempt. If it succeeds we truncate the front.
+        let snapshot = state.snapshot_pending();
+        if snapshot.count == 0 {
+            return Ok(empty_flush_result());
+        }
+
+        let start = Instant::now();
+        let append_result = self.wal_appender.append(snapshot.batches).await?;
+        let wal_io_duration = start.elapsed();
+
+        // Append succeeded — remove the flushed batches from the front of
+        // the queue. Note: WAL-only mode does not use the global durability
+        // watermark (`durable_watermark_tx`) — `put_wal_only` waits on the
+        // per-trigger `done` cell instead — so we don't advance it here.
+        // Same for the wal-flush-completion cell, which is only consulted
+        // by MemTable-mode backpressure waiters.
+        state.commit_flushed(snapshot.count);
+
+        Ok(WalFlushResult {
+            entry: Some(WalEntry {
+                position: append_result.entry_position,
+                writer_epoch: self.wal_appender.writer_epoch(),
+                num_batches: append_result.num_batches,
+            }),
+            wal_io_duration,
+            index_update_duration: std::time::Duration::ZERO,
+            index_update_duration_breakdown: std::collections::HashMap::new(),
+            rows_indexed: 0,
+            wal_bytes: append_result.wal_bytes,
+        })
+    }
+
+    /// Stats accessor: best-effort next-position hint, mirrored from the
+    /// underlying appender.
     pub fn next_wal_entry_position(&self) -> u64 {
-        self.next_wal_entry_position.load(Ordering::SeqCst)
+        self.wal_appender.next_entry_position_hint()
     }
 
     /// Get the shard ID.
@@ -531,96 +613,27 @@ impl WalFlusher {
         self.shard_id
     }
 
-    /// Get the writer epoch.
+    /// Get the writer epoch (delegated to the underlying appender).
     pub fn writer_epoch(&self) -> u64 {
-        self.writer_epoch
+        self.wal_appender.writer_epoch()
     }
 
     /// Get the path for a WAL entry.
     pub fn wal_entry_path(&self, wal_entry_position: u64) -> Path {
-        let filename = wal_entry_filename(wal_entry_position);
-        self.wal_dir.clone().join(filename.as_str())
+        self.wal_appender.wal_entry_path(wal_entry_position)
     }
+}
 
-    /// Write a fence barrier at startup to claim WAL positions.
-    ///
-    /// Writes an empty WAL entry (valid Arrow IPC stream, zero batches) using
-    /// `PutMode::Create` at the next expected position. If a zombie writer
-    /// already wrote there, we skip forward until we find an unclaimed slot.
-    /// This immediately fences any old writer still holding stale positions.
-    pub async fn write_fence_barrier(&self, schema: &ArrowSchema) -> Result<()> {
-        let object_store = self
-            .object_store
-            .as_ref()
-            .ok_or_else(|| Error::io("Object store not set on WAL flusher"))?;
-
-        // Build an empty WAL entry (schema + epoch metadata, no batches)
-        let mut metadata = schema.metadata().clone();
-        metadata.insert(WRITER_EPOCH_KEY.to_string(), self.writer_epoch.to_string());
-        let schema_with_epoch = ArrowSchema::new_with_metadata(schema.fields().to_vec(), metadata);
-
-        let mut buffer = Vec::new();
-        {
-            let mut writer =
-                StreamWriter::try_new(&mut buffer, &schema_with_epoch).map_err(|e| {
-                    Error::io(format!("Failed to create fence barrier IPC stream: {}", e))
-                })?;
-            writer.finish().map_err(|e| {
-                Error::io(format!("Failed to finish fence barrier IPC stream: {}", e))
-            })?;
-        }
-        let barrier_data = Bytes::from(buffer);
-
-        let put_opts = PutOptions {
-            mode: PutMode::Create,
-            ..Default::default()
-        };
-
-        // Try to claim positions, scanning forward past any old writer's entries
-        loop {
-            let position = self.next_wal_entry_position.load(Ordering::SeqCst);
-            let path = self.wal_entry_path(position);
-
-            match object_store
-                .inner
-                .put_opts(&path, barrier_data.clone().into(), put_opts.clone())
-                .await
-            {
-                Ok(_) => {
-                    // Claimed this position — advance past it for real writes
-                    self.next_wal_entry_position.fetch_add(1, Ordering::SeqCst);
-                    info!(
-                        "Fence barrier written at WAL position {} for shard {} (epoch {})",
-                        position, self.shard_id, self.writer_epoch
-                    );
-                    return Ok(());
-                }
-                Err(object_store::Error::AlreadyExists { .. }) => {
-                    // Old writer claimed this position — skip forward
-                    self.next_wal_entry_position.fetch_add(1, Ordering::SeqCst);
-                    continue;
-                }
-                Err(e) => {
-                    return Err(Error::io(format!(
-                        "Failed to write fence barrier at position {}: {}",
-                        position, e
-                    )));
-                }
-            }
-        }
-    }
-
-    /// Map an object_store put error to a fencing error when AlreadyExists.
-    fn map_wal_put_error(e: object_store::Error, wal_entry_position: u64, shard_id: Uuid) -> Error {
-        if matches!(e, object_store::Error::AlreadyExists { .. }) {
-            Error::writer_fenced(format!(
-                "WAL position {} already exists for shard {} \
-                 (another writer has claimed this position)",
-                wal_entry_position, shard_id
-            ))
-        } else {
-            Error::io(format!("Failed to write WAL file: {}", e))
-        }
+/// Sentinel "nothing to flush" result, shared by `WalFlusher` and the
+/// `WalFlushHandler` early-out path in `write.rs`.
+pub fn empty_flush_result() -> WalFlushResult {
+    WalFlushResult {
+        entry: None,
+        wal_io_duration: std::time::Duration::ZERO,
+        index_update_duration: std::time::Duration::ZERO,
+        index_update_duration_breakdown: std::collections::HashMap::new(),
+        rows_indexed: 0,
+        wal_bytes: 0,
     }
 }
 
@@ -727,6 +740,11 @@ pub struct WalAppender {
     shard_id: Uuid,
     writer_epoch: u64,
     next_entry_position: Mutex<Option<u64>>,
+    /// Mirrors `next_entry_position` for cheap sync observability (stats).
+    /// Seeded at construction from `manifest.wal_entry_position_last_seen + 1`
+    /// so reopened shards report the post-recovery cursor immediately;
+    /// updated after each successful append.
+    next_entry_position_hint: AtomicU64,
 }
 
 impl WalAppender {
@@ -743,15 +761,49 @@ impl WalAppender {
             shard_id,
             2,
         ));
-        let (writer_epoch, _) = manifest_store.claim_epoch(shard_spec_id).await?;
-        Ok(Self {
+        let (writer_epoch, manifest) = manifest_store.claim_epoch(shard_spec_id).await?;
+        let position_hint = manifest
+            .wal_entry_position_last_seen
+            .max(manifest.replay_after_wal_entry_position)
+            .saturating_add(1);
+        Ok(Self::with_claimed_epoch(
+            object_store,
+            base_path,
+            shard_id,
+            manifest_store,
+            writer_epoch,
+            position_hint,
+        ))
+    }
+
+    /// Create a WAL appender for a shard whose epoch was already claimed by
+    /// the caller (e.g. `ShardWriter::open` claims once then injects the
+    /// resulting epoch into both the shard writer and its appender).
+    ///
+    /// `next_entry_position_hint_seed` should be
+    /// `manifest.wal_entry_position_last_seen + 1` so the sync observability
+    /// accessor (`next_entry_position_hint` / `WalFlusher::next_wal_entry_position`)
+    /// reflects the post-recovery cursor immediately after open instead of
+    /// reading 0 until the first append has discovered the true tip. The
+    /// authoritative position counter is still discovered lazily on the
+    /// first append.
+    pub(crate) fn with_claimed_epoch(
+        object_store: Arc<ObjectStore>,
+        base_path: Path,
+        shard_id: Uuid,
+        manifest_store: Arc<ShardManifestStore>,
+        writer_epoch: u64,
+        next_entry_position_hint_seed: u64,
+    ) -> Self {
+        Self {
             object_store,
             wal_dir: shard_wal_path(&base_path, &shard_id),
             manifest_store,
             shard_id,
             writer_epoch,
             next_entry_position: Mutex::new(None),
-        })
+            next_entry_position_hint: AtomicU64::new(next_entry_position_hint_seed),
+        }
     }
 
     /// Shard id.
@@ -762,6 +814,32 @@ impl WalAppender {
     /// Writer epoch recorded in the shard manifest.
     pub fn writer_epoch(&self) -> u64 {
         self.writer_epoch
+    }
+
+    /// Resolved path for a WAL entry at `position`.
+    pub(crate) fn wal_entry_path(&self, position: u64) -> Path {
+        self.wal_dir.clone().join(wal_entry_filename(position))
+    }
+
+    /// Cheap sync accessor for the next entry position the appender will
+    /// assign on its next `append`. Seeded from the shard manifest at
+    /// construction (so reopened shards report the post-recovery cursor
+    /// immediately) and updated after each successful append. Used for
+    /// stats observability; not authoritative — the actual next position
+    /// is discovered lazily by `append`.
+    pub(crate) fn next_entry_position_hint(&self) -> u64 {
+        self.next_entry_position_hint.load(Ordering::SeqCst)
+    }
+
+    /// Seed the appender's next-position counter from a known value
+    /// (e.g. one past the highest WAL entry observed during MemTable
+    /// replay on `ShardWriter::open`). Skips the first-append lazy
+    /// discovery probe.
+    pub(crate) async fn seed_next_position(&self, position: u64) {
+        let mut guard = self.next_entry_position.lock().await;
+        *guard = Some(position);
+        self.next_entry_position_hint
+            .store(position, Ordering::SeqCst);
     }
 
     /// Append batches as one durable WAL entry.
@@ -794,9 +872,11 @@ impl WalAppender {
             .await
             {
                 Ok(()) => {
-                    *next_pos = Some(pos.checked_add(1).ok_or_else(|| {
+                    let next = pos.checked_add(1).ok_or_else(|| {
                         Error::io(format!("WAL position overflow for shard {}", self.shard_id))
-                    })?);
+                    })?;
+                    *next_pos = Some(next);
+                    self.next_entry_position_hint.store(next, Ordering::SeqCst);
                     return Ok(WalAppendResult {
                         shard_id: self.shard_id,
                         entry_position: pos,
@@ -1235,12 +1315,42 @@ mod tests {
         .unwrap()
     }
 
+    fn build_test_flusher(
+        store: Arc<ObjectStore>,
+        base_path: &Path,
+        shard_id: Uuid,
+        writer_epoch: u64,
+    ) -> WalFlusher {
+        let manifest_store = Arc::new(ShardManifestStore::new(
+            store.clone(),
+            base_path,
+            shard_id,
+            2,
+        ));
+        let appender = Arc::new(WalAppender::with_claimed_epoch(
+            store,
+            base_path.clone(),
+            shard_id,
+            manifest_store,
+            writer_epoch,
+            // Tests start with no entries, so seed the hint at 0.
+            0,
+        ));
+        WalFlusher::new(appender)
+    }
+
+    fn batch_store_source(batch_store: &Arc<BatchStore>) -> WalFlushSource {
+        WalFlushSource::BatchStore {
+            batch_store: batch_store.clone(),
+            indexes: None,
+        }
+    }
+
     #[tokio::test]
     async fn test_wal_flusher_track_batch() {
         let (store, base_path, _temp_dir) = create_local_store().await;
         let shard_id = Uuid::new_v4();
-        let mut buffer = WalFlusher::new(&base_path, shard_id, 1, 1);
-        buffer.set_object_store(store);
+        let buffer = build_test_flusher(store, &base_path, shard_id, 1);
 
         // Track a batch
         let watcher = buffer.track_batch(0);
@@ -1256,11 +1366,10 @@ mod tests {
     async fn test_track_batch_watcher_blocks_until_flush() {
         let (store, base_path, _temp_dir) = create_local_store().await;
         let region_id = Uuid::new_v4();
-        let mut flusher = WalFlusher::new(&base_path, region_id, 1, 1);
-        flusher.set_object_store(store);
+        let flusher = build_test_flusher(store, &base_path, region_id, 1);
 
         let schema = create_test_schema();
-        let batch_store = BatchStore::with_capacity(10);
+        let batch_store = Arc::new(BatchStore::with_capacity(10));
         batch_store.append(create_test_batch(&schema, 10)).unwrap();
 
         let mut watcher = flusher.track_batch(0);
@@ -1274,10 +1383,8 @@ mod tests {
         );
 
         // Flush, then the watcher should resolve
-        flusher
-            .flush_to_with_index_update(&batch_store, batch_store.len(), None)
-            .await
-            .unwrap();
+        let source = batch_store_source(&batch_store);
+        flusher.flush(&source, batch_store.len()).await.unwrap();
         watcher.wait().await.unwrap();
         assert!(watcher.is_durable());
     }
@@ -1286,15 +1393,14 @@ mod tests {
     async fn test_wal_flusher_flush_to_with_index_update() {
         let (store, base_path, _temp_dir) = create_local_store().await;
         let shard_id = Uuid::new_v4();
-        let mut buffer = WalFlusher::new(&base_path, shard_id, 1, 1);
-        buffer.set_object_store(store);
+        let buffer = build_test_flusher(store, &base_path, shard_id, 1);
 
         // Create a BatchStore with some data
         let schema = create_test_schema();
         let batch1 = create_test_batch(&schema, 10);
         let batch2 = create_test_batch(&schema, 5);
 
-        let batch_store = BatchStore::with_capacity(10);
+        let batch_store = Arc::new(BatchStore::with_capacity(10));
         batch_store.append(batch1).unwrap();
         batch_store.append(batch2).unwrap();
 
@@ -1308,12 +1414,12 @@ mod tests {
         assert!(batch_store.max_flushed_batch_position().is_none());
 
         // Flush all pending batches
-        let result = buffer
-            .flush_to_with_index_update(&batch_store, batch_store.len(), None)
-            .await
-            .unwrap();
+        let source = batch_store_source(&batch_store);
+        let result = buffer.flush(&source, batch_store.len()).await.unwrap();
         let entry = result.entry.unwrap();
-        assert_eq!(entry.position, 1);
+        // First entry from a freshly-discovered position is 0 (atomic-create
+        // path discovers the tip via list and starts at FIRST_WAL_ENTRY_POSITION).
+        assert_eq!(entry.position, FIRST_WAL_ENTRY_POSITION);
         assert_eq!(entry.writer_epoch, 1);
         assert_eq!(entry.num_batches, 2);
         // After flushing 2 batches (positions 0 and 1), max flushed position is 1 (inclusive)
@@ -1330,22 +1436,19 @@ mod tests {
     async fn test_wal_entry_read() {
         let (store, base_path, _temp_dir) = create_local_store().await;
         let shard_id = Uuid::new_v4();
-        let mut buffer = WalFlusher::new(&base_path, shard_id, 42, 1);
-        buffer.set_object_store(store.clone());
+        let buffer = build_test_flusher(store.clone(), &base_path, shard_id, 42);
 
         // Create a BatchStore with some data
         let schema = create_test_schema();
-        let batch_store = BatchStore::with_capacity(10);
+        let batch_store = Arc::new(BatchStore::with_capacity(10));
         batch_store.append(create_test_batch(&schema, 10)).unwrap();
         batch_store.append(create_test_batch(&schema, 5)).unwrap();
 
         // Track batch IDs and flush all pending batches
         let _watcher1 = buffer.track_batch(0);
         let _watcher2 = buffer.track_batch(1);
-        let result = buffer
-            .flush_to_with_index_update(&batch_store, batch_store.len(), None)
-            .await
-            .unwrap();
+        let source = batch_store_source(&batch_store);
+        let result = buffer.flush(&source, batch_store.len()).await.unwrap();
         let entry = result.entry.unwrap();
 
         // Read back the WAL entry
@@ -1359,45 +1462,6 @@ mod tests {
         assert_eq!(wal_data.batches[1].num_rows(), 5);
     }
 
-    // ========================================================================
-    // Conditional PUT fencing tests
-    // ========================================================================
-
-    #[tokio::test]
-    async fn test_wal_flush_rejects_duplicate_position() {
-        let (store, base_path, _temp_dir) = create_local_store().await;
-        let shard_id = Uuid::new_v4();
-
-        // Writer A and B both start from WAL position 1 (simulating stale manifest)
-        let mut flusher_a = WalFlusher::new(&base_path, shard_id, 1, 1);
-        flusher_a.set_object_store(store.clone());
-
-        let mut flusher_b = WalFlusher::new(&base_path, shard_id, 2, 1);
-        flusher_b.set_object_store(store.clone());
-
-        let schema = create_test_schema();
-
-        // Writer A flushes first — succeeds (claims position 1)
-        let batch_store_a = BatchStore::with_capacity(10);
-        batch_store_a.append(create_test_batch(&schema, 5)).unwrap();
-        let result_a = flusher_a
-            .flush_to_with_index_update(&batch_store_a, batch_store_a.len(), None)
-            .await;
-        assert!(result_a.is_ok(), "First writer should succeed");
-
-        // Writer B tries same position — fails with fencing error
-        let batch_store_b = BatchStore::with_capacity(10);
-        batch_store_b.append(create_test_batch(&schema, 5)).unwrap();
-        let result_b = flusher_b
-            .flush_to_with_index_update(&batch_store_b, batch_store_b.len(), None)
-            .await;
-        assert!(result_b.is_err(), "Second writer should be fenced");
-        assert!(
-            result_b.unwrap_err().is_writer_fenced(),
-            "Error should indicate fencing"
-        );
-    }
-
     // Regression test: close_watermark() must unblock a BatchDurableWatcher that
     // is sleeping in `rx.changed().await`, and the error must be classified as
     // WriterFenced (not generic IO) so callers can branch on `is_writer_fenced`.
@@ -1407,9 +1471,7 @@ mod tests {
     async fn test_close_watermark_unblocks_waiter_with_writer_fenced() {
         let (store, base_path, _temp_dir) = create_local_store().await;
         let shard_id = Uuid::new_v4();
-        let mut flusher = WalFlusher::new(&base_path, shard_id, 1, 1);
-        flusher.set_object_store(store);
-        let flusher = Arc::new(flusher);
+        let flusher = Arc::new(build_test_flusher(store, &base_path, shard_id, 1));
 
         let mut watcher = flusher.track_batch(0);
 
@@ -1521,46 +1583,6 @@ mod tests {
             err.to_string().contains("Writer fenced"),
             "expected fence error from append, got: {err}"
         );
-    }
-
-    #[tokio::test]
-    async fn test_fence_barrier_skips_past_old_writer_entries() {
-        let (store, base_path, _temp_dir) = create_local_store().await;
-        let shard_id = Uuid::new_v4();
-        let schema = create_test_schema();
-
-        // Old writer A wrote WAL entries at positions 1, 2, 3
-        let mut flusher_a = WalFlusher::new(&base_path, shard_id, 1, 1);
-        flusher_a.set_object_store(store.clone());
-        for _ in 0..3 {
-            let batch_store = BatchStore::with_capacity(10);
-            batch_store.append(create_test_batch(&schema, 5)).unwrap();
-            flusher_a
-                .flush_to_with_index_update(&batch_store, batch_store.len(), None)
-                .await
-                .unwrap();
-        }
-        assert_eq!(flusher_a.next_wal_entry_position(), 4);
-
-        // New writer B starts from position 1 (stale manifest) and writes barrier.
-        // Should skip forward past A's entries to position 4.
-        let mut flusher_b = WalFlusher::new(&base_path, shard_id, 2, 1);
-        flusher_b.set_object_store(store.clone());
-        flusher_b.write_fence_barrier(&schema).await.unwrap();
-
-        // B should have skipped positions 1,2,3 and claimed 4, now at 5
-        assert_eq!(flusher_b.next_wal_entry_position(), 5);
-
-        // B can now write real data at position 5
-        let batch_store_b = BatchStore::with_capacity(10);
-        batch_store_b
-            .append(create_test_batch(&schema, 10))
-            .unwrap();
-        let result = flusher_b
-            .flush_to_with_index_update(&batch_store_b, batch_store_b.len(), None)
-            .await;
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().entry.unwrap().position, 5);
     }
 
     #[tokio::test]
