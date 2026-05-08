@@ -7694,21 +7694,17 @@ mod test {
         }
     }
 
-    #[rstest]
-    #[case::stable_row_ids(true)]
-    #[case::row_addrs_as_ids(false)]
-    #[tokio::test]
-    async fn can_filter_row_id(#[case] use_stable_row_ids: bool) {
-        // 5 fragments x 100 rows so logical row ids and row addresses diverge
-        // across fragment boundaries. With stable row ids the logical id space
-        // is sequential 0..500; without it, _rowid IS the (frag<<32)|offset
-        // packed row address.
+    // 5 fragments x 100 rows so logical row ids and row addresses diverge
+    // across fragment boundaries. With stable row ids the logical id space
+    // is sequential 0..500; without it, _rowid IS the (frag<<32)|offset
+    // packed row address.
+    async fn multi_fragment_dataset(use_stable_row_ids: bool) -> Dataset {
         let write_params = WriteParams {
             enable_stable_row_ids: use_stable_row_ids,
             max_rows_per_file: 100,
             ..Default::default()
         };
-        let dataset = lance_datagen::gen_batch()
+        lance_datagen::gen_batch()
             .col("x", array::step::<Int32Type>())
             .into_ram_dataset_with_params(
                 FragmentCount::from(5),
@@ -7716,16 +7712,25 @@ mod test {
                 Some(write_params),
             )
             .await
-            .unwrap();
+            .unwrap()
+    }
 
-        // Filter by _rowid against rows in three different fragments.
+    #[rstest]
+    #[case::stable_row_ids(true)]
+    #[case::row_addrs_as_ids(false)]
+    #[tokio::test]
+    async fn can_filter_by_row_id(#[case] use_stable_row_ids: bool) {
+        let dataset = multi_fragment_dataset(use_stable_row_ids).await;
+
+        // Pick rows in three different fragments. With stable row ids the
+        // logical id space is sequential; without it, _rowid is the packed
+        // row address.
         let row_id_values: Vec<u64> = if use_stable_row_ids {
             vec![50, 150, 250]
         } else {
-            // Without stable row ids, _rowid is the packed row address.
             vec![50, (1u64 << 32) | 50, (2u64 << 32) | 50]
         };
-        let row_id_filter = format!(
+        let filter = format!(
             "_rowid IN ({})",
             row_id_values
                 .iter()
@@ -7736,7 +7741,7 @@ mod test {
         let mut scan = dataset.scan();
         scan.with_row_id();
         scan.project::<&str>(&[]).unwrap();
-        scan.filter(&row_id_filter).unwrap();
+        scan.filter(&filter).unwrap();
         let batch = scan.try_into_batch().await.unwrap();
         assert_eq!(batch.num_rows(), row_id_values.len());
         let mut got = batch
@@ -7746,12 +7751,21 @@ mod test {
             .to_vec();
         got.sort();
         assert_eq!(got, row_id_values);
+    }
 
-        // Filter by _rowaddr against rows in three different fragments. With
-        // stable row ids enabled, the take path needs to translate addresses
-        // to stable ids before masking against the row id sequence.
+    #[rstest]
+    #[case::stable_row_ids(true)]
+    #[case::legacy_row_ids(false)]
+    #[tokio::test]
+    async fn can_filter_by_row_address(#[case] use_stable_row_ids: bool) {
+        let dataset = multi_fragment_dataset(use_stable_row_ids).await;
+
+        // Row addresses are always (frag<<32)|offset regardless of stable
+        // row id setting. With stable row ids enabled, the take path needs
+        // to translate these addresses to stable ids before masking against
+        // each fragment's row id sequence.
         let addr_values: Vec<u64> = vec![50, (1u64 << 32) | 50, (2u64 << 32) | 50];
-        let addr_filter = format!(
+        let filter = format!(
             "_rowaddr IN ({})",
             addr_values
                 .iter()
@@ -7762,7 +7776,7 @@ mod test {
         let mut scan = dataset.scan();
         scan.with_row_address();
         scan.project::<&str>(&[]).unwrap();
-        scan.filter(&addr_filter).unwrap();
+        scan.filter(&filter).unwrap();
         let batch = scan.try_into_batch().await.unwrap();
         assert_eq!(batch.num_rows(), addr_values.len());
         let mut got = batch
