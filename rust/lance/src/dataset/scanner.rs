@@ -82,6 +82,7 @@ use uuid::Uuid;
 
 use super::Dataset;
 use crate::dataset::row_offsets_to_row_addresses;
+use crate::dataset::rowids::load_row_id_sequence;
 use crate::dataset::utils::SchemaAdapter;
 use crate::index::DatasetIndexInternalExt;
 use crate::index::scalar::inverted::{load_segment_details, load_segments};
@@ -2813,6 +2814,41 @@ impl Scanner {
         }
     }
 
+    /// Translate a list of row addresses to their corresponding stable row
+    /// ids by looking up each (fragment, offset) in the fragment's row id
+    /// sequence.  Addresses that point to a missing fragment or out-of-range
+    /// offset are silently dropped (matching the IN-list semantics where
+    /// non-matching values simply don't contribute rows).
+    ///
+    /// Only meaningful when the dataset has stable row ids enabled.
+    async fn addresses_to_stable_row_ids(dataset: &Dataset, addresses: &[u64]) -> Result<Vec<u64>> {
+        // Group addresses by fragment so each row id sequence is loaded once.
+        let mut offsets_by_fragment: std::collections::HashMap<u32, Vec<u32>> =
+            std::collections::HashMap::new();
+        for &addr in addresses {
+            let row_addr = RowAddress::new_from_u64(addr);
+            offsets_by_fragment
+                .entry(row_addr.fragment_id())
+                .or_default()
+                .push(row_addr.row_offset());
+        }
+
+        let fragments = dataset.fragments();
+        let mut ids = Vec::with_capacity(addresses.len());
+        for (frag_id, offsets) in offsets_by_fragment {
+            let Some(fragment) = fragments.iter().find(|f| f.id == frag_id as u64) else {
+                continue;
+            };
+            let sequence = load_row_id_sequence(dataset, fragment).await?;
+            for offset in offsets {
+                if let Some(id) = sequence.get(offset as usize) {
+                    ids.push(id);
+                }
+            }
+        }
+        Ok(ids)
+    }
+
     fn u64s_as_take_input(&self, u64s: Vec<u64>) -> Result<Arc<dyn ExecutionPlan>> {
         let row_addrs = RowAddrTreeMap::from_iter(u64s);
         let row_addr_mask = RowAddrMask::from_allowed(row_addrs);
@@ -2834,12 +2870,30 @@ impl Scanner {
 
         let input = match take_op {
             TakeOperation::RowIds(ids) => self.u64s_as_take_input(ids),
-            TakeOperation::RowAddrs(addrs) => self.u64s_as_take_input(addrs),
+            TakeOperation::RowAddrs(addrs) => {
+                // The take input drives a mask intersection against each
+                // fragment's RowIdSequence.  When stable row ids are enabled
+                // that sequence stores logical ids (not addresses), so we
+                // must translate user-supplied addresses to their stable ids
+                // before masking.  Without stable row ids the sequence stores
+                // addresses, so no translation is needed.
+                let ids = if self.dataset.manifest.uses_stable_row_ids() {
+                    Self::addresses_to_stable_row_ids(self.dataset.as_ref(), &addrs).await?
+                } else {
+                    addrs
+                };
+                self.u64s_as_take_input(ids)
+            }
             TakeOperation::RowOffsets(offsets) => {
                 let mut addrs =
                     row_offsets_to_row_addresses(&self.dataset.get_fragments(), &offsets).await?;
                 addrs.retain(|addr| *addr != RowAddress::TOMBSTONE_ROW);
-                self.u64s_as_take_input(addrs)
+                let ids = if self.dataset.manifest.uses_stable_row_ids() {
+                    Self::addresses_to_stable_row_ids(self.dataset.as_ref(), &addrs).await?
+                } else {
+                    addrs
+                };
+                self.u64s_as_take_input(ids)
             }
         }?;
 
@@ -7640,21 +7694,84 @@ mod test {
         }
     }
 
+    #[rstest]
+    #[case::stable_row_ids(true)]
+    #[case::row_addrs_as_ids(false)]
     #[tokio::test]
-    async fn can_filter_row_id() {
+    async fn can_filter_row_id(#[case] use_stable_row_ids: bool) {
+        // 5 fragments x 100 rows so logical row ids and row addresses diverge
+        // across fragment boundaries. With stable row ids the logical id space
+        // is sequential 0..500; without it, _rowid IS the (frag<<32)|offset
+        // packed row address.
+        let write_params = WriteParams {
+            enable_stable_row_ids: use_stable_row_ids,
+            max_rows_per_file: 100,
+            ..Default::default()
+        };
         let dataset = lance_datagen::gen_batch()
             .col("x", array::step::<Int32Type>())
-            .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(1000))
+            .into_ram_dataset_with_params(
+                FragmentCount::from(5),
+                FragmentRowCount::from(100),
+                Some(write_params),
+            )
             .await
             .unwrap();
 
+        // Filter by _rowid against rows in three different fragments.
+        let row_id_values: Vec<u64> = if use_stable_row_ids {
+            vec![50, 150, 250]
+        } else {
+            // Without stable row ids, _rowid is the packed row address.
+            vec![50, (1u64 << 32) | 50, (2u64 << 32) | 50]
+        };
+        let row_id_filter = format!(
+            "_rowid IN ({})",
+            row_id_values
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
         let mut scan = dataset.scan();
         scan.with_row_id();
         scan.project::<&str>(&[]).unwrap();
-        scan.filter("_rowid == 50").unwrap();
+        scan.filter(&row_id_filter).unwrap();
         let batch = scan.try_into_batch().await.unwrap();
-        assert_eq!(batch.num_rows(), 1);
-        assert_eq!(batch.column(0).as_primitive::<UInt64Type>().values()[0], 50);
+        assert_eq!(batch.num_rows(), row_id_values.len());
+        let mut got = batch
+            .column(0)
+            .as_primitive::<UInt64Type>()
+            .values()
+            .to_vec();
+        got.sort();
+        assert_eq!(got, row_id_values);
+
+        // Filter by _rowaddr against rows in three different fragments. With
+        // stable row ids enabled, the take path needs to translate addresses
+        // to stable ids before masking against the row id sequence.
+        let addr_values: Vec<u64> = vec![50, (1u64 << 32) | 50, (2u64 << 32) | 50];
+        let addr_filter = format!(
+            "_rowaddr IN ({})",
+            addr_values
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let mut scan = dataset.scan();
+        scan.with_row_address();
+        scan.project::<&str>(&[]).unwrap();
+        scan.filter(&addr_filter).unwrap();
+        let batch = scan.try_into_batch().await.unwrap();
+        assert_eq!(batch.num_rows(), addr_values.len());
+        let mut got = batch
+            .column(0)
+            .as_primitive::<UInt64Type>()
+            .values()
+            .to_vec();
+        got.sort();
+        assert_eq!(got, addr_values);
     }
 
     #[rstest]
