@@ -109,10 +109,10 @@ impl RowIdIndex {
             if id < *range.start() {
                 continue; // falls in a gap between chunks
             }
-            if let Some(pos) = row_id_seg.position(id) {
-                if let Some(addr) = addr_seg.get(pos) {
-                    out[orig_idx] = Some(RowAddress::from(addr));
-                }
+            if let Some(pos) = row_id_seg.position(id)
+                && let Some(addr) = addr_seg.get(pos)
+            {
+                out[orig_idx] = Some(RowAddress::from(addr));
             }
         }
         out
