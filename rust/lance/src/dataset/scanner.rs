@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use datafusion::config::ConfigOptions;
 use std::ops::Range;
@@ -41,7 +41,6 @@ use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::{LexOrdering, Partitioning, PhysicalExpr, create_physical_expr};
 use datafusion_physical_plan::joins::PartitionMode;
 use datafusion_physical_plan::projection::ProjectionExec;
-use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_physical_plan::{empty::EmptyExec, joins::HashJoinExec};
 use futures::future::BoxFuture;
 use futures::stream::{Stream, StreamExt};
@@ -53,20 +52,20 @@ use lance_core::datatypes::{
 };
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::address::RowAddress;
-use lance_core::utils::mask::{RowAddrMask, RowAddrTreeMap};
+use lance_core::utils::mask::RowAddrTreeMap;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR, ROW_ID, ROW_OFFSET};
 use lance_datafusion::aggregate::Aggregate;
 use lance_datafusion::exec::{
-    LanceExecutionOptions, OneShotExec, StrictBatchSizeExec, analyze_plan, execute_plan,
+    LanceExecutionOptions, StrictBatchSizeExec, analyze_plan, execute_plan,
 };
 use lance_datafusion::expr::safe_coerce_scalar;
 use lance_datafusion::projection::ProjectionPlan;
 use lance_file::reader::FileReaderOptions;
 use lance_index::IndexCriteria;
 use lance_index::scalar::FullTextSearchQuery;
+use lance_index::scalar::expression::PlannerIndexExt;
 use lance_index::scalar::expression::ScalarIndexExpr;
-use lance_index::scalar::expression::{INDEX_EXPR_RESULT_SCHEMA, IndexExprResult, PlannerIndexExt};
 use lance_index::scalar::inverted::query::{
     FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery, PhraseQuery, fill_fts_query_column,
 };
@@ -82,7 +81,7 @@ use uuid::Uuid;
 
 use super::Dataset;
 use crate::dataset::row_offsets_to_row_addresses;
-use crate::dataset::rowids::load_row_id_sequence;
+use crate::dataset::rowids::get_row_id_index;
 use crate::dataset::utils::SchemaAdapter;
 use crate::index::DatasetIndexInternalExt;
 use crate::index::scalar::inverted::{load_segment_details, load_segments};
@@ -90,7 +89,7 @@ use crate::index::scalar_logical::scalar_index_fragment_bitmap;
 use crate::index::vector::utils::{
     default_distance_type_for, get_vector_dim, get_vector_type, validate_distance_type_for,
 };
-use crate::io::exec::filtered_read::{FilteredReadExec, FilteredReadOptions};
+use crate::io::exec::filtered_read::{FilteredReadExec, FilteredReadOptions, FilteredReadPlan};
 use crate::io::exec::fts::{
     BoostQueryExec, FlatMatchFilterExec, FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec,
 };
@@ -2814,100 +2813,91 @@ impl Scanner {
         }
     }
 
-    /// Translate a list of row addresses to their corresponding stable row
-    /// ids by looking up each (fragment, offset) in the fragment's row id
-    /// sequence.  Addresses that point to a missing fragment or out-of-range
-    /// offset are silently dropped (matching the IN-list semantics where
-    /// non-matching values simply don't contribute rows).
-    ///
-    /// Only meaningful when the dataset has stable row ids enabled.
-    async fn addresses_to_stable_row_ids(dataset: &Dataset, addresses: &[u64]) -> Result<Vec<u64>> {
-        // Group addresses by fragment so each row id sequence is loaded once.
-        let mut offsets_by_fragment: std::collections::HashMap<u32, Vec<u32>> =
-            std::collections::HashMap::new();
-        for &addr in addresses {
-            let row_addr = RowAddress::new_from_u64(addr);
-            offsets_by_fragment
-                .entry(row_addr.fragment_id())
-                .or_default()
-                .push(row_addr.row_offset());
-        }
-
-        let fragments = dataset.fragments();
-        let mut ids = Vec::with_capacity(addresses.len());
-        for (frag_id, offsets) in offsets_by_fragment {
-            let Some(fragment) = fragments.iter().find(|f| f.id == frag_id as u64) else {
-                continue;
-            };
-            let sequence = load_row_id_sequence(dataset, fragment).await?;
-            for offset in offsets {
-                if let Some(id) = sequence.get(offset as usize) {
-                    ids.push(id);
+    /// Resolve a [`TakeOperation`] to row addresses.  Inputs that don't
+    /// resolve to a live row (missing id, tombstone offset) are dropped to
+    /// match `IN`-list semantics.
+    async fn take_op_to_addresses(&self, take_op: TakeOperation) -> Result<Vec<u64>> {
+        match take_op {
+            TakeOperation::RowIds(ids) => {
+                if !self.dataset.manifest.uses_stable_row_ids() {
+                    return Ok(ids);
                 }
-            }
-        }
-        Ok(ids)
-    }
-
-    fn u64s_as_take_input(&self, u64s: Vec<u64>) -> Result<Arc<dyn ExecutionPlan>> {
-        let row_addrs = RowAddrTreeMap::from_iter(u64s);
-        let row_addr_mask = RowAddrMask::from_allowed(row_addrs);
-        let index_result = IndexExprResult::Exact(row_addr_mask);
-        let fragments_covered = self.dataset.fragment_bitmap.as_ref().clone();
-        let batch = index_result.serialize_to_arrow(&fragments_covered)?;
-        let stream = futures::stream::once(async move { Ok(batch) });
-        let stream = Box::pin(RecordBatchStreamAdapter::new(
-            INDEX_EXPR_RESULT_SCHEMA.clone(),
-            stream,
-        ));
-        Ok(Arc::new(OneShotExec::new(stream)))
-    }
-
-    async fn take_source(&self, take_op: TakeOperation) -> Result<Arc<dyn ExecutionPlan>> {
-        // We generally assume that late materialization does not make sense for take operations
-        // so we can just use the physical projection
-        let projection = self.projection_plan.physical_projection.clone();
-
-        let input = match take_op {
-            TakeOperation::RowIds(ids) => self.u64s_as_take_input(ids),
-            TakeOperation::RowAddrs(addrs) => {
-                // The take input drives a mask intersection against each
-                // fragment's RowIdSequence.  When stable row ids are enabled
-                // that sequence stores logical ids (not addresses), so we
-                // must translate user-supplied addresses to their stable ids
-                // before masking.  Without stable row ids the sequence stores
-                // addresses, so no translation is needed.
-                let ids = if self.dataset.manifest.uses_stable_row_ids() {
-                    Self::addresses_to_stable_row_ids(self.dataset.as_ref(), &addrs).await?
-                } else {
-                    addrs
+                let Some(index) = get_row_id_index(self.dataset.as_ref()).await? else {
+                    return Err(Error::internal(
+                        "stable row ids enabled but RowIdIndex is missing".to_string(),
+                    ));
                 };
-                self.u64s_as_take_input(ids)
+                Ok(ids
+                    .into_iter()
+                    .filter_map(|id| index.get(id).map(u64::from))
+                    .collect())
             }
+            TakeOperation::RowAddrs(addrs) => Ok(addrs),
             TakeOperation::RowOffsets(offsets) => {
                 let mut addrs =
                     row_offsets_to_row_addresses(&self.dataset.get_fragments(), &offsets).await?;
                 addrs.retain(|addr| *addr != RowAddress::TOMBSTONE_ROW);
-                let ids = if self.dataset.manifest.uses_stable_row_ids() {
-                    Self::addresses_to_stable_row_ids(self.dataset.as_ref(), &addrs).await?
-                } else {
-                    addrs
-                };
-                self.u64s_as_take_input(ids)
+                Ok(addrs)
             }
-        }?;
+        }
+    }
 
-        let mut filtered_read_options = FilteredReadOptions::new(projection);
-        if let Some(fragment) = self.fragments.as_ref() {
-            filtered_read_options =
-                filtered_read_options.with_fragments(Arc::new(fragment.clone()));
+    async fn take_source(&self, take_op: TakeOperation) -> Result<Arc<dyn ExecutionPlan>> {
+        // Late materialization is not useful for take, so use the physical projection.
+        let projection = self.projection_plan.physical_projection.clone();
+
+        let addrs = self.take_op_to_addresses(take_op).await?;
+
+        // Drop addresses pointing to non-existent fragments or to offsets
+        // past a fragment's physical row count, matching `IN`-list
+        // semantics where non-matching inputs simply contribute no rows.
+        let fragment_physical_rows: HashMap<u32, Option<u64>> = self
+            .dataset
+            .fragments()
+            .iter()
+            .map(|f| (f.id as u32, f.physical_rows.map(|n| n as u64)))
+            .collect();
+        let mut rows = RowAddrTreeMap::new();
+        for addr in addrs {
+            let row_addr = RowAddress::new_from_u64(addr);
+            let Some(physical_rows) = fragment_physical_rows.get(&row_addr.fragment_id()) else {
+                continue;
+            };
+            if let Some(physical_rows) = physical_rows
+                && (row_addr.row_offset() as u64) >= *physical_rows
+            {
+                continue;
+            }
+            rows.insert(addr);
         }
 
-        Ok(Arc::new(FilteredReadExec::try_new(
-            self.dataset.clone(),
-            filtered_read_options,
-            Some(input),
-        )?))
+        // Restrict the scan to fragments with selected rows so we skip
+        // loading row id sequences and deletion vectors for unrelated ones.
+        let candidate_fragments: Vec<Fragment> = if let Some(fragments) = self.fragments.as_ref() {
+            fragments.clone()
+        } else {
+            self.dataset.fragments().as_ref().clone()
+        };
+        let touched: HashSet<u32> = rows.iter().map(|(id, _)| *id).collect();
+        let scoped_fragments: Vec<Fragment> = candidate_fragments
+            .into_iter()
+            .filter(|f| touched.contains(&(f.id as u32)))
+            .collect();
+
+        let filtered_read_options =
+            FilteredReadOptions::new(projection).with_fragments(Arc::new(scoped_fragments));
+
+        let plan = FilteredReadPlan {
+            rows,
+            filters: HashMap::new(),
+            scan_range_after_filter: None,
+        };
+
+        let exec = FilteredReadExec::try_new(self.dataset.clone(), filtered_read_options, None)?
+            .with_plan(plan)
+            .await?;
+
+        Ok(Arc::new(exec))
     }
 
     async fn filtered_read_source(
@@ -7760,10 +7750,8 @@ mod test {
     async fn can_filter_by_row_address(#[case] use_stable_row_ids: bool) {
         let dataset = multi_fragment_dataset(use_stable_row_ids).await;
 
-        // Row addresses are always (frag<<32)|offset regardless of stable
-        // row id setting. With stable row ids enabled, the take path needs
-        // to translate these addresses to stable ids before masking against
-        // each fragment's row id sequence.
+        // Row addresses are (frag<<32)|offset regardless of the stable row
+        // id setting; pick rows from three different fragments.
         let addr_values: Vec<u64> = vec![50, (1u64 << 32) | 50, (2u64 << 32) | 50];
         let filter = format!(
             "_rowaddr IN ({})",
@@ -7786,6 +7774,40 @@ mod test {
             .to_vec();
         got.sort();
         assert_eq!(got, addr_values);
+    }
+
+    #[rstest]
+    #[case::stable_row_ids(true)]
+    #[case::legacy_row_ids(false)]
+    #[tokio::test]
+    async fn can_filter_by_row_offset(#[case] use_stable_row_ids: bool) {
+        let dataset = multi_fragment_dataset(use_stable_row_ids).await;
+
+        // 5 fragments of 100 rows each, so dataset offsets 50/150/250 land
+        // in fragments 0/1/2 at local offset 50.
+        let offset_values: Vec<u64> = vec![50, 150, 250];
+        let expected_addrs: Vec<u64> = vec![50, (1u64 << 32) | 50, (2u64 << 32) | 50];
+        let filter = format!(
+            "_rowoffset IN ({})",
+            offset_values
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let mut scan = dataset.scan();
+        scan.with_row_address();
+        scan.project::<&str>(&[]).unwrap();
+        scan.filter(&filter).unwrap();
+        let batch = scan.try_into_batch().await.unwrap();
+        assert_eq!(batch.num_rows(), offset_values.len());
+        let mut got = batch
+            .column(0)
+            .as_primitive::<UInt64Type>()
+            .values()
+            .to_vec();
+        got.sort();
+        assert_eq!(got, expected_addrs);
     }
 
     #[rstest]
@@ -10383,21 +10405,22 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         let do_check = async move |filt: &str, expected_idx: &[i32], applies_optimization: bool| {
             let mut scanner = ds_copy.scan();
             scanner.filter(filt).unwrap();
-            // Verify the optimization is applied
+            // The take fast path resolves the row addresses up front and
+            // pushes them into FilteredReadExec as a precomputed plan, so
+            // neither full_filter nor refine_filter is set on the read.
             let plan = scanner.explain_plan(true).await.unwrap();
+            let take_signal = plan.contains("full_filter=--") && plan.contains("refine_filter=--");
             if applies_optimization {
                 assert!(
-                    plan.contains("OneShotStream"),
+                    take_signal,
                     "expected take optimization to be applied. Filter: '{}'.  Plan:\n{}",
-                    filt,
-                    plan
+                    filt, plan
                 );
             } else {
                 assert!(
-                    !plan.contains("OneShotStream"),
+                    !take_signal,
                     "expected take optimization to not be applied. Filter: '{}'.  Plan:\n{}",
-                    filt,
-                    plan
+                    filt, plan
                 );
             }
 

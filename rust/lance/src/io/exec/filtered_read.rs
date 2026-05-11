@@ -2009,16 +2009,21 @@ impl ExecutionPlan for FilteredReadExec {
             ))
         } else {
             let index_input = children.into_iter().next();
+            // Preserve any precomputed plan: a plan set via `with_plan` is
+            // independent of children, and DataFusion calls
+            // `with_new_children` during plan optimization which would
+            // otherwise discard it.  Cloning the Arc shares the same
+            // OnceCell, so a plan derived from children (and set lazily on
+            // first execute) is also preserved across identical-children
+            // rewrites.
             Ok(Arc::new(Self {
                 dataset: self.dataset.clone(),
                 options: self.options.clone(),
                 properties: self.properties.clone(),
                 metrics: self.metrics.clone(),
-                // Seems unlikely this would already be initialized but clear it
-                // out just in case
                 running_stream: Arc::new(AsyncMutex::new(None)),
                 index_input,
-                plan: Arc::new(OnceCell::new()),
+                plan: self.plan.clone(),
             }))
         }
     }
