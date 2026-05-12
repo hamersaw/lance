@@ -246,7 +246,7 @@ impl RetryExecutor for DeleteJob {
                     } else {
                         None
                     };
-                    let removed_row_addrs = removed_row_ids.row_addrs(row_id_index.as_ref());
+                    let removed_row_addrs = removed_row_ids.row_addrs(row_id_index.as_deref());
 
                     let (fragments, deleted_ids) =
                         apply_deletions(&self.dataset, &removed_row_addrs).await?;

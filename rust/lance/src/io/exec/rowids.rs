@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use arrow_array::{Array, ArrayRef, RecordBatch, UInt64Array, cast::AsArray, types::UInt64Type};
 use arrow_schema::{Schema, SchemaRef};
@@ -26,7 +26,8 @@ use lance_core::{
 use lance_table::rowids::RowIdIndex;
 
 use crate::Dataset;
-use crate::dataset::rowids::build_row_id_index_for;
+use crate::dataset::rowids::get_full_row_id_index;
+use crate::utils::future::SharedPrerequisite;
 
 use super::utils::InstrumentedRecordBatchStreamAdapter;
 
@@ -35,14 +36,16 @@ use super::utils::InstrumentedRecordBatchStreamAdapter;
 /// It's generally more efficient to scan the `_rowaddr` column, but this can be
 /// useful when reading secondary indices, which only have the `_rowid` column.
 ///
-/// The rowid → rowaddr index is built lazily per batch over only the
-/// fragments that could own the batch's row ids, leveraging
-/// [`build_row_id_index_for`]. The underlying per-fragment caches mean
-/// repeated batches that touch the same fragments don't pay redundant I/O.
+/// The rowid → rowaddr index is materialized once per execution via
+/// [`SharedPrerequisite`] and reused across every batch. The first call to
+/// `execute` kicks off the build; subsequent batches await the same handle.
 #[derive(Clone)]
 pub struct AddRowAddrExec {
     input: Arc<dyn ExecutionPlan>,
     dataset: Arc<Dataset>,
+    /// Lazily-initialized handle to the full row id index. Shared across
+    /// all batches in this exec so we never rebuild per batch.
+    row_id_index: OnceLock<Arc<SharedPrerequisite<Option<Arc<RowIdIndex>>>>>,
     /// Position in the input schema where the rowids are located
     rowid_pos: usize,
     /// Position in the output schema where to insert the row address
@@ -116,6 +119,7 @@ impl AddRowAddrExec {
         Ok(Self {
             input,
             dataset,
+            row_id_index: OnceLock::new(),
             rowid_pos,
             rowaddr_pos,
             output_schema,
@@ -175,30 +179,32 @@ impl AddRowAddrExec {
         partition: usize,
         context: Arc<datafusion::execution::context::TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        // Kick off (or join) the once-per-execution row id index build.
+        // SharedPrerequisite ensures all batches share one Arc<RowIdIndex>.
+        let index_prereq = self
+            .row_id_index
+            .get_or_init(|| {
+                let dataset = self.dataset.clone();
+                let fut = async move { get_full_row_id_index(dataset.as_ref()).await };
+                SharedPrerequisite::spawn(fut)
+            })
+            .clone();
+
         let input_stream = self.input.execute(partition, context)?;
 
-        let dataset = self.dataset.clone();
         let rowid_pos = self.rowid_pos;
         let rowaddr_pos = self.rowaddr_pos;
         let output_schema = self.output_schema.clone();
         let stream = input_stream.then(move |batch| {
-            let dataset = dataset.clone();
             let output_schema = output_schema.clone();
+            let index_prereq = index_prereq.clone();
             async move {
                 let batch = batch?;
-                let row_ids = batch.column(rowid_pos);
-                let row_id_values = row_ids.as_primitive_opt::<UInt64Type>().ok_or_else(|| {
-                    DataFusionError::Internal(
-                        "AddRowAddrExec: rowid column is not a UInt64Array".into(),
-                    )
-                })?;
-                // Build a small index over only the fragments that could
-                // contain this batch's row ids.
-                let row_id_index = build_row_id_index_for(dataset.as_ref(), row_id_values.values())
-                    .await
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                index_prereq.wait_ready().await?;
+                let row_id_index = index_prereq.get_ready();
 
-                let row_addr = Self::compute_row_addrs(row_ids, row_id_index.as_ref())?;
+                let row_ids = batch.column(rowid_pos);
+                let row_addr = Self::compute_row_addrs(row_ids, row_id_index.as_deref())?;
 
                 let mut columns = Vec::with_capacity(batch.num_columns() + 1);
                 let existing_columns = batch.columns();

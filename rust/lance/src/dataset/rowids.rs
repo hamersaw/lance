@@ -2,14 +2,15 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::Dataset;
-use crate::session::caches::RowIdSequenceKey;
+use crate::session::caches::{RowIdIndexKey, RowIdSequenceKey};
 use crate::{Error, Result};
 use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::utils::deletion::DeletionVector;
 use lance_table::{
-    format::{Fragment, RowIdMeta},
+    format::{Fragment, RowIdHint, RowIdMeta},
     rowids::{FragmentRowIdIndex, RowIdIndex, RowIdSequence, read_row_ids},
 };
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 /// Load a row id sequence from the given dataset and fragment.
@@ -73,29 +74,88 @@ pub fn load_row_id_sequences<'a>(
 /// Build a full `RowIdIndex` covering every fragment in the dataset.
 ///
 /// Used in tests that need to assert against the entire mapping; production
-/// code should use [`build_row_id_index_for`] which only loads fragments
-/// that could own the requested row ids.
+/// code should use [`build_row_id_index_for`] (when row ids are known) or
+/// [`get_full_row_id_index`] (for streaming execs).
 #[cfg(test)]
 pub async fn get_row_id_index(
     dataset: &Dataset,
 ) -> Result<Option<Arc<lance_table::rowids::RowIdIndex>>> {
-    if dataset.manifest.uses_stable_row_ids() {
-        let index = load_row_id_index_for_fragments(dataset, &dataset.manifest.fragments).await?;
-        Ok(Some(Arc::new(index)))
-    } else {
-        Ok(None)
-    }
+    get_full_row_id_index(dataset).await
 }
 
-/// Build a `RowIdIndex` over only the supplied fragments. Used by the lazy
-/// translator path so a single-fragment take doesn't pay O(num_fragments)
-/// IOPs.
-async fn load_row_id_index_for_fragments(
+/// Build (or fetch from cache) a `RowIdIndex` covering every fragment in
+/// the dataset. Suitable for streaming execs like `AddRowAddrExec` that
+/// need to translate arbitrary row ids and would otherwise rebuild the
+/// index per batch.
+pub async fn get_full_row_id_index(dataset: &Dataset) -> Result<Option<Arc<RowIdIndex>>> {
+    if !dataset.manifest.uses_stable_row_ids() {
+        return Ok(None);
+    }
+    let fragments = &dataset.manifest.fragments;
+    let fragment_ids: Vec<u32> = fragments.iter().map(|f| f.id as u32).collect();
+    let index = get_or_build_index_for_ids(dataset, fragments, fragment_ids).await?;
+    Ok(Some(index))
+}
+
+/// Hash of a sorted-unique set of fragment ids. Used as part of the cache
+/// key so two callers requesting the same fragment set share one entry.
+fn hash_fragment_ids(sorted_ids: &[u32]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    sorted_ids.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Build a `RowIdIndex` over the supplied fragments, going through the
+/// session cache. The caller is responsible for passing the exact fragment
+/// set to include — the cache key is derived from it.
+async fn get_or_build_index_for_ids(
     dataset: &Dataset,
-    fragments: &[Fragment],
-) -> Result<lance_table::rowids::RowIdIndex> {
-    let sequences = load_row_id_sequences(dataset, fragments)
-        .try_collect::<Vec<_>>()
+    all_fragments: &[Fragment],
+    mut fragment_ids: Vec<u32>,
+) -> Result<Arc<RowIdIndex>> {
+    fragment_ids.sort_unstable();
+    fragment_ids.dedup();
+    let key = RowIdIndexKey {
+        version: dataset.manifest.version,
+        fragment_set_hash: hash_fragment_ids(&fragment_ids),
+    };
+
+    // Resolve fragment refs once so we can hand them to the build closure
+    // without re-scanning the manifest on cache hit.
+    let candidate_refs: Vec<&Fragment> = {
+        let id_set: std::collections::HashSet<u32> = fragment_ids.iter().copied().collect();
+        all_fragments
+            .iter()
+            .filter(|f| id_set.contains(&(f.id as u32)))
+            .collect()
+    };
+
+    dataset
+        .metadata_cache
+        .get_or_insert_with_key(key, || load_row_id_index_for_refs(dataset, candidate_refs))
+        .await
+}
+
+/// Assemble a `RowIdIndex` from the given fragment references. Loads each
+/// fragment's row id sequence (cached per-fragment) and deletion vector.
+async fn load_row_id_index_for_refs<'a>(
+    dataset: &'a Dataset,
+    fragments: Vec<&'a Fragment>,
+) -> Result<RowIdIndex> {
+    // Materialize per-fragment futures eagerly so the stream's closure
+    // doesn't need to be HRTB-general — each future captures concrete
+    // references tied to 'a.
+    let sequence_futs: Vec<_> = fragments
+        .iter()
+        .map(|&fragment| {
+            let fragment_id = fragment.id as u32;
+            let fut = load_row_id_sequence(dataset, fragment);
+            async move { fut.await.map(|seq| (fragment_id, seq)) }
+        })
+        .collect();
+    let sequences: Vec<(u32, Arc<RowIdSequence>)> = futures::stream::iter(sequence_futs)
+        .buffer_unordered(dataset.object_store.io_parallelism())
+        .try_collect()
         .await?;
 
     let all_fragments = dataset.get_fragments();
@@ -130,42 +190,61 @@ async fn load_row_id_index_for_fragments(
         .try_collect()
         .await?;
 
-    let index = RowIdIndex::new(&fragment_indices)?;
-
-    Ok(index)
+    RowIdIndex::new(&fragment_indices)
 }
 
-/// Select fragments that could own at least one of the requested row ids
-/// based on each fragment's `row_id_hint`. Fragments without a hint are
-/// always included (legacy data, or fragments written before the hint
-/// existed).
-fn select_candidate_fragments(fragments: &[Fragment], row_ids: &[u64]) -> Vec<Fragment> {
+/// Threshold above which we sort the row id slice and binary-search per
+/// fragment hint, instead of doing a linear scan per fragment. Small lookup
+/// batches (the common take-by-rowid case) skip the up-front sort cost.
+const HINT_SORT_THRESHOLD: usize = 32;
+
+/// Return the ids of fragments that could own at least one of the requested
+/// row ids. Fragments without a hint are always included (legacy data).
+fn select_candidate_fragment_ids(fragments: &[Fragment], row_ids: &[u64]) -> Vec<u32> {
+    let sorted_ids: Option<Vec<u64>> = if row_ids.len() > HINT_SORT_THRESHOLD {
+        let mut v = row_ids.to_vec();
+        v.sort_unstable();
+        Some(v)
+    } else {
+        None
+    };
+
     fragments
         .iter()
-        .filter(|frag| match &frag.row_id_hint {
-            None => true,
-            Some(hint) => row_ids.iter().any(|&id| hint.could_contain(id)),
+        .filter_map(|frag| {
+            let include = match &frag.row_id_hint {
+                None => true,
+                Some(RowIdHint::MinMax { min, max }) => match &sorted_ids {
+                    Some(sorted) => {
+                        let pos = sorted.partition_point(|id| id < min);
+                        sorted.get(pos).is_some_and(|id| id <= max)
+                    }
+                    None => row_ids.iter().any(|id| min <= id && id <= max),
+                },
+            };
+            include.then_some(frag.id as u32)
         })
-        .cloned()
         .collect()
 }
 
 /// Build a `RowIdIndex` covering only the fragments that could own the
-/// requested row ids. Falls back to the full index for non-stable-rowid
-/// datasets.
+/// requested row ids. Falls back to `None` for non-stable-rowid datasets.
 ///
-/// This is the lazy-loading entry point: a take that touches one fragment
-/// only pays I/O for that fragment's row id sequence and deletion vector,
-/// instead of every fragment's.
+/// Lazy-loading entry point: a take that touches one fragment only pays
+/// I/O for that fragment's row id sequence and deletion vector. The result
+/// is memoized via the session cache, keyed by (manifest version, sorted
+/// candidate fragment id set), so repeated queries against the same set
+/// reuse the assembled index.
 pub async fn build_row_id_index_for(
     dataset: &Dataset,
     row_ids: &[u64],
-) -> Result<Option<RowIdIndex>> {
+) -> Result<Option<Arc<RowIdIndex>>> {
     if !dataset.manifest.uses_stable_row_ids() {
         return Ok(None);
     }
-    let candidates = select_candidate_fragments(&dataset.manifest.fragments, row_ids);
-    let index = load_row_id_index_for_fragments(dataset, &candidates).await?;
+    let candidate_ids = select_candidate_fragment_ids(&dataset.manifest.fragments, row_ids);
+    let index =
+        get_or_build_index_for_ids(dataset, &dataset.manifest.fragments, candidate_ids).await?;
     Ok(Some(index))
 }
 

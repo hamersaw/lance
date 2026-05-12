@@ -19,7 +19,7 @@ use lance_core::{
 };
 use lance_table::{
     format::{DeletionFile, Manifest},
-    rowids::RowIdSequence,
+    rowids::{RowIdIndex, RowIdSequence},
 };
 use object_store::path::Path;
 
@@ -145,6 +145,29 @@ impl CacheKey for RowIdSequenceKey {
     }
     fn type_name() -> &'static str {
         "RowIdSequence"
+    }
+}
+
+/// Cache key for an assembled `RowIdIndex`. Keyed by manifest version plus a
+/// hash over the sorted set of fragment ids covered by the index, so the
+/// lazy `build_row_id_index_for` path partitions the cache instead of
+/// skipping it. Full-coverage builds collapse to a single entry per version.
+#[derive(Debug)]
+pub struct RowIdIndexKey {
+    pub version: u64,
+    pub fragment_set_hash: u64,
+}
+
+impl CacheKey for RowIdIndexKey {
+    type ValueType = RowIdIndex;
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Owned(format!(
+            "row_id_index/{}/{:016x}",
+            self.version, self.fragment_set_hash
+        ))
+    }
+    fn type_name() -> &'static str {
+        "RowIdIndex"
     }
 }
 

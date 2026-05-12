@@ -339,7 +339,7 @@ impl UpdateJob {
         } else {
             None
         };
-        let row_addrs = removed_row_ids.row_addrs(row_id_index.as_ref());
+        let row_addrs = removed_row_ids.row_addrs(row_id_index.as_deref());
         let (old_fragments, removed_fragment_ids) = self.apply_deletions(&row_addrs).await?;
         let affected_rows = RowAddrTreeMap::from(row_addrs.as_ref().clone());
 
