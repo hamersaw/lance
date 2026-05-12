@@ -57,7 +57,7 @@ use object_store::ObjectStoreExt;
 use object_store::path::Path;
 use prost::Message;
 use roaring::RoaringBitmap;
-use rowids::get_row_id_index;
+use rowids::build_row_id_index_for;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -2343,7 +2343,7 @@ impl Dataset {
     }
 
     pub(crate) async fn filter_deleted_ids(&self, ids: &[u64]) -> Result<Vec<u64>> {
-        let addresses = if let Some(row_id_index) = get_row_id_index(self).await? {
+        let addresses = if let Some(row_id_index) = build_row_id_index_for(self, ids).await? {
             let addresses = ids
                 .iter()
                 .filter_map(|id| row_id_index.get(*id).map(|address| address.into()))

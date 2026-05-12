@@ -19,7 +19,7 @@ use lance_core::{
 };
 use lance_table::{
     format::{DeletionFile, Manifest},
-    rowids::{RowIdIndex, RowIdSequence},
+    rowids::RowIdSequence,
 };
 use object_store::path::Path;
 
@@ -130,21 +130,6 @@ impl CacheKey for RowAddrMaskKey {
     }
     fn type_name() -> &'static str {
         "RowAddrMask"
-    }
-}
-
-#[derive(Debug)]
-pub struct RowIdIndexKey {
-    pub version: u64,
-}
-
-impl CacheKey for RowIdIndexKey {
-    type ValueType = RowIdIndex;
-    fn key(&self) -> Cow<'_, str> {
-        Cow::Owned(format!("row_id_index/{}", self.version))
-    }
-    fn type_name() -> &'static str {
-        "RowIdIndex"
     }
 }
 

@@ -34,7 +34,7 @@ use tracing::error;
 
 use crate::dataset::Dataset;
 use crate::dataset::fragment::{FragReadConfig, FragmentReader};
-use crate::dataset::rowids::get_row_id_index;
+use crate::dataset::rowids::build_row_id_index_for;
 use crate::datatypes::Schema;
 
 use super::utils::IoMetrics;
@@ -171,13 +171,15 @@ impl TakeStream {
             Ok((row_addr_array.clone(), None))
         } else {
             let row_id_array = batch.column_by_name(ROW_ID).expect_ok()?;
+            let row_id_array_typed = row_id_array.as_primitive::<UInt64Type>();
+            let row_ids_slice = row_id_array_typed.values();
 
-            if let Some(row_id_index) = get_row_id_index(&self.dataset).await? {
-                let row_id_array = row_id_array.as_primitive::<UInt64Type>();
-                let mut addresses = Vec::with_capacity(row_id_array.len());
-                let mut valid = Vec::with_capacity(row_id_array.len());
+            if let Some(row_id_index) = build_row_id_index_for(&self.dataset, row_ids_slice).await?
+            {
+                let mut addresses = Vec::with_capacity(row_id_array_typed.len());
+                let mut valid = Vec::with_capacity(row_id_array_typed.len());
 
-                for id in row_id_array.values().iter() {
+                for id in row_ids_slice.iter() {
                     if let Some(address) = row_id_index.get(*id) {
                         addresses.push(u64::from(address));
                         valid.push(true);
@@ -186,7 +188,7 @@ impl TakeStream {
                     }
                 }
 
-                let mask = if addresses.len() < row_id_array.len() {
+                let mask = if addresses.len() < row_id_array_typed.len() {
                     Some(BooleanArray::from(valid))
                 } else {
                     None

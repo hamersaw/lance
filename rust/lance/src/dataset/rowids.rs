@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::Dataset;
-use crate::session::caches::{RowIdIndexKey, RowIdSequenceKey};
+use crate::session::caches::RowIdSequenceKey;
 use crate::{Error, Result};
 use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::utils::deletion::DeletionVector;
@@ -70,31 +70,37 @@ pub fn load_row_id_sequences<'a>(
         .buffer_unordered(dataset.object_store.io_parallelism())
 }
 
+/// Build a full `RowIdIndex` covering every fragment in the dataset.
+///
+/// Used in tests that need to assert against the entire mapping; production
+/// code should use [`build_row_id_index_for`] which only loads fragments
+/// that could own the requested row ids.
+#[cfg(test)]
 pub async fn get_row_id_index(
     dataset: &Dataset,
 ) -> Result<Option<Arc<lance_table::rowids::RowIdIndex>>> {
     if dataset.manifest.uses_stable_row_ids() {
-        let key = RowIdIndexKey {
-            version: dataset.manifest.version,
-        };
-        let index = dataset
-            .metadata_cache
-            .get_or_insert_with_key(key, || load_row_id_index(dataset))
-            .await?;
-        Ok(Some(index))
+        let index = load_row_id_index_for_fragments(dataset, &dataset.manifest.fragments).await?;
+        Ok(Some(Arc::new(index)))
     } else {
         Ok(None)
     }
 }
 
-async fn load_row_id_index(dataset: &Dataset) -> Result<lance_table::rowids::RowIdIndex> {
-    let sequences = load_row_id_sequences(dataset, &dataset.manifest.fragments)
+/// Build a `RowIdIndex` over only the supplied fragments. Used by the lazy
+/// translator path so a single-fragment take doesn't pay O(num_fragments)
+/// IOPs.
+async fn load_row_id_index_for_fragments(
+    dataset: &Dataset,
+    fragments: &[Fragment],
+) -> Result<lance_table::rowids::RowIdIndex> {
+    let sequences = load_row_id_sequences(dataset, fragments)
         .try_collect::<Vec<_>>()
         .await?;
 
-    let fragments = dataset.get_fragments();
+    let all_fragments = dataset.get_fragments();
     let fragment_map: std::collections::HashMap<u32, &crate::dataset::fragment::FileFragment> =
-        fragments.iter().map(|f| (f.id() as u32, f)).collect();
+        all_fragments.iter().map(|f| (f.id() as u32, f)).collect();
 
     let fragment_indices: Vec<_> =
         futures::stream::iter(sequences.into_iter().map(|(fragment_id, sequence)| {
@@ -127,6 +133,40 @@ async fn load_row_id_index(dataset: &Dataset) -> Result<lance_table::rowids::Row
     let index = RowIdIndex::new(&fragment_indices)?;
 
     Ok(index)
+}
+
+/// Select fragments that could own at least one of the requested row ids
+/// based on each fragment's `row_id_hint`. Fragments without a hint are
+/// always included (legacy data, or fragments written before the hint
+/// existed).
+fn select_candidate_fragments(fragments: &[Fragment], row_ids: &[u64]) -> Vec<Fragment> {
+    fragments
+        .iter()
+        .filter(|frag| match &frag.row_id_hint {
+            None => true,
+            Some(hint) => row_ids.iter().any(|&id| hint.could_contain(id)),
+        })
+        .cloned()
+        .collect()
+}
+
+/// Build a `RowIdIndex` covering only the fragments that could own the
+/// requested row ids. Falls back to the full index for non-stable-rowid
+/// datasets.
+///
+/// This is the lazy-loading entry point: a take that touches one fragment
+/// only pays I/O for that fragment's row id sequence and deletion vector,
+/// instead of every fragment's.
+pub async fn build_row_id_index_for(
+    dataset: &Dataset,
+    row_ids: &[u64],
+) -> Result<Option<RowIdIndex>> {
+    if !dataset.manifest.uses_stable_row_ids() {
+        return Ok(None);
+    }
+    let candidates = select_candidate_fragments(&dataset.manifest.fragments, row_ids);
+    let index = load_row_id_index_for_fragments(dataset, &candidates).await?;
+    Ok(Some(index))
 }
 
 #[cfg(test)]
@@ -668,6 +708,153 @@ mod test {
             if i.value(idx) >= 15 {
                 assert_eq!(category.value(idx), 999);
             }
+        }
+    }
+
+    /// Equivalence test: the lazy `build_row_id_index_for` and the eager
+    /// `get_row_id_index` must resolve every existing row id to the same
+    /// address. The lazy variant is just allowed to skip fragments — never
+    /// to misroute or drop ids that the full index would have resolved.
+    #[tokio::test]
+    async fn test_lazy_index_matches_full_index() {
+        let num_rows = 60u64;
+        let batch = sequence_batch(0..num_rows as i32);
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                max_rows_per_file: 10,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let full = get_row_id_index(&dataset).await.unwrap().unwrap();
+        let row_ids: Vec<u64> = (0..num_rows).collect();
+        let lazy = build_row_id_index_for(&dataset, &row_ids)
+            .await
+            .unwrap()
+            .unwrap();
+
+        for id in 0..num_rows {
+            assert_eq!(
+                full.get(id),
+                lazy.get(id),
+                "Address mismatch at row id {id}",
+            );
+        }
+        // Out-of-range ids resolve to None on both.
+        assert_eq!(full.get(num_rows), lazy.get(num_rows));
+    }
+
+    /// After updating a row, the absorbing fragment's hint widens to include
+    /// the moved row id. Translation must still resolve correctly even when
+    /// multiple fragments are candidates for the same id.
+    #[tokio::test]
+    async fn test_lazy_index_handles_update_overlap() {
+        let num_rows = 30u64;
+        let batch = sequence_batch(0..num_rows as i32);
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                max_rows_per_file: 10,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Update an "early" row (id=2). With stable row ids the rowid stays
+        // the same, but the row physically moves to a new fragment, so that
+        // new fragment's hint will straddle a wide range that overlaps with
+        // the original fragment's hint.
+        let updated = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("id = 2")
+            .unwrap()
+            .set("id", "999")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset;
+
+        // Confirm we have at least two fragments whose hints both cover
+        // rowid 2 — that's the overlap case the lazy translator must handle.
+        let candidates: Vec<_> = updated
+            .manifest
+            .fragments
+            .iter()
+            .filter(|f| match &f.row_id_hint {
+                Some(h) => h.could_contain(2),
+                None => true,
+            })
+            .collect();
+        assert!(
+            candidates.len() >= 2,
+            "Expected at least two candidate fragments for the moved row id, got {}",
+            candidates.len(),
+        );
+
+        // The lazy index must resolve rowid 2 to the new fragment, not the
+        // original (which has a tombstone).
+        let lazy = build_row_id_index_for(&updated, &[2])
+            .await
+            .unwrap()
+            .unwrap();
+        let resolved = lazy.get(2).expect("rowid 2 must resolve after update");
+        // Resolved address must match the eager index's view of the world.
+        let full = get_row_id_index(&updated).await.unwrap().unwrap();
+        assert_eq!(full.get(2), Some(resolved));
+    }
+
+    /// Backward-compat: a fragment without a row_id_hint (legacy data) must
+    /// still resolve correctly through the lazy translator. The translator
+    /// treats it as a candidate for every row id, so it loads the sequence
+    /// and routes accordingly — same correctness, no IOP improvement.
+    #[tokio::test]
+    async fn test_lazy_index_handles_missing_hint() {
+        let num_rows = 20u64;
+        let batch = sequence_batch(0..num_rows as i32);
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let mut dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                max_rows_per_file: 10,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Strip the hints from every fragment to simulate legacy data.
+        let mut new_manifest = (*dataset.manifest).clone();
+        let mut new_fragments = (*new_manifest.fragments).clone();
+        for f in &mut new_fragments {
+            f.row_id_hint = None;
+        }
+        new_manifest.fragments = Arc::new(new_fragments);
+        dataset.manifest = Arc::new(new_manifest);
+
+        // Lookups must still resolve — falling back to load all fragments.
+        for id in 0..num_rows {
+            let lazy = build_row_id_index_for(&dataset, &[id])
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                lazy.get(id).is_some(),
+                "rowid {id} must resolve when hints are absent",
+            );
         }
     }
 }

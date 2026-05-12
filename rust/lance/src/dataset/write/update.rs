@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use super::retry::{RetryConfig, RetryExecutor, execute_with_retry};
 use super::{CommitBuilder, WriteParams, write_fragments_internal};
-use crate::dataset::rowids::get_row_id_index;
+use crate::dataset::rowids::build_row_id_index_for;
 use crate::dataset::transaction::UpdateMode::RewriteRows;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::utils::make_rowid_capture_stream;
@@ -28,7 +28,7 @@ use lance_core::error::{InvalidInputSnafu, box_error};
 use lance_core::utils::mask::RowAddrTreeMap;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_datafusion::expr::safe_coerce_scalar;
-use lance_table::format::{Fragment, RowIdMeta};
+use lance_table::format::Fragment;
 use roaring::RoaringTreemap;
 use snafu::ResultExt;
 
@@ -327,14 +327,19 @@ impl UpdateJob {
                 ))
             })?;
             for (fragment, sequence) in new_fragments.iter_mut().zip(sequences) {
-                let serialized = lance_table::rowids::write_row_ids(&sequence);
-                fragment.row_id_meta = Some(RowIdMeta::Inline(serialized));
+                fragment.set_row_id_sequence(&sequence);
             }
         }
 
-        // Apply deletions
-        let row_id_index = get_row_id_index(&self.dataset).await?;
-        let row_addrs = removed_row_ids.row_addrs(row_id_index.as_deref());
+        // Apply deletions: only build the rowid index when the captured ids
+        // are sequence-style (i.e. actually need translation).
+        let row_id_index = if let Some(seq) = removed_row_ids.row_id_sequence() {
+            let row_ids: Vec<u64> = seq.iter().collect();
+            build_row_id_index_for(&self.dataset, &row_ids).await?
+        } else {
+            None
+        };
+        let row_addrs = removed_row_ids.row_addrs(row_id_index.as_ref());
         let (old_fragments, removed_fragment_ids) = self.apply_deletions(&row_addrs).await?;
         let affected_rows = RowAddrTreeMap::from(row_addrs.as_ref().clone());
 

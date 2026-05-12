@@ -43,7 +43,7 @@ use inserted_rows::KeyExistenceFilter;
 
 use super::retry::{RetryConfig, RetryExecutor, execute_with_retry};
 use super::{CommitBuilder, WriteParams, write_fragments_internal};
-use crate::dataset::rowids::get_row_id_index;
+use crate::dataset::rowids::build_row_id_index_for;
 use crate::dataset::transaction::UpdateMode::{RewriteColumns, RewriteRows};
 use crate::dataset::utils::CapturedRowIds;
 use crate::index::DatasetIndexExt;
@@ -115,7 +115,7 @@ use lance_datafusion::{
 use lance_file::version::LanceFileVersion;
 use lance_index::IndexCriteria;
 use lance_index::mem_wal::MergedGeneration;
-use lance_table::format::{Fragment, IndexMetadata, RowIdMeta};
+use lance_table::format::{Fragment, IndexMetadata};
 use log::info;
 use roaring::RoaringTreemap;
 use snafu::ResultExt;
@@ -1685,24 +1685,23 @@ impl MergeInsertJob {
                 })?;
 
                 for (fragment, sequence) in new_fragments.iter_mut().zip(sequences) {
-                    let serialized = lance_table::rowids::write_row_ids(&sequence);
-                    fragment.row_id_meta = Some(RowIdMeta::Inline(serialized));
+                    fragment.set_row_id_sequence(&sequence);
                 }
             }
 
             // Apply deletions
             let removed_row_ids = Arc::into_inner(deleted_rows).unwrap().into_inner().unwrap();
 
-            let removed_row_addr_vec =
-                if let Some(row_id_index) = get_row_id_index(&self.dataset).await? {
-                    let addresses: Vec<u64> = removed_row_ids
-                        .iter()
-                        .filter_map(|id| row_id_index.get(*id).map(|address| address.into()))
-                        .collect::<Vec<_>>();
-                    addresses
-                } else {
-                    removed_row_ids
-                };
+            let removed_row_addr_vec = if let Some(row_id_index) =
+                build_row_id_index_for(&self.dataset, &removed_row_ids).await?
+            {
+                removed_row_ids
+                    .iter()
+                    .filter_map(|id| row_id_index.get(*id).map(|address| address.into()))
+                    .collect::<Vec<_>>()
+            } else {
+                removed_row_ids
+            };
 
             let removed_row_addrs = RoaringTreemap::from_iter(removed_row_addr_vec.into_iter());
 

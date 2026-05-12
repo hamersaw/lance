@@ -368,6 +368,10 @@ impl DataFileFieldInterner {
             .created_at_version_sequence
             .map(|pb| Self::intern_created_version_meta(&mut self.inline_bytes, pb))
             .transpose()?;
+        let row_id_hint = match p.row_id_hint {
+            Some(h) => RowIdHint::try_from(h).ok(),
+            None => None,
+        };
         Ok(Fragment {
             id: p.id,
             files: p
@@ -380,6 +384,7 @@ impl DataFileFieldInterner {
             physical_rows,
             last_updated_at_version_meta,
             created_at_version_meta,
+            row_id_hint,
         })
     }
 }
@@ -471,6 +476,86 @@ impl TryFrom<pb::data_fragment::RowIdSequence> for RowIdMeta {
     }
 }
 
+/// Hint describing the row ids that a fragment owns.
+///
+/// Stored on each `Fragment` so readers can route a stable row id to the
+/// owning fragment without loading every fragment's row id sequence. Modeled
+/// as an enum so future variants (e.g. bloom filters, sparse ranges) can be
+/// added without breaking existing readers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
+#[serde(tag = "kind")]
+pub enum RowIdHint {
+    /// Inclusive min/max of the row ids this fragment owns.
+    MinMax { min: u64, max: u64 },
+}
+
+impl RowIdHint {
+    /// True if this fragment could contain `row_id` according to the hint.
+    pub fn could_contain(&self, row_id: u64) -> bool {
+        match self {
+            Self::MinMax { min, max } => *min <= row_id && row_id <= *max,
+        }
+    }
+
+    /// Build a hint from a row id sequence. Returns `None` for an empty
+    /// sequence (no rows owned).
+    pub fn from_sequence(sequence: &crate::rowids::RowIdSequence) -> Option<Self> {
+        let range = sequence.row_id_range()?;
+        Some(Self::MinMax {
+            min: *range.start(),
+            max: *range.end(),
+        })
+    }
+
+    /// Build a hint from row id metadata without any I/O. For inline
+    /// metadata we parse the embedded sequence; for external metadata we
+    /// return `None` (the caller has to derive the hint at the point where
+    /// it already holds the sequence in memory).
+    pub fn from_meta(meta: &RowIdMeta) -> Option<Self> {
+        match meta {
+            RowIdMeta::Inline(data) => {
+                let sequence = crate::rowids::read_row_ids(data).ok()?;
+                Self::from_sequence(&sequence)
+            }
+            RowIdMeta::External(_) => None,
+        }
+    }
+}
+
+impl TryFrom<pb::RowIdHint> for RowIdHint {
+    type Error = Error;
+
+    fn try_from(value: pb::RowIdHint) -> Result<Self> {
+        let Some(kind) = value.kind else {
+            // An unrecognized variant on the wire (or an empty oneof) should
+            // be treated as "no hint" by the caller. Surfacing it here as an
+            // error would break forward-compat, so map it to an explicit
+            // sentinel error the caller can downgrade.
+            return Err(Error::not_supported_source(
+                "RowIdHint with no recognized variant".into(),
+            ));
+        };
+        match kind {
+            pb::row_id_hint::Kind::MinMax(min_max) => Ok(Self::MinMax {
+                min: min_max.min,
+                max: min_max.max,
+            }),
+        }
+    }
+}
+
+impl From<&RowIdHint> for pb::RowIdHint {
+    fn from(value: &RowIdHint) -> Self {
+        let kind = match value {
+            RowIdHint::MinMax { min, max } => pb::row_id_hint::Kind::MinMax(pb::RowIdMinMax {
+                min: *min,
+                max: *max,
+            }),
+        };
+        Self { kind: Some(kind) }
+    }
+}
+
 /// Data fragment.
 ///
 /// A fragment is a set of files which represent the different columns of the same rows.
@@ -503,6 +588,15 @@ pub struct Fragment {
     /// Created at version metadata
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at_version_meta: Option<RowDatasetVersionMeta>,
+
+    /// Optional hint describing which row ids this fragment owns.
+    ///
+    /// When present, readers can route stable row ids to fragments without
+    /// loading every fragment's row id sequence. `None` for legacy data
+    /// written before this field existed; readers must treat such fragments
+    /// as candidates for any row id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub row_id_hint: Option<RowIdHint>,
 }
 
 impl Fragment {
@@ -515,7 +609,18 @@ impl Fragment {
             physical_rows: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            row_id_hint: None,
         }
+    }
+
+    /// Serialize `sequence` into `row_id_meta` and refresh `row_id_hint` in
+    /// one step. The hint and the sequence must stay in lockstep — every
+    /// writer that mints or rewrites stable row ids should route through
+    /// this method so the two fields can't drift apart.
+    pub fn set_row_id_sequence(&mut self, sequence: &crate::rowids::RowIdSequence) {
+        let serialized = crate::rowids::write_row_ids(sequence);
+        self.row_id_meta = Some(RowIdMeta::Inline(serialized));
+        self.row_id_hint = RowIdHint::from_sequence(sequence);
     }
 
     pub fn num_rows(&self) -> Option<usize> {
@@ -554,6 +659,7 @@ impl Fragment {
             row_id_meta: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            row_id_hint: None,
         }
     }
 
@@ -662,6 +768,13 @@ impl TryFrom<pb::DataFragment> for Fragment {
         } else {
             None
         };
+        // Unrecognized hint variants are downgraded to `None` (treat as
+        // legacy) rather than failing the read, so old binaries can still
+        // open new manifests.
+        let row_id_hint = match p.row_id_hint {
+            Some(h) => RowIdHint::try_from(h).ok(),
+            None => None,
+        };
         Ok(Self {
             id: p.id,
             files: p
@@ -680,6 +793,7 @@ impl TryFrom<pb::DataFragment> for Fragment {
                 .created_at_version_sequence
                 .map(RowDatasetVersionMeta::try_from)
                 .transpose()?,
+            row_id_hint,
         })
     }
 }
@@ -713,6 +827,7 @@ impl From<&Fragment> for pb::DataFragment {
         let last_updated_at_version_sequence =
             last_updated_at_version_meta_to_pb(&f.last_updated_at_version_meta);
         let created_at_version_sequence = created_at_version_meta_to_pb(&f.created_at_version_meta);
+        let row_id_hint = f.row_id_hint.as_ref().map(pb::RowIdHint::from);
         Self {
             id: f.id,
             files: f.files.iter().map(pb::DataFile::from).collect(),
@@ -721,6 +836,7 @@ impl From<&Fragment> for pb::DataFragment {
             physical_rows: f.physical_rows.unwrap_or_default() as u64,
             last_updated_at_version_sequence,
             created_at_version_sequence,
+            row_id_hint,
         }
     }
 }
@@ -818,6 +934,58 @@ mod tests {
 
         let frag2 = Fragment::from_json(&json).unwrap();
         assert_eq!(fragment, frag2);
+    }
+
+    #[test]
+    fn test_row_id_hint_could_contain() {
+        let hint = RowIdHint::MinMax { min: 100, max: 200 };
+        assert!(!hint.could_contain(99));
+        assert!(hint.could_contain(100));
+        assert!(hint.could_contain(150));
+        assert!(hint.could_contain(200));
+        assert!(!hint.could_contain(201));
+    }
+
+    #[test]
+    fn test_row_id_hint_proto_roundtrip() {
+        let hint = RowIdHint::MinMax { min: 42, max: 9999 };
+        let pb_hint = pb::RowIdHint::from(&hint);
+        let recovered = RowIdHint::try_from(pb_hint).unwrap();
+        assert_eq!(hint, recovered);
+    }
+
+    #[test]
+    fn test_row_id_hint_unrecognized_variant_is_downgraded() {
+        // A pb::RowIdHint with no recognized variant must round-trip to a
+        // Fragment with row_id_hint == None (forward-compat fallback).
+        let mut pb_frag = pb::DataFragment {
+            id: 1,
+            files: vec![],
+            deletion_file: None,
+            row_id_sequence: None,
+            physical_rows: 10,
+            last_updated_at_version_sequence: None,
+            created_at_version_sequence: None,
+            row_id_hint: Some(pb::RowIdHint { kind: None }),
+        };
+        let frag = Fragment::try_from(pb_frag.clone()).unwrap();
+        assert!(frag.row_id_hint.is_none());
+
+        // A None pb hint also gives None on the Rust side.
+        pb_frag.row_id_hint = None;
+        let frag = Fragment::try_from(pb_frag).unwrap();
+        assert!(frag.row_id_hint.is_none());
+    }
+
+    #[test]
+    fn test_fragment_with_row_id_hint_roundtrip() {
+        let mut fragment = Fragment::new(7);
+        fragment.physical_rows = Some(50);
+        fragment.row_id_hint = Some(RowIdHint::MinMax { min: 0, max: 49 });
+
+        let proto = pb::DataFragment::from(&fragment);
+        let recovered = Fragment::try_from(proto).unwrap();
+        assert_eq!(fragment, recovered);
     }
 
     #[test]

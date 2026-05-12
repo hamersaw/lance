@@ -1364,8 +1364,7 @@ async fn rechunk_stable_row_ids(
 
     for (fragment, sequence) in new_fragments.iter_mut().zip(new_sequences) {
         // TODO: if large enough, serialize to separate file
-        let serialized = lance_table::rowids::write_row_ids(&sequence);
-        fragment.row_id_meta = Some(RowIdMeta::Inline(serialized));
+        fragment.set_row_id_sequence(&sequence);
     }
 
     Ok(())
@@ -1691,6 +1690,7 @@ mod tests {
             physical_rows: Some(0),
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            row_id_hint: None,
         };
         let single_bin = CandidateBin {
             fragments: vec![fragment.clone()],

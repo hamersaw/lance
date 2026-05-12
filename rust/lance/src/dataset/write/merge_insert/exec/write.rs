@@ -20,7 +20,6 @@ use datafusion::{
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
 use futures::{StreamExt, stream};
 use lance_core::{Error, ROW_ADDR, ROW_ID};
-use lance_table::format::RowIdMeta;
 use roaring::RoaringTreemap;
 
 use crate::dataset::transaction::UpdateMode::RewriteRows;
@@ -887,8 +886,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
                 })?;
 
                 for (fragment, sequence) in new_fragments.iter_mut().zip(sequences) {
-                    let serialized = lance_table::rowids::write_row_ids(&sequence);
-                    fragment.row_id_meta = Some(RowIdMeta::Inline(serialized));
+                    fragment.set_row_id_sequence(&sequence);
                 }
             }
 

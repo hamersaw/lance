@@ -346,6 +346,28 @@ message DataFragment {
   // deletion tombstones. To compute the current number of rows, subtract
   // `deletion_file.num_deleted_rows` from this value.
   uint64 physical_rows = 4;
+
+  // Optional hint about which row ids this fragment owns.
+  //
+  // When present, readers can route stable row ids to fragments without
+  // loading every fragment's row id sequence. Modeled as a oneof so future
+  // hint variants (bloom filters, sparse ranges) can land additively
+  // without breaking older readers.
+  RowIdHint row_id_hint = 11;
+}
+
+// Hint describing the row ids that a fragment owns.
+message RowIdHint {
+  oneof kind {
+    // Inclusive min/max of the row ids this fragment owns.
+    RowIdMinMax min_max = 1;
+  }
+}
+
+// Inclusive min/max of row ids owned by a fragment.
+message RowIdMinMax {
+  uint64 min = 1;
+  uint64 max = 2;
 }
 
 message DataFile {

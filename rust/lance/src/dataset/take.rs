@@ -4,7 +4,7 @@
 use std::{collections::BTreeMap, collections::HashMap, ops::Range, pin::Pin, sync::Arc};
 
 use crate::dataset::fragment::FragReadConfig;
-use crate::dataset::rowids::get_row_id_index;
+use crate::dataset::rowids::build_row_id_index_for;
 use crate::io::exec::AddRowOffsetExec;
 use crate::{Error, Result};
 use arrow::{compute::concat_batches, datatypes::UInt64Type};
@@ -529,14 +529,15 @@ impl TakeBuilder {
                 .row_ids
                 .as_ref()
                 .expect("row_ids must be set if row_addrs is not");
-            let addrs = if let Some(row_id_index) = get_row_id_index(&self.dataset).await? {
-                row_ids
-                    .iter()
-                    .filter_map(|id| row_id_index.get(*id).map(|address| address.into()))
-                    .collect::<Vec<_>>()
-            } else {
-                row_ids.clone()
-            };
+            let addrs =
+                if let Some(row_id_index) = build_row_id_index_for(&self.dataset, row_ids).await? {
+                    row_ids
+                        .iter()
+                        .filter_map(|id| row_id_index.get(*id).map(|address| address.into()))
+                        .collect::<Vec<_>>()
+                } else {
+                    row_ids.clone()
+                };
             self.row_addrs = Some(addrs);
         }
         Ok(self.row_addrs.as_ref().unwrap())

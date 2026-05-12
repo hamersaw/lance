@@ -35,7 +35,7 @@ use lance_table::{
         commit::CommitHandler,
         manifest::{read_manifest, read_manifest_indexes},
     },
-    rowids::{RowIdSequence, segment::U64Segment, version::build_version_meta, write_row_ids},
+    rowids::{RowIdSequence, segment::U64Segment, version::build_version_meta},
 };
 use object_store::path::Path;
 use roaring::RoaringBitmap;
@@ -2853,8 +2853,7 @@ impl Transaction {
                         }
                         let combined_sequence = RowIdSequence::from(row_ids.as_slice());
 
-                        let serialized = write_row_ids(&combined_sequence);
-                        fragment.row_id_meta = Some(RowIdMeta::Inline(serialized));
+                        fragment.set_row_id_sequence(&combined_sequence);
                         *next_row_id += remaining_rows;
                     }
                     Ordering::Greater => {
@@ -2869,8 +2868,7 @@ impl Transaction {
                 let row_ids = *next_row_id..(*next_row_id + physical_rows);
                 let sequence = RowIdSequence::from(row_ids);
                 // TODO: write to a separate file if large. Possibly share a file with other fragments.
-                let serialized = write_row_ids(&sequence);
-                fragment.row_id_meta = Some(RowIdMeta::Inline(serialized));
+                fragment.set_row_id_sequence(&sequence);
                 *next_row_id += physical_rows;
             }
         }
@@ -4049,6 +4047,7 @@ mod tests {
             deletion_file: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            row_id_hint: None,
         }];
         let mut next_row_id = 0;
 
@@ -4081,6 +4080,7 @@ mod tests {
             deletion_file: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            row_id_hint: None,
         }];
         let mut next_row_id = 100;
 
@@ -4113,6 +4113,7 @@ mod tests {
             deletion_file: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            row_id_hint: None,
         }];
         let mut next_row_id = 100;
 
@@ -4148,6 +4149,7 @@ mod tests {
             deletion_file: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            row_id_hint: None,
         }];
         let mut next_row_id = 100;
 
@@ -4176,6 +4178,7 @@ mod tests {
                 deletion_file: None,
                 last_updated_at_version_meta: None,
                 created_at_version_meta: None,
+                row_id_hint: None,
             },
             Fragment {
                 id: 2,
@@ -4185,6 +4188,7 @@ mod tests {
                 deletion_file: None,
                 last_updated_at_version_meta: None,
                 created_at_version_meta: None,
+                row_id_hint: None,
             },
         ];
         let mut next_row_id = 1000;
@@ -4229,6 +4233,7 @@ mod tests {
             deletion_file: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            row_id_hint: None,
         }];
         let mut next_row_id = 0;
 
@@ -4738,6 +4743,7 @@ mod tests {
             physical_rows: Some(5),
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            row_id_hint: None,
         };
 
         let manifest = make_stable_row_id_manifest(vec![fragment.clone()]);
@@ -5006,6 +5012,7 @@ mod tests {
             row_id_meta: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            row_id_hint: None,
         };
 
         let operation = Operation::Overwrite {
@@ -5098,6 +5105,7 @@ mod tests {
             physical_rows: Some(5),
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            row_id_hint: None,
         };
 
         let mut manifest = Manifest::new(
@@ -5170,6 +5178,7 @@ mod tests {
             physical_rows: Some(5),
             last_updated_at_version_meta: Some(meta_v1.clone()),
             created_at_version_meta: None,
+            row_id_hint: None,
         };
 
         let mut manifest = Manifest::new(
@@ -5189,6 +5198,7 @@ mod tests {
             physical_rows: Some(5),
             last_updated_at_version_meta: Some(meta_v1),
             created_at_version_meta: None,
+            row_id_hint: None,
         };
 
         let tx = Transaction::new(
@@ -5238,6 +5248,7 @@ mod tests {
             physical_rows: Some(5),
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            row_id_hint: None,
         };
 
         let manifest = Manifest::new(
@@ -5302,6 +5313,7 @@ mod tests {
             physical_rows: Some(3),
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            row_id_hint: None,
         };
 
         let mut manifest = Manifest::new(
@@ -5324,6 +5336,7 @@ mod tests {
             physical_rows: Some(4),
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            row_id_hint: None,
         };
 
         let tx = Transaction::new(
@@ -5388,6 +5401,7 @@ mod tests {
                 RowDatasetVersionMeta::from_sequence(&created_at_seq).unwrap(),
             ),
             last_updated_at_version_meta: None,
+            row_id_hint: None,
         };
 
         let new_seq = RowIdSequence::from([100u64, 102].as_slice());
@@ -5399,6 +5413,7 @@ mod tests {
             physical_rows: Some(2),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
+            row_id_hint: None,
         };
 
         let manifest = make_stable_row_id_manifest(vec![existing_fragment]);
@@ -5443,6 +5458,7 @@ mod tests {
                     RowDatasetVersionMeta::from_sequence(&frag_a_created).unwrap(),
                 ),
                 last_updated_at_version_meta: None,
+                row_id_hint: None,
             },
             Fragment {
                 id: 2,
@@ -5454,6 +5470,7 @@ mod tests {
                     RowDatasetVersionMeta::from_sequence(&frag_b_created).unwrap(),
                 ),
                 last_updated_at_version_meta: None,
+                row_id_hint: None,
             },
         ]);
 
@@ -5467,6 +5484,7 @@ mod tests {
             physical_rows: Some(2),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
+            row_id_hint: None,
         };
 
         let (result, _) = update_txn(vec![new_fragment])
@@ -5502,6 +5520,7 @@ mod tests {
                 RowDatasetVersionMeta::from_sequence(&existing_created).unwrap(),
             ),
             last_updated_at_version_meta: None,
+            row_id_hint: None,
         };
 
         // New fragment has row 10 (known) and row 999 (unknown — freshly inserted)
@@ -5514,6 +5533,7 @@ mod tests {
             physical_rows: Some(2),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
+            row_id_hint: None,
         };
 
         let manifest = make_stable_row_id_manifest(vec![existing_fragment]);
@@ -5544,6 +5564,7 @@ mod tests {
             physical_rows: Some(2),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
+            row_id_hint: None,
         };
 
         let new_seq = RowIdSequence::from([50u64].as_slice());
@@ -5555,6 +5576,7 @@ mod tests {
             physical_rows: Some(1),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
+            row_id_hint: None,
         };
 
         let manifest = make_stable_row_id_manifest(vec![existing_fragment]);
@@ -5583,6 +5605,7 @@ mod tests {
             physical_rows: Some(2),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
+            row_id_hint: None,
         };
 
         let new_fragment = Fragment {
@@ -5593,6 +5616,7 @@ mod tests {
             physical_rows: Some(3),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
+            row_id_hint: None,
         };
 
         let manifest = make_stable_row_id_manifest(vec![existing_fragment]);
@@ -5624,6 +5648,7 @@ mod tests {
                 vec![0xFFu8; 8].as_slice(),
             ))),
             last_updated_at_version_meta: None,
+            row_id_hint: None,
         };
 
         let new_seq = RowIdSequence::from([10u64].as_slice());
@@ -5635,6 +5660,7 @@ mod tests {
             physical_rows: Some(1),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
+            row_id_hint: None,
         };
 
         let manifest = make_stable_row_id_manifest(vec![existing_fragment]);
@@ -5678,6 +5704,7 @@ mod tests {
                 RowDatasetVersionMeta::from_sequence(&in_range_created).unwrap(),
             ),
             last_updated_at_version_meta: None,
+            row_id_hint: None,
         };
 
         // Fragment outside range – IDs [1000, 1001], created_at = 99 (must never appear)
@@ -5698,6 +5725,7 @@ mod tests {
                 RowDatasetVersionMeta::from_sequence(&out_of_range_created).unwrap(),
             ),
             last_updated_at_version_meta: None,
+            row_id_hint: None,
         };
 
         // New fragment rewrites both rows from the in-range fragment
@@ -5710,6 +5738,7 @@ mod tests {
             physical_rows: Some(2),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
+            row_id_hint: None,
         };
 
         let manifest = make_stable_row_id_manifest(vec![in_range_frag, out_of_range_frag]);
@@ -5748,6 +5777,7 @@ mod tests {
             physical_rows: Some(3),
             created_at_version_meta: Some(RowDatasetVersionMeta::from_sequence(&created).unwrap()),
             last_updated_at_version_meta: None,
+            row_id_hint: None,
         };
 
         // New fragment takes the boundary IDs: 10 (min) and 12 (max)
@@ -5760,6 +5790,7 @@ mod tests {
             physical_rows: Some(2),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
+            row_id_hint: None,
         };
 
         let manifest = make_stable_row_id_manifest(vec![existing]);
@@ -5810,6 +5841,7 @@ mod tests {
                 RowDatasetVersionMeta::from_sequence(&src_created).unwrap(),
             ),
             last_updated_at_version_meta: None,
+            row_id_hint: None,
         };
 
         // New fragment rewrites all 100 rows preserving their stable IDs.
@@ -5822,6 +5854,7 @@ mod tests {
             physical_rows: Some(100),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
+            row_id_hint: None,
         };
 
         let manifest = make_stable_row_id_manifest(vec![src_frag]);
@@ -5871,6 +5904,7 @@ mod tests {
                     RowDatasetVersionMeta::from_sequence(&created_a).unwrap(),
                 ),
                 last_updated_at_version_meta: None,
+                row_id_hint: None,
             },
             Fragment {
                 id: 2,
@@ -5882,6 +5916,7 @@ mod tests {
                     RowDatasetVersionMeta::from_sequence(&created_b).unwrap(),
                 ),
                 last_updated_at_version_meta: None,
+                row_id_hint: None,
             },
         ]);
 
@@ -5895,6 +5930,7 @@ mod tests {
             physical_rows: Some(2),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
+            row_id_hint: None,
         };
 
         let (result, _) = update_txn(vec![new_frag])

@@ -2086,3 +2086,101 @@ async fn test_open_dataset_non_not_found_error_is_not_masked() {
         err,
     );
 }
+
+/// Take 10 stable-row-id rows from a single fragment and return the cold IOPs
+/// observed via the supplied tracker. Helper for the regression test below.
+async fn take_one_fragment_cold_iops(
+    uri: &str,
+    take_size: usize,
+    fragment_idx: u64,
+    rows_per_fragment: u64,
+) -> u64 {
+    let tracker = Arc::new(IOTracker::default());
+    let store_params = ObjectStoreParams {
+        object_store_wrapper: Some(tracker.clone()),
+        ..Default::default()
+    };
+    let dataset = DatasetBuilder::from_uri(uri)
+        .with_store_params(store_params)
+        .load()
+        .await
+        .unwrap();
+    let _ = tracker.incremental_stats(); // reset
+
+    let row_offsets: Vec<u64> = (1..=take_size as u64)
+        .map(|i| fragment_idx * rows_per_fragment + i)
+        .collect();
+    let _ = dataset
+        .take_rows(
+            &row_offsets,
+            lance_core::datatypes::Schema::try_from(dataset.schema()).unwrap(),
+        )
+        .await
+        .unwrap();
+
+    tracker.incremental_stats().read_iops
+}
+
+/// Regression test for https://github.com/lance-format/lance/issues/6486.
+/// Cold-take IOPs on a stable-rowid dataset must not scale with the number
+/// of fragments — only the fragments that could own the requested row ids
+/// should be loaded. Pre-fix this was O(num_fragments) extra IOPs per take.
+#[tokio::test]
+async fn test_stable_rowid_take_does_not_scale_with_fragments() {
+    use crate::dataset::WriteParams;
+
+    let rows_per_fragment: u64 = 100;
+    let take_size: usize = 10;
+
+    async fn build(num_fragments: u64, rows_per_fragment: u64) -> TempStrDir {
+        let total_rows = (num_fragments * rows_per_fragment) as i32;
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("value", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..total_rows)) as Arc<dyn Array>,
+                Arc::new(StringArray::from_iter_values(
+                    (0..total_rows).map(|i| format!("v-{i}")),
+                )),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let temp = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            reader,
+            temp.as_str(),
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                max_rows_per_file: rows_per_fragment as usize,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        // Force a few deletion files so load_row_id_index would have had to
+        // read each fragment's deletion vector.
+        dataset.delete("id % 173 == 0").await.unwrap();
+        temp
+    }
+
+    let small_dir = build(2, rows_per_fragment).await;
+    let large_dir = build(10, rows_per_fragment).await;
+
+    let small_iops =
+        take_one_fragment_cold_iops(small_dir.as_str(), take_size, 0, rows_per_fragment).await;
+    let large_iops =
+        take_one_fragment_cold_iops(large_dir.as_str(), take_size, 0, rows_per_fragment).await;
+
+    // The two-fragment dataset and ten-fragment dataset both touch a single
+    // fragment for the take. Cold IOPs should match — the ten-fragment one
+    // must not pay 8 extra IOPs to load untouched fragments.
+    assert_eq!(
+        small_iops, large_iops,
+        "Cold take IOPs should not scale with num_fragments. \
+         small (2 frags) = {small_iops}, large (10 frags) = {large_iops}",
+    );
+}
