@@ -1632,6 +1632,11 @@ impl ShardWriter {
         self.config.shard_id
     }
 
+    /// Return `Err` if a successor writer has claimed a higher epoch.
+    pub async fn check_fenced(&self) -> Result<()> {
+        self.manifest_store.check_fenced(self.epoch).await
+    }
+
     /// Get current MemTable statistics. Returns an error in WAL-only mode
     /// (no MemTable exists).
     pub async fn memtable_stats(&self) -> Result<MemTableStats> {
@@ -2900,6 +2905,54 @@ mod tests {
             "unexpected error: {err}"
         );
 
+        writer_b.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_check_fenced_detects_successor_claim() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = create_test_schema();
+        let shard_id = Uuid::new_v4();
+
+        let writer_a = ShardWriter::open(
+            store.clone(),
+            base_path.clone(),
+            base_uri.clone(),
+            wal_only_config(shard_id),
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        // Not yet fenced.
+        writer_a.check_fenced().await.unwrap();
+
+        // Successor claims a higher epoch.
+        let writer_b = ShardWriter::open(
+            store,
+            base_path,
+            base_uri,
+            wal_only_config(shard_id),
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+        assert!(writer_b.epoch() > writer_a.epoch());
+
+        // A's check_fenced surfaces the fence without needing a put round-trip.
+        let err = writer_a
+            .check_fenced()
+            .await
+            .expect_err("expected fence error");
+        assert!(
+            err.to_string().contains("Writer fenced"),
+            "unexpected error: {err}"
+        );
+
+        // B is the current writer and is not fenced.
+        writer_b.check_fenced().await.unwrap();
         writer_b.close().await.unwrap();
     }
 
