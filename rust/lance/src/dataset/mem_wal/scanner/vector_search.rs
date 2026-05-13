@@ -486,6 +486,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_vector_search_without_base_table() {
+        use futures::TryStreamExt;
+
         let schema = create_vector_schema();
         let temp_dir = tempfile::tempdir().unwrap();
         let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
@@ -517,5 +519,18 @@ mod tests {
             "Plan must not scan base table, got: {}",
             plan_str
         );
+
+        // Execute the plan so runtime issues (schema mismatches, missing
+        // sources, etc.) surface here rather than at the call site.
+        let ctx = datafusion::prelude::SessionContext::new();
+        let stream = plan
+            .execute(0, ctx.task_ctx())
+            .expect("plan should execute without a base table");
+        let batches: Vec<RecordBatch> = stream
+            .try_collect()
+            .await
+            .expect("collecting batches should succeed");
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 0, "fresh tier with no sources should yield no rows");
     }
 }

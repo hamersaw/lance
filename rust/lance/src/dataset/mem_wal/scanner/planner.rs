@@ -1276,6 +1276,63 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    async fn test_lsm_scan_without_base_table_with_filter() {
+        // Exercises filter() on a scanner built via without_base_table(): the
+        // filter must parse against the supplied schema (no base dataset to
+        // borrow one from) and push down to the fresh-tier sources.
+        let (base_dataset, shard_snapshots, active_memtable, pk_columns, _temp_path) =
+            setup_multi_level_lsm().await;
+
+        let base_uri = base_dataset.uri().to_string();
+        let arrow_schema: arrow_schema::Schema = base_dataset.schema().into();
+        let schema = Arc::new(arrow_schema);
+
+        let mut scanner =
+            LsmScanner::without_base_table(schema, base_uri, shard_snapshots, pk_columns)
+                .filter("id > 3")
+                .unwrap();
+        if let Some((shard_id, memtable)) = active_memtable {
+            scanner = scanner.with_active_memtable(shard_id, memtable);
+        }
+
+        let batches: Vec<RecordBatch> = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        let mut results: HashMap<i32, String> = HashMap::new();
+        for batch in batches {
+            let ids = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let names = batch
+                .column_by_name("name")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+
+            for i in 0..batch.num_rows() {
+                results.insert(ids.value(i), names.value(i).to_string());
+            }
+        }
+
+        // id<=3 excluded by filter; id=1,2 also absent because base is excluded.
+        // Fresh tier with newest-wins: gen2_4, active_5, active_6, active_7.
+        assert_eq!(results.len(), 4);
+        assert_eq!(results.get(&4), Some(&"gen2_4".to_string()));
+        assert_eq!(results.get(&5), Some(&"active_5".to_string()));
+        assert_eq!(results.get(&6), Some(&"active_6".to_string()));
+        assert_eq!(results.get(&7), Some(&"active_7".to_string()));
+    }
+
+    #[tokio::test]
     async fn test_lsm_scan_without_base_table_no_flushed_no_active() {
         // No base, no flushed, no active → empty result, valid plan.
         let schema = create_pk_schema();
