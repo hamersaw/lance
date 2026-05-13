@@ -2084,7 +2084,7 @@ impl MemTableFlushHandler {
     /// Whether the flush succeeds or fails, the memtable's flush-completion
     /// watcher is always signaled and the backpressure queue is always drained
     /// for this memtable. Otherwise `wait_for_flush_drain` would observe a
-    /// dropped watch channel and panic on the closed receiver.
+    /// dropped watch channel and return `Err` instead of the actual outcome.
     #[instrument(name = "mt_flush", level = "info", skip_all, fields(generation = memtable.generation(), row_count = memtable.row_count()))]
     async fn flush_memtable(
         &mut self,
