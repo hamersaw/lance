@@ -1707,7 +1707,8 @@ impl ShardWriter {
     }
 
     /// Seal the active memtable so it's queued for L0 flush. No-op when
-    /// the active memtable is empty. Errors in WAL-only mode. Pair with
+    /// the active memtable is empty. Errors in WAL-only mode or if this
+    /// writer has been fenced by a successor. Pair with
     /// [`Self::wait_for_flush_drain`] to wait for the queued flush.
     #[instrument(name = "sw_force_seal_active", level = "info", skip_all, fields(shard_id = %self.config.shard_id, epoch = self.epoch))]
     pub async fn force_seal_active(&self) -> Result<()> {
@@ -1717,6 +1718,7 @@ impl ShardWriter {
                 writer_state,
                 ..
             } => {
+                self.check_fenced().await?;
                 let mut state = state.write().await;
                 if state.memtable.batch_count() == 0 {
                     return Ok(());
@@ -1733,7 +1735,8 @@ impl ShardWriter {
     /// Block until every frozen memtable in the L0 flush queue has
     /// landed and been recorded in the manifest. Does not wait on the
     /// active memtable — call [`Self::force_seal_active`] first if you
-    /// want everything-on-disk. Errors in WAL-only mode.
+    /// want everything-on-disk. Errors in WAL-only mode, or if any
+    /// awaited flush reports `DurabilityResult::Failed`.
     #[instrument(name = "sw_wait_for_flush_drain", level = "info", skip_all, fields(shard_id = %self.config.shard_id, epoch = self.epoch))]
     pub async fn wait_for_flush_drain(&self) -> Result<()> {
         let state_lock = match &self.mode {
@@ -1757,9 +1760,7 @@ impl ShardWriter {
                 return Ok(());
             }
             for mut w in watchers {
-                // `None` from the cell means the writer is shutting
-                // down; treat as drained.
-                let _ = w.await_value().await;
+                w.await_value().await.into_result()?;
             }
         }
     }
@@ -2033,6 +2034,11 @@ impl MemTableFlushHandler {
     /// This method waits for the WAL flush to complete (sent at freeze time),
     /// then flushes to Lance storage. The WAL flush is already queued by
     /// freeze_memtable to ensure strict ordering of WAL entries.
+    ///
+    /// Whether the flush succeeds or fails, the memtable's flush-completion
+    /// watcher is always signaled and the backpressure queue is always drained
+    /// for this memtable. Otherwise `wait_for_flush_drain` would observe a
+    /// dropped watch channel and panic on the closed receiver.
     #[instrument(name = "mt_flush", level = "info", skip_all, fields(generation = memtable.generation(), row_count = memtable.row_count()))]
     async fn flush_memtable(
         &mut self,
@@ -2041,24 +2047,27 @@ impl MemTableFlushHandler {
         let start = Instant::now();
         let memtable_size = memtable.estimated_size();
 
-        // Step 1: Wait for WAL flush completion (already queued at freeze time)
-        // The TriggerWalFlush message was sent by freeze_memtable to ensure
-        // strict ordering of WAL entries.
-        if let Some(mut completion_reader) = memtable.take_wal_flush_completion() {
-            completion_reader
-                .await_value()
-                .await
-                .map_err(|e| Error::io(format!("WAL flush failed: {}", e)))?;
+        let flush_result = async {
+            // Step 1: Wait for WAL flush completion (queued at freeze time).
+            if let Some(mut completion_reader) = memtable.take_wal_flush_completion() {
+                completion_reader
+                    .await_value()
+                    .await
+                    .map_err(|e| Error::io(format!("WAL flush failed: {}", e)))?;
+            }
+            // Step 2: Flush the memtable to Lance storage.
+            self.flusher.flush(&memtable, self.epoch).await
         }
+        .await;
 
-        // Step 2: Flush the memtable to Lance storage
-        let result = self.flusher.flush(&memtable, self.epoch).await?;
+        // Step 3: Always signal completion (with the outcome) and drain
+        // backpressure state for this memtable, even on failure.
+        let durability = match &flush_result {
+            Ok(_) => DurabilityResult::ok(),
+            Err(e) => DurabilityResult::err(e.to_string()),
+        };
+        memtable.signal_memtable_flush_complete(durability);
 
-        // Step 3: Signal completion and update backpressure tracking
-        // Signal memtable flush completion for backpressure watchers
-        memtable.signal_memtable_flush_complete();
-
-        // Update backpressure tracking - remove the oldest watcher and decrement bytes
         {
             let mut state = self.state.write().await;
             if let Some((_size, _watcher)) = state.frozen_flush_watchers.pop_front() {
@@ -2067,7 +2076,8 @@ impl MemTableFlushHandler {
             }
         }
 
-        // Record stats
+        let result = flush_result?;
+
         self.stats
             .record_memtable_flush(start.elapsed(), result.rows_flushed);
 
