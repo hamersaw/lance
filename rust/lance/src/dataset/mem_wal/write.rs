@@ -1718,6 +1718,14 @@ impl ShardWriter {
     /// the active memtable is empty. Errors in WAL-only mode or if this
     /// writer has been fenced by a successor. Pair with
     /// [`Self::wait_for_flush_drain`] to wait for the queued flush.
+    ///
+    /// Beyond test setup where deterministic flush points are required,
+    /// this is the primary lever for callers that need to drive flushes
+    /// out-of-band from the size/interval triggers — for example, to cap
+    /// resident memtable bytes across many shards in a multi-table WAL
+    /// writer process, or to drain the WAL ahead of a format change so
+    /// the next epoch starts with no replayable entries from the old
+    /// layout.
     #[instrument(name = "sw_force_seal_active", level = "info", skip_all, fields(shard_id = %self.config.shard_id, epoch = self.epoch))]
     pub async fn force_seal_active(&self) -> Result<()> {
         match &self.mode {
@@ -1745,6 +1753,13 @@ impl ShardWriter {
     /// active memtable — call [`Self::force_seal_active`] first if you
     /// want everything-on-disk. Errors in WAL-only mode, or if any
     /// awaited flush reports `DurabilityResult::Failed`.
+    ///
+    /// Useful in tests for deterministic post-flush assertions, and in
+    /// production wherever a caller needs a synchronous fence after
+    /// [`Self::force_seal_active`] — e.g. trimming memtable residency
+    /// across shards in a multi-table WAL writer, or ensuring the WAL
+    /// is fully drained to Lance storage before rolling to a new
+    /// format/epoch.
     #[instrument(name = "sw_wait_for_flush_drain", level = "info", skip_all, fields(shard_id = %self.config.shard_id, epoch = self.epoch))]
     pub async fn wait_for_flush_drain(&self) -> Result<()> {
         let state_lock = match &self.mode {
