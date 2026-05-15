@@ -36,9 +36,10 @@ use super::utils::InstrumentedRecordBatchStreamAdapter;
 /// It's generally more efficient to scan the `_rowaddr` column, but this can be
 /// useful when reading secondary indices, which only have the `_rowid` column.
 ///
-/// The rowid → rowaddr index is materialized once per execution via
-/// [`SharedPrerequisite`] and reused across every batch. The first call to
-/// `execute` kicks off the build; subsequent batches await the same handle.
+/// The rowid → rowaddr index is materialized once per execution via an
+/// internal `SharedPrerequisite` and reused across every batch. The first
+/// call to `execute` kicks off the build; subsequent batches await the same
+/// handle.
 #[derive(Clone)]
 pub struct AddRowAddrExec {
     input: Arc<dyn ExecutionPlan>,
