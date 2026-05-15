@@ -23,7 +23,7 @@ use rangemap::RangeInclusiveMap;
 // Disjoint ranges of row ids are stored as the keys of the map. The values are
 // a pair of segments. The first segment is the row ids, and the second segment
 // is the addresses.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RowIdIndex(RangeInclusiveMap<u64, (U64Segment, U64Segment)>);
 
 #[derive(DeepSizeOf)]
@@ -71,6 +71,41 @@ impl RowIdIndex {
         }
 
         Ok(Self(RangeInclusiveMap::from_iter(final_chunks)))
+    }
+
+    /// Splice additional fragments into the existing index in place,
+    /// avoiding a full rebuild.
+    ///
+    /// Decomposes `new` and verifies the resulting chunks are disjoint from
+    /// each other and from every range already in the index. If so, inserts
+    /// them (O(new segments · log n)) and returns `true`. If any row id
+    /// range overlaps — the updated-and-moved-row case — `self` is left
+    /// unchanged and `false` is returned; the caller must fall back to a
+    /// full [`RowIdIndex::new`] over the complete fragment set, which is the
+    /// proven path for merging overlapping (old-tombstoned + new-owner)
+    /// chunks. Correctness is identical either way; this only skips the
+    /// re-decode + re-merge of already-covered fragments.
+    pub fn try_additive_extend(&mut self, new: &[FragmentRowIdIndex]) -> bool {
+        let mut chunks: Vec<_> = new.iter().flat_map(decompose_sequence).collect();
+        chunks.sort_unstable_by_key(|(range, _)| *range.start());
+        // Sorted by start, so inclusive ranges overlap iff a predecessor's
+        // end reaches the next start.
+        if chunks
+            .windows(2)
+            .any(|pair| pair[0].0.end() >= pair[1].0.start())
+        {
+            return false;
+        }
+        if chunks
+            .iter()
+            .any(|(range, _)| self.0.overlapping(range).next().is_some())
+        {
+            return false;
+        }
+        for (range, value) in chunks {
+            self.0.insert(range, value);
+        }
+        true
     }
 
     /// Get the address for a given row id.
@@ -334,6 +369,53 @@ fn merge_overlapping_chunks(overlapping_chunks: Vec<IndexChunk>) -> Result<Index
 mod tests {
     use super::*;
     use proptest::{prelude::Strategy, prop_assert_eq};
+
+    fn frag(id: u32, seq: RowIdSequence) -> FragmentRowIdIndex {
+        FragmentRowIdIndex {
+            fragment_id: id,
+            row_id_sequence: Arc::new(seq),
+            deletion_vector: Arc::new(DeletionVector::default()),
+        }
+    }
+
+    #[test]
+    fn test_try_additive_extend_disjoint() {
+        let base = frag(10, RowIdSequence(vec![U64Segment::Range(0..10)]));
+        let added = frag(20, RowIdSequence(vec![U64Segment::Range(100..110)]));
+
+        let mut index = RowIdIndex::new(std::slice::from_ref(&base)).unwrap();
+        assert!(index.try_additive_extend(std::slice::from_ref(&added)));
+
+        // Equivalent to a full rebuild over both fragments.
+        let full = RowIdIndex::new(&[base, added]).unwrap();
+        for id in [0u64, 9, 100, 109, 10, 99, 110] {
+            assert_eq!(index.get(id), full.get(id), "mismatch at {id}");
+        }
+    }
+
+    #[test]
+    fn test_try_additive_extend_overlap_is_rejected() {
+        let base = frag(10, RowIdSequence(vec![U64Segment::Range(0..10)]));
+        // Row id range [5, 15) overlaps the already-covered [0, 10).
+        let overlapping = frag(30, RowIdSequence(vec![U64Segment::Range(5..15)]));
+
+        let mut index = RowIdIndex::new(std::slice::from_ref(&base)).unwrap();
+        assert!(!index.try_additive_extend(std::slice::from_ref(&overlapping)));
+        // Rejected: index left exactly as it was (only [0, 10) resolves).
+        assert_eq!(index.get(0), Some(RowAddress::new_from_parts(10, 0)));
+        assert_eq!(index.get(12), None);
+    }
+
+    #[test]
+    fn test_try_additive_extend_overlap_among_new_is_rejected() {
+        let a = frag(40, RowIdSequence(vec![U64Segment::Range(0..10)]));
+        let b = frag(41, RowIdSequence(vec![U64Segment::Range(8..12)]));
+        let mut index = RowIdIndex::empty();
+        // The two new fragments overlap each other, so the additive path
+        // must defer to a full rebuild.
+        assert!(!index.try_additive_extend(&[a, b]));
+        assert_eq!(index.get(0), None);
+    }
 
     #[test]
     fn test_new_index() {

@@ -147,8 +147,12 @@ async fn load_fragment_index(
 }
 
 /// Merge freshly loaded fragments into the shared per-version slot and
-/// return the rebuilt index. Re-checks `covered` under the write lock so a
-/// fragment a concurrent take loaded in parallel is merged exactly once.
+/// return the resulting index. Re-checks `covered` under the write lock so
+/// a fragment a concurrent take loaded in parallel is merged exactly once.
+///
+/// Fast path: splice the new (disjoint) fragments straight into the
+/// existing map. Only when their row id ranges overlap an already-covered
+/// fragment — the updated-and-moved-row case — do we pay a full rebuild.
 fn merge_into_slot(
     slot: &RwLock<Assembled>,
     fresh: Vec<FragmentRowIdIndex>,
@@ -161,14 +165,22 @@ fn merge_into_slot(
             .clone());
     }
     let mut g = slot.write().expect("row id index slot poisoned");
+    let mut truly_new = Vec::with_capacity(fresh.len());
     for fi in fresh {
         if g.covered.insert(fi.fragment_id) {
-            g.fragment_indices.push(fi);
+            truly_new.push(fi);
         }
     }
-    let rebuilt = Arc::new(RowIdIndex::new(&g.fragment_indices)?);
-    g.index = rebuilt.clone();
-    Ok(rebuilt)
+    if truly_new.is_empty() {
+        return Ok(g.index.clone());
+    }
+    if Arc::make_mut(&mut g.index).try_additive_extend(&truly_new) {
+        g.fragment_indices.append(&mut truly_new);
+    } else {
+        g.fragment_indices.append(&mut truly_new);
+        g.index = Arc::new(RowIdIndex::new(&g.fragment_indices)?);
+    }
+    Ok(g.index.clone())
 }
 
 /// Build (or extend) a `RowIdIndex` covering every fragment in the dataset.
