@@ -27,7 +27,7 @@ use lance::dataset::{InsertBuilder, NewColumnTransform};
 use lance_core::datatypes::BlobHandling;
 use lance_io::utils::CachedFileSize;
 use lance_table::format::{
-    DataFile, DeletionFile, DeletionFileType, Fragment, RowDatasetVersionMeta, RowIdHint, RowIdMeta,
+    DataFile, DeletionFile, DeletionFileType, Fragment, RowDatasetVersionMeta, RowIdMeta,
 };
 use lance_table::io::deletion::deletion_file_path;
 use object_store::path::Path;
@@ -778,10 +778,6 @@ impl FromPyObject<'_, '_> for PyLance<Fragment> {
 
         let row_id_meta: Option<PyRef<PyRowIdMeta>> = ob.getattr("row_id_meta")?.extract()?;
         let row_id_meta = row_id_meta.map(|r| r.0.clone());
-        // Derive the routing hint from inline metadata so Python-built
-        // fragments participate in lazy fragment loading. External meta
-        // would require I/O, which doesn't belong on this conversion path.
-        let row_id_hint = row_id_meta.as_ref().and_then(RowIdHint::from_meta);
         let last_updated_at_version_meta: Option<PyRef<PyRowDatasetVersionMeta>> =
             ob.getattr("last_updated_at_version_meta")?.extract()?;
         let last_updated_at_version_meta = last_updated_at_version_meta.map(|r| r.0.clone());
@@ -797,7 +793,6 @@ impl FromPyObject<'_, '_> for PyLance<Fragment> {
             row_id_meta,
             last_updated_at_version_meta,
             created_at_version_meta,
-            row_id_hint,
         }))
     }
 }

@@ -10,7 +10,11 @@
 //!     │    │
 //!     └────┴──► FileMetadataCache (prefixed by file path)
 
-use std::{borrow::Cow, ops::Deref};
+use std::{
+    borrow::Cow,
+    ops::Deref,
+    sync::{Arc, RwLock},
+};
 
 use deepsize::{Context, DeepSizeOf};
 use lance_core::{
@@ -19,9 +23,10 @@ use lance_core::{
 };
 use lance_table::{
     format::{DeletionFile, Manifest},
-    rowids::{RowIdIndex, RowIdSequence},
+    rowids::{FragmentRowIdIndex, RowIdIndex, RowIdSequence},
 };
 use object_store::path::Path;
+use roaring::RoaringBitmap;
 
 use crate::dataset::transaction::Transaction;
 
@@ -148,23 +153,53 @@ impl CacheKey for RowIdSequenceKey {
     }
 }
 
-/// Cache key for an assembled `RowIdIndex`. Keyed by manifest version plus a
-/// hash over the sorted set of fragment ids covered by the index, so the
-/// lazy `build_row_id_index_for` path partitions the cache instead of
-/// skipping it. Full-coverage builds collapse to a single entry per version.
+/// One growing assembled `RowIdIndex` per manifest version.
+///
+/// `index` spans exactly the fragments in `covered`. `fragment_indices`
+/// retains the (Arc'd, already-parsed) inputs so the index can be re-merged
+/// when more fragments are loaded, without re-parsing any sequence or DV.
+/// The lazy take path extends this lazily; the scan path extends it to full
+/// coverage — they share one slot and warm each other.
+pub struct Assembled {
+    pub fragment_indices: Vec<FragmentRowIdIndex>,
+    pub index: Arc<RowIdIndex>,
+    pub covered: RoaringBitmap,
+}
+
+impl Assembled {
+    pub fn empty() -> Self {
+        Self {
+            fragment_indices: Vec::new(),
+            // An empty index resolves every id to `None`, which the lazy
+            // path correctly treats as "not yet covered" and falls through.
+            index: Arc::new(RowIdIndex::empty()),
+            covered: RoaringBitmap::new(),
+        }
+    }
+}
+
+impl DeepSizeOf for Assembled {
+    fn deep_size_of_children(&self, context: &mut Context) -> usize {
+        self.fragment_indices.deep_size_of_children(context)
+            + self.index.deep_size_of_children(context)
+            // RoaringBitmap has no DeepSizeOf impl; mirror DeletionVector.
+            + self.covered.serialized_size()
+    }
+}
+
+/// Cache key for the per-version assembled `RowIdIndex` slot. Keyed by
+/// manifest version only: a DV is mutable across versions but immutable
+/// within one, so each version gets its own slot and a new deletion file
+/// never aliases a stale baked-in DV.
 #[derive(Debug)]
 pub struct RowIdIndexKey {
     pub version: u64,
-    pub fragment_set_hash: u64,
 }
 
 impl CacheKey for RowIdIndexKey {
-    type ValueType = RowIdIndex;
+    type ValueType = RwLock<Assembled>;
     fn key(&self) -> Cow<'_, str> {
-        Cow::Owned(format!(
-            "row_id_index/{}/{:016x}",
-            self.version, self.fragment_set_hash
-        ))
+        Cow::Owned(format!("row_id_index/{}", self.version))
     }
     fn type_name() -> &'static str {
         "RowIdIndex"

@@ -1321,7 +1321,6 @@ mod tests {
                 physical_rows: None,
                 created_at_version_meta: None,
                 last_updated_at_version_meta: None,
-                row_id_hint: None,
             },
             Fragment {
                 id: 1,
@@ -1334,7 +1333,6 @@ mod tests {
                 physical_rows: None,
                 created_at_version_meta: None,
                 last_updated_at_version_meta: None,
-                row_id_hint: None,
             },
         ];
 

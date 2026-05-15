@@ -1046,7 +1046,6 @@ mod test {
                         physical_rows: Some(50),
                         last_updated_at_version_meta: None,
                         created_at_version_meta: None,
-                        row_id_hint: None,
                     }))
                 } else {
                     Ok(None)

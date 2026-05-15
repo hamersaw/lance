@@ -31,7 +31,7 @@ use lance_core::{
     utils::mask::{RowAddrMask, RowAddrTreeMap},
 };
 use lance_io::ReadBatchParams;
-pub use serde::{read_row_ids, write_row_ids};
+pub use serde::{SequenceBound, peek_row_id_bound, read_row_ids, write_row_ids};
 
 use crate::utils::LanceIteratorExtension;
 use lance_core::utils::mask::RowSetOps;

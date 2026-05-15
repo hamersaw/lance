@@ -26,6 +26,7 @@ use rangemap::RangeInclusiveMap;
 #[derive(Debug)]
 pub struct RowIdIndex(RangeInclusiveMap<u64, (U64Segment, U64Segment)>);
 
+#[derive(DeepSizeOf)]
 pub struct FragmentRowIdIndex {
     pub fragment_id: u32,
     pub row_id_sequence: Arc<RowIdSequence>,
@@ -33,6 +34,11 @@ pub struct FragmentRowIdIndex {
 }
 
 impl RowIdIndex {
+    /// An index covering no fragments. Resolves every row id to `None`.
+    pub fn empty() -> Self {
+        Self(RangeInclusiveMap::new())
+    }
+
     /// Create a new index from a list of fragment ids and their corresponding row id sequences.
     pub fn new(fragment_indices: &[FragmentRowIdIndex]) -> Result<Self> {
         let chunks = fragment_indices

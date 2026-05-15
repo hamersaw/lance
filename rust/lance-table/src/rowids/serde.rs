@@ -6,6 +6,7 @@ use lance_core::{Error, Result};
 
 use super::{RowIdSequence, U64Segment, encoded_array::EncodedU64Array};
 use prost::Message;
+use std::ops::RangeInclusive;
 
 impl TryFrom<pb::RowIdSequence> for RowIdSequence {
     type Error = Error;
@@ -203,6 +204,68 @@ pub fn read_row_ids(reader: &[u8]) -> Result<RowIdSequence> {
     RowIdSequence::try_from(pb_sequence)
 }
 
+/// Cheap classification of a serialized row id sequence, used to decide
+/// whether a fragment can be skipped without paying the full parse.
+pub enum SequenceBound {
+    /// Every segment is range-shaped, so a conservative inclusive `[min,max]`
+    /// was derived from the protobuf scalar fields alone — the packed array
+    /// payloads were *not* re-materialized. A value inside the range is not
+    /// guaranteed to exist (segments may be sparse); a value outside it is
+    /// guaranteed absent.
+    Bounded(RangeInclusive<u64>),
+    /// The sequence owns no row ids.
+    Empty,
+    /// At least one `SortedArray`/`Array` segment: its bound lives inside the
+    /// packed payload, so no cheap bound is possible. We had to decode the
+    /// envelope anyway, so the fully parsed sequence is returned to avoid a
+    /// second decode at the call site.
+    Opaque(RowIdSequence),
+}
+
+/// Decode the `pb::RowIdSequence` envelope once and classify it without the
+/// expensive `EncodedU64Array` re-materialization, *unless* an array-shaped
+/// segment forces a full parse. See [`SequenceBound`].
+pub fn peek_row_id_bound(reader: &[u8]) -> Result<SequenceBound> {
+    use pb::u64_segment as pb_seg;
+    use pb::u64_segment::Segment::*;
+
+    let pb_sequence = pb::RowIdSequence::decode(reader)?;
+
+    let mut min: Option<u64> = None;
+    let mut max: Option<u64> = None;
+    let mut has_array_segment = false;
+    for segment in &pb_sequence.segments {
+        match &segment.segment {
+            None => return Err(Error::invalid_input("missing segment type")),
+            Some(
+                Range(pb_seg::Range { start, end })
+                | RangeWithHoles(pb_seg::RangeWithHoles { start, end, .. })
+                | RangeWithBitmap(pb_seg::RangeWithBitmap { start, end, .. }),
+            ) => {
+                // Mirror `U64Segment::range()`: an empty range owns nothing.
+                if end > start {
+                    min = Some(min.map_or(*start, |m| m.min(*start)));
+                    max = Some(max.map_or(end - 1, |m| m.max(end - 1)));
+                }
+            }
+            Some(SortedArray(_) | Array(_)) => {
+                has_array_segment = true;
+                break;
+            }
+        }
+    }
+
+    if has_array_segment {
+        // Borrow released above; finish the parse we already started.
+        return Ok(SequenceBound::Opaque(RowIdSequence::try_from(pb_sequence)?));
+    }
+
+    match (min, max) {
+        (Some(min), Some(max)) => Ok(SequenceBound::Bounded(min..=max)),
+        _ => Ok(SequenceBound::Empty),
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -235,5 +298,57 @@ mod test {
         let sequence2 = read_row_ids(&serialized).unwrap();
 
         assert_eq!(sequence.0, sequence2.0);
+    }
+
+    #[test]
+    fn test_peek_row_id_bound_range_shaped() {
+        let mut sequence = RowIdSequence::from(0..20); // [0, 19]
+        sequence.0.push(U64Segment::Range(30..100)); // [30, 99]
+        sequence.0.push(U64Segment::RangeWithHoles {
+            range: 100..200, // [100, 199]
+            holes: EncodedU64Array::U64(vec![104, 108, 150]),
+        });
+        sequence.0.push(U64Segment::RangeWithBitmap {
+            range: 200..300, // [200, 299]
+            bitmap: Bitmap::new_empty(100),
+        });
+        let serialized = write_row_ids(&sequence);
+
+        match peek_row_id_bound(&serialized).unwrap() {
+            SequenceBound::Bounded(r) => assert_eq!(r, 0..=299),
+            _ => panic!("expected Bounded"),
+        }
+    }
+
+    #[test]
+    fn test_peek_row_id_bound_empty() {
+        // No segments at all, and an explicitly empty range, both own nothing.
+        for sequence in [RowIdSequence::default(), {
+            let mut s = RowIdSequence::default();
+            s.0.push(U64Segment::Range(5..5));
+            s
+        }] {
+            let serialized = write_row_ids(&sequence);
+            assert!(matches!(
+                peek_row_id_bound(&serialized).unwrap(),
+                SequenceBound::Empty
+            ));
+        }
+    }
+
+    #[test]
+    fn test_peek_row_id_bound_opaque_falls_back_to_full_parse() {
+        let mut sequence = RowIdSequence::from(0..20);
+        sequence
+            .0
+            .push(U64Segment::Array(EncodedU64Array::U64(vec![99, 50, 70])));
+        let serialized = write_row_ids(&sequence);
+
+        match peek_row_id_bound(&serialized).unwrap() {
+            SequenceBound::Opaque(parsed) => {
+                assert_eq!(parsed.0, read_row_ids(&serialized).unwrap().0);
+            }
+            _ => panic!("expected Opaque for an array-shaped segment"),
+        }
     }
 }

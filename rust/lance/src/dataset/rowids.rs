@@ -2,16 +2,18 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::Dataset;
-use crate::session::caches::{RowIdIndexKey, RowIdSequenceKey};
+use crate::session::caches::{Assembled, RowIdIndexKey, RowIdSequenceKey};
 use crate::{Error, Result};
 use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::utils::deletion::DeletionVector;
 use lance_table::{
-    format::{Fragment, RowIdHint, RowIdMeta},
-    rowids::{FragmentRowIdIndex, RowIdIndex, RowIdSequence, read_row_ids},
+    format::{Fragment, RowIdMeta},
+    rowids::{
+        FragmentRowIdIndex, RowIdIndex, RowIdSequence, SequenceBound, peek_row_id_bound,
+        read_row_ids,
+    },
 };
-use std::hash::{Hash, Hasher};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 /// Load a row id sequence from the given dataset and fragment.
 pub async fn load_row_id_sequence(
@@ -83,158 +85,138 @@ pub async fn get_row_id_index(
     get_full_row_id_index(dataset).await
 }
 
-/// Build (or fetch from cache) a `RowIdIndex` covering every fragment in
-/// the dataset. Suitable for streaming execs like `AddRowAddrExec` that
-/// need to translate arbitrary row ids and would otherwise rebuild the
-/// index per batch.
+/// Fetch (creating if absent) the per-manifest-version assembled-index slot.
+/// Initialization is cheap and does no I/O — the slot starts empty and is
+/// grown lazily by the take path and to full coverage by the scan path.
+async fn get_row_id_index_slot(dataset: &Dataset) -> Result<Arc<RwLock<Assembled>>> {
+    let key = RowIdIndexKey {
+        version: dataset.manifest.version,
+    };
+    dataset
+        .metadata_cache
+        .get_or_insert_with_key(key, || async { Ok(RwLock::new(Assembled::empty())) })
+        .await
+}
+
+/// Manifest fragments ordered newest-first (descending id). Updated stable
+/// rows live in the newest owning fragment, so a take tends to resolve on
+/// the first cold candidate(s), maximizing fast-stop.
+fn fragments_newest_first(fragments: &[Fragment]) -> Vec<&Fragment> {
+    let mut v: Vec<&Fragment> = fragments.iter().collect();
+    v.sort_unstable_by(|a, b| b.id.cmp(&a.id));
+    v
+}
+
+/// Load one fragment's `FragmentRowIdIndex` (row id sequence + deletion
+/// vector). The sequence goes through the per-fragment cache; `parsed`
+/// lets the caller hand back a sequence it already decoded (the `Opaque`
+/// peek result) so the inline bytes are not decoded twice.
+async fn load_fragment_index(
+    dataset: &Dataset,
+    fragment: &Fragment,
+    parsed: Option<RowIdSequence>,
+) -> Result<FragmentRowIdIndex> {
+    let fragment_id = fragment.id as u32;
+    let row_id_sequence = match parsed {
+        Some(seq) => {
+            // Seed (or reuse) the per-fragment cache without re-decoding.
+            let key = RowIdSequenceKey {
+                fragment_id: fragment.id,
+            };
+            dataset
+                .metadata_cache
+                .get_or_insert_with_key(key, || async move { Ok(seq) })
+                .await?
+        }
+        None => load_row_id_sequence(dataset, fragment).await?,
+    };
+    let deletion_vector = match dataset.get_fragment(fragment.id as usize) {
+        Some(ff) if ff.metadata().deletion_file.is_some() => ff
+            .get_deletion_vector()
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default(),
+        _ => Arc::new(DeletionVector::default()),
+    };
+    Ok(FragmentRowIdIndex {
+        fragment_id,
+        row_id_sequence,
+        deletion_vector,
+    })
+}
+
+/// Merge freshly loaded fragments into the shared per-version slot and
+/// return the rebuilt index. Re-checks `covered` under the write lock so a
+/// fragment a concurrent take loaded in parallel is merged exactly once.
+fn merge_into_slot(
+    slot: &RwLock<Assembled>,
+    fresh: Vec<FragmentRowIdIndex>,
+) -> Result<Arc<RowIdIndex>> {
+    if fresh.is_empty() {
+        return Ok(slot
+            .read()
+            .expect("row id index slot poisoned")
+            .index
+            .clone());
+    }
+    let mut g = slot.write().expect("row id index slot poisoned");
+    for fi in fresh {
+        if g.covered.insert(fi.fragment_id) {
+            g.fragment_indices.push(fi);
+        }
+    }
+    let rebuilt = Arc::new(RowIdIndex::new(&g.fragment_indices)?);
+    g.index = rebuilt.clone();
+    Ok(rebuilt)
+}
+
+/// Build (or extend) a `RowIdIndex` covering every fragment in the dataset.
+/// Suitable for streaming execs like `AddRowAddrExec` that translate
+/// arbitrary row ids. Shares the per-version slot with the lazy take path,
+/// so a scan warms it to full coverage and subsequent takes hit phase 0.
 pub async fn get_full_row_id_index(dataset: &Dataset) -> Result<Option<Arc<RowIdIndex>>> {
     if !dataset.manifest.uses_stable_row_ids() {
         return Ok(None);
     }
-    let fragments = &dataset.manifest.fragments;
-    let fragment_ids: Vec<u32> = fragments.iter().map(|f| f.id as u32).collect();
-    let index = get_or_build_index_for_ids(dataset, fragments, fragment_ids).await?;
-    Ok(Some(index))
-}
-
-/// Hash of a sorted-unique set of fragment ids. Used as part of the cache
-/// key so two callers requesting the same fragment set share one entry.
-fn hash_fragment_ids(sorted_ids: &[u32]) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    sorted_ids.hash(&mut hasher);
-    hasher.finish()
-}
-
-/// Build a `RowIdIndex` over the supplied fragments, going through the
-/// session cache. The caller is responsible for passing the exact fragment
-/// set to include — the cache key is derived from it.
-async fn get_or_build_index_for_ids(
-    dataset: &Dataset,
-    all_fragments: &[Fragment],
-    mut fragment_ids: Vec<u32>,
-) -> Result<Arc<RowIdIndex>> {
-    fragment_ids.sort_unstable();
-    fragment_ids.dedup();
-    let key = RowIdIndexKey {
-        version: dataset.manifest.version,
-        fragment_set_hash: hash_fragment_ids(&fragment_ids),
-    };
-
-    // Resolve fragment refs once so we can hand them to the build closure
-    // without re-scanning the manifest on cache hit.
-    let candidate_refs: Vec<&Fragment> = {
-        let id_set: std::collections::HashSet<u32> = fragment_ids.iter().copied().collect();
-        all_fragments
-            .iter()
-            .filter(|f| id_set.contains(&(f.id as u32)))
-            .collect()
-    };
-
-    dataset
-        .metadata_cache
-        .get_or_insert_with_key(key, || load_row_id_index_for_refs(dataset, candidate_refs))
-        .await
-}
-
-/// Assemble a `RowIdIndex` from the given fragment references. Loads each
-/// fragment's row id sequence (cached per-fragment) and deletion vector.
-async fn load_row_id_index_for_refs<'a>(
-    dataset: &'a Dataset,
-    fragments: Vec<&'a Fragment>,
-) -> Result<RowIdIndex> {
-    // Materialize per-fragment futures eagerly so the stream's closure
-    // doesn't need to be HRTB-general — each future captures concrete
-    // references tied to 'a.
-    let sequence_futs: Vec<_> = fragments
+    let slot = get_row_id_index_slot(dataset).await?;
+    let covered = slot
+        .read()
+        .expect("row id index slot poisoned")
+        .covered
+        .clone();
+    let missing: Vec<&Fragment> = dataset
+        .manifest
+        .fragments
         .iter()
-        .map(|&fragment| {
-            let fragment_id = fragment.id as u32;
-            let fut = load_row_id_sequence(dataset, fragment);
-            async move { fut.await.map(|seq| (fragment_id, seq)) }
-        })
+        .filter(|f| !covered.contains(f.id as u32))
         .collect();
-    let sequences: Vec<(u32, Arc<RowIdSequence>)> = futures::stream::iter(sequence_futs)
-        .buffer_unordered(dataset.object_store.io_parallelism())
-        .try_collect()
-        .await?;
-
-    let all_fragments = dataset.get_fragments();
-    let fragment_map: std::collections::HashMap<u32, &crate::dataset::fragment::FileFragment> =
-        all_fragments.iter().map(|f| (f.id() as u32, f)).collect();
-
-    let fragment_indices: Vec<_> =
-        futures::stream::iter(sequences.into_iter().map(|(fragment_id, sequence)| {
-            let fragment = fragment_map
-                .get(&fragment_id)
-                .expect("Fragment should exist");
-            let has_deletion_file = fragment.metadata().deletion_file.is_some();
-            let fragment_clone = (*fragment).clone();
-            async move {
-                let deletion_vector = if has_deletion_file {
-                    match fragment_clone.get_deletion_vector().await {
-                        Ok(Some(dv)) => dv,
-                        Ok(None) | Err(_) => Arc::new(DeletionVector::default()),
-                    }
-                } else {
-                    Arc::new(DeletionVector::default())
-                };
-
-                Ok::<FragmentRowIdIndex, Error>(FragmentRowIdIndex {
-                    fragment_id,
-                    row_id_sequence: sequence,
-                    deletion_vector,
-                })
-            }
-        }))
-        .buffer_unordered(dataset.object_store.io_parallelism())
-        .try_collect()
-        .await?;
-
-    RowIdIndex::new(&fragment_indices)
-}
-
-/// Threshold above which we sort the row id slice and binary-search per
-/// fragment hint, instead of doing a linear scan per fragment. Small lookup
-/// batches (the common take-by-rowid case) skip the up-front sort cost.
-const HINT_SORT_THRESHOLD: usize = 32;
-
-/// Return the ids of fragments that could own at least one of the requested
-/// row ids. Fragments without a hint are always included (legacy data).
-fn select_candidate_fragment_ids(fragments: &[Fragment], row_ids: &[u64]) -> Vec<u32> {
-    let sorted_ids: Option<Vec<u64>> = if row_ids.len() > HINT_SORT_THRESHOLD {
-        let mut v = row_ids.to_vec();
-        v.sort_unstable();
-        Some(v)
-    } else {
-        None
-    };
-
-    fragments
+    if missing.is_empty() {
+        return Ok(Some(
+            slot.read()
+                .expect("row id index slot poisoned")
+                .index
+                .clone(),
+        ));
+    }
+    let load_futs: Vec<_> = missing
         .iter()
-        .filter_map(|frag| {
-            let include = match &frag.row_id_hint {
-                None => true,
-                Some(RowIdHint::MinMax { min, max }) => match &sorted_ids {
-                    Some(sorted) => {
-                        let pos = sorted.partition_point(|id| id < min);
-                        sorted.get(pos).is_some_and(|id| id <= max)
-                    }
-                    None => row_ids.iter().any(|id| min <= id && id <= max),
-                },
-            };
-            include.then_some(frag.id as u32)
-        })
-        .collect()
+        .map(|&f| load_fragment_index(dataset, f, None))
+        .collect();
+    let fresh: Vec<FragmentRowIdIndex> = futures::stream::iter(load_futs)
+        .buffer_unordered(dataset.object_store.io_parallelism())
+        .try_collect()
+        .await?;
+    Ok(Some(merge_into_slot(&slot, fresh)?))
 }
 
-/// Build a `RowIdIndex` covering only the fragments that could own the
-/// requested row ids. Falls back to `None` for non-stable-rowid datasets.
+/// Build a `RowIdIndex` that resolves the requested `row_ids`. Returns
+/// `None` for non-stable-rowid datasets.
 ///
-/// Lazy-loading entry point: a take that touches one fragment only pays
-/// I/O for that fragment's row id sequence and deletion vector. The result
-/// is memoized via the session cache, keyed by (manifest version, sorted
-/// candidate fragment id set), so repeated queries against the same set
-/// reuse the assembled index.
+/// Phase 0 resolves against the cached per-version index (zero I/O). Phase
+/// 1 loads only the uncovered fragments that could own a still-unresolved
+/// id — gated by a cheap inline-metadata bound peek — and merges them into
+/// the shared slot, stopping as soon as every requested id is resolved.
 pub async fn build_row_id_index_for(
     dataset: &Dataset,
     row_ids: &[u64],
@@ -242,10 +224,66 @@ pub async fn build_row_id_index_for(
     if !dataset.manifest.uses_stable_row_ids() {
         return Ok(None);
     }
-    let candidate_ids = select_candidate_fragment_ids(&dataset.manifest.fragments, row_ids);
-    let index =
-        get_or_build_index_for_ids(dataset, &dataset.manifest.fragments, candidate_ids).await?;
-    Ok(Some(index))
+    let slot = get_row_id_index_slot(dataset).await?;
+
+    // Fast-stop working set: ids still needing a live resolution.
+    let mut pending: std::collections::HashSet<u64> = row_ids.iter().copied().collect();
+
+    // Phase 0 — warm: resolve against the cached index. `get() == Some` is a
+    // definitive live resolution (the DV is baked into the index).
+    let cached = {
+        let g = slot.read().expect("row id index slot poisoned");
+        g.index.clone()
+    };
+    pending.retain(|&id| cached.get(id).is_none());
+    if pending.is_empty() {
+        return Ok(Some(cached));
+    }
+
+    // Phase 1 — cold: load uncovered candidate fragments, newest first.
+    let covered_snapshot = slot
+        .read()
+        .expect("row id index slot poisoned")
+        .covered
+        .clone();
+    let mut fresh: Vec<FragmentRowIdIndex> = Vec::new();
+    for fragment in fragments_newest_first(&dataset.manifest.fragments) {
+        if pending.is_empty() {
+            break;
+        }
+        if covered_snapshot.contains(fragment.id as u32) {
+            continue;
+        }
+        let (is_candidate, parsed) = match &fragment.row_id_meta {
+            Some(RowIdMeta::Inline(bytes)) => match peek_row_id_bound(bytes)? {
+                SequenceBound::Empty => (false, None),
+                SequenceBound::Bounded(range) => {
+                    (pending.iter().any(|id| range.contains(id)), None)
+                }
+                SequenceBound::Opaque(seq) => (true, Some(seq)),
+            },
+            // External sequence: cannot peek without I/O — mandatory candidate.
+            Some(RowIdMeta::External(_)) => (true, None),
+            None => {
+                return Err(Error::internal(format!(
+                    "Fragment {} missing row id meta under stable row ids",
+                    fragment.id
+                )));
+            }
+        };
+        if !is_candidate {
+            continue;
+        }
+        let fi = load_fragment_index(dataset, fragment, parsed).await?;
+        // Live-resolution probe (invariant 1): a single-fragment index bakes
+        // in this fragment's DV, so a tombstoned (moved) id resolves to
+        // `None` here and stays pending for its real owner.
+        let probe = RowIdIndex::new(std::slice::from_ref(&fi))?;
+        pending.retain(|&id| probe.get(id).is_none());
+        fresh.push(fi);
+    }
+
+    Ok(Some(merge_into_slot(&slot, fresh)?))
 }
 
 #[cfg(test)]
@@ -829,9 +867,11 @@ mod test {
         assert_eq!(full.get(num_rows), lazy.get(num_rows));
     }
 
-    /// After updating a row, the absorbing fragment's hint widens to include
-    /// the moved row id. Translation must still resolve correctly even when
-    /// multiple fragments are candidates for the same id.
+    /// Invariant 1: an updated row keeps its stable id but physically moves
+    /// to a new fragment; the old fragment carries a tombstone whose range
+    /// still covers the id. The lazy translator must resolve to the live
+    /// (new) owner, never the tombstoned slot — even though the old fragment
+    /// is also a range candidate.
     #[tokio::test]
     async fn test_lazy_index_handles_update_overlap() {
         let num_rows = 30u64;
@@ -849,10 +889,6 @@ mod test {
         .await
         .unwrap();
 
-        // Update an "early" row (id=2). With stable row ids the rowid stays
-        // the same, but the row physically moves to a new fragment, so that
-        // new fragment's hint will straddle a wide range that overlaps with
-        // the original fragment's hint.
         let updated = UpdateBuilder::new(Arc::new(dataset))
             .update_where("id = 2")
             .unwrap()
@@ -865,41 +901,80 @@ mod test {
             .unwrap()
             .new_dataset;
 
-        // Confirm we have at least two fragments whose hints both cover
-        // rowid 2 — that's the overlap case the lazy translator must handle.
-        let candidates: Vec<_> = updated
-            .manifest
-            .fragments
-            .iter()
-            .filter(|f| match &f.row_id_hint {
-                Some(h) => h.could_contain(2),
-                None => true,
-            })
-            .collect();
+        // The update must have produced an extra fragment for the moved row.
         assert!(
-            candidates.len() >= 2,
-            "Expected at least two candidate fragments for the moved row id, got {}",
-            candidates.len(),
+            updated.manifest.fragments.len() >= 2,
+            "expected the update to add a fragment, got {}",
+            updated.manifest.fragments.len(),
         );
 
         // The lazy index must resolve rowid 2 to the new fragment, not the
-        // original (which has a tombstone).
+        // tombstoned original, and agree with the full index.
         let lazy = build_row_id_index_for(&updated, &[2])
             .await
             .unwrap()
             .unwrap();
         let resolved = lazy.get(2).expect("rowid 2 must resolve after update");
-        // Resolved address must match the eager index's view of the world.
         let full = get_row_id_index(&updated).await.unwrap().unwrap();
         assert_eq!(full.get(2), Some(resolved));
     }
 
-    /// Backward-compat: a fragment without a row_id_hint (legacy data) must
-    /// still resolve correctly through the lazy translator. The translator
-    /// treats it as a candidate for every row id, so it loads the sequence
-    /// and routes accordingly — same correctness, no IOP improvement.
+    /// The per-version slot grows monotonically: a take only ingests the
+    /// fragments that could own a requested id, and a later take reuses what
+    /// is already covered while extending with what is not.
     #[tokio::test]
-    async fn test_lazy_index_handles_missing_hint() {
+    async fn test_lazy_index_incremental_growth() {
+        let num_rows = 60u64;
+        let batch = sequence_batch(0..num_rows as i32);
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                max_rows_per_file: 10,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        // Contiguous write: rowid i lives in fragment i / 10.
+        assert_eq!(dataset.manifest.fragments.len(), 6);
+
+        // First take only needs fragment 0.
+        let idx = build_row_id_index_for(&dataset, &[5])
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(idx.get(5).is_some());
+        let slot = get_row_id_index_slot(&dataset).await.unwrap();
+        {
+            let g = slot.read().unwrap();
+            assert!(g.covered.contains(0), "fragment 0 must be covered");
+            assert!(
+                !g.covered.contains(5),
+                "fragment 5 must NOT be loaded by a take for rowid 5",
+            );
+        }
+
+        // Second take extends the slot with fragment 5 and keeps fragment 0.
+        let idx = build_row_id_index_for(&dataset, &[55])
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(idx.get(55).is_some());
+        assert!(idx.get(5).is_some(), "previously covered id still resolves");
+        {
+            let g = slot.read().unwrap();
+            assert!(g.covered.contains(0) && g.covered.contains(5));
+        }
+    }
+
+    /// The slot is keyed by manifest version. A delete creates a new version
+    /// with a tombstone; the new version's slot must resolve the deleted id
+    /// to `None` while the pre-delete version still resolves it.
+    #[tokio::test]
+    async fn test_lazy_index_version_isolation() {
         let num_rows = 20u64;
         let batch = sequence_batch(0..num_rows as i32);
         let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
@@ -915,25 +990,60 @@ mod test {
         .await
         .unwrap();
 
-        // Strip the hints from every fragment to simulate legacy data.
-        let mut new_manifest = (*dataset.manifest).clone();
-        let mut new_fragments = (*new_manifest.fragments).clone();
-        for f in &mut new_fragments {
-            f.row_id_hint = None;
-        }
-        new_manifest.fragments = Arc::new(new_fragments);
-        dataset.manifest = Arc::new(new_manifest);
+        let before = dataset.clone();
+        dataset.delete("id = 3").await.unwrap();
 
-        // Lookups must still resolve — falling back to load all fragments.
-        for id in 0..num_rows {
-            let lazy = build_row_id_index_for(&dataset, &[id])
-                .await
-                .unwrap()
-                .unwrap();
-            assert!(
-                lazy.get(id).is_some(),
-                "rowid {id} must resolve when hints are absent",
-            );
+        let after = build_row_id_index_for(&dataset, &[3, 4])
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(after.get(3).is_none(), "deleted rowid must not resolve");
+        assert!(after.get(4).is_some(), "surviving rowid must resolve");
+
+        let prev = build_row_id_index_for(&before, &[3])
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            prev.get(3).is_some(),
+            "pre-delete version must still resolve rowid 3",
+        );
+    }
+
+    /// Concurrent takes for disjoint ids must each resolve correctly and the
+    /// shared slot must end up covering every needed fragment exactly once.
+    #[tokio::test]
+    async fn test_lazy_index_concurrent_takes() {
+        let num_rows = 60u64;
+        let batch = sequence_batch(0..num_rows as i32);
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                max_rows_per_file: 10,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let (a, b, c) = tokio::join!(
+            build_row_id_index_for(&dataset, &[5]),
+            build_row_id_index_for(&dataset, &[25]),
+            build_row_id_index_for(&dataset, &[55]),
+        );
+        assert!(a.unwrap().unwrap().get(5).is_some());
+        assert!(b.unwrap().unwrap().get(25).is_some());
+        assert!(c.unwrap().unwrap().get(55).is_some());
+
+        let slot = get_row_id_index_slot(&dataset).await.unwrap();
+        let g = slot.read().unwrap();
+        for fid in [0u32, 2, 5] {
+            assert!(g.covered.contains(fid), "fragment {fid} must be covered");
         }
+        // Each covered fragment appears once (no double-merge under races).
+        assert_eq!(g.fragment_indices.len() as u64, g.covered.len());
     }
 }
