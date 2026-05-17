@@ -40,8 +40,8 @@ pub type ActiveMemTableRef = InMemoryMemTableRef;
 pub struct InMemoryMemTables {
     /// The single live memtable accepting writes.
     pub active: InMemoryMemTableRef,
-    /// Frozen memtables awaiting flush; order is irrelevant — dedup orders
-    /// by `generation`.
+    /// Frozen memtables awaiting flush; element order is irrelevant — the
+    /// collector sorts in-memory sources by `generation` before the scan.
     pub frozen: Vec<InMemoryMemTableRef>,
 }
 
@@ -147,16 +147,27 @@ impl LsmDataSourceCollector {
         &self.in_memory_memtables
     }
 
-    /// One [`LsmDataSource::ActiveMemTable`] per in-memory memtable —
-    /// active or frozen are the same shape, distinguished by `generation`.
-    fn memtable_source(shard_id: Uuid, m: &InMemoryMemTableRef) -> LsmDataSource {
-        LsmDataSource::ActiveMemTable {
-            batch_store: m.batch_store.clone(),
-            index_store: m.index_store.clone(),
-            schema: m.schema.clone(),
-            shard_id,
-            generation: LsmGeneration::memtable(m.generation),
-        }
+    /// A shard's in-memory memtables (active + frozen-awaiting-flush) as
+    /// scan sources, in **ascending generation order**. The planner relies
+    /// on this: it reverses sources to generation-DESC so the newest row
+    /// wins the dedup tiebreaker (see `LsmScanPlanner::plan_scan`). Active
+    /// is the newest generation; frozen are older sealed ones — so without
+    /// this sort a stale frozen row could outrank a re-write in the active
+    /// memtable for the same pk.
+    fn in_memory_sources(shard_id: Uuid, mems: &InMemoryMemTables) -> Vec<LsmDataSource> {
+        let mut refs: Vec<&InMemoryMemTableRef> = std::iter::once(&mems.active)
+            .chain(mems.frozen.iter())
+            .collect();
+        refs.sort_by_key(|m| m.generation);
+        refs.into_iter()
+            .map(|m| LsmDataSource::ActiveMemTable {
+                batch_store: m.batch_store.clone(),
+                index_store: m.index_store.clone(),
+                schema: m.schema.clone(),
+                shard_id,
+                generation: LsmGeneration::memtable(m.generation),
+            })
+            .collect()
     }
 
     /// Collect all data sources.
@@ -186,12 +197,7 @@ impl LsmDataSourceCollector {
         }
 
         for (shard_id, mems) in &self.in_memory_memtables {
-            sources.push(Self::memtable_source(*shard_id, &mems.active));
-            sources.extend(
-                mems.frozen
-                    .iter()
-                    .map(|m| Self::memtable_source(*shard_id, m)),
-            );
+            sources.extend(Self::in_memory_sources(*shard_id, mems));
         }
 
         Ok(sources)
@@ -233,12 +239,7 @@ impl LsmDataSourceCollector {
                 continue;
             }
 
-            sources.push(Self::memtable_source(*shard_id, &mems.active));
-            sources.extend(
-                mems.frozen
-                    .iter()
-                    .map(|m| Self::memtable_source(*shard_id, m)),
-            );
+            sources.extend(Self::in_memory_sources(*shard_id, mems));
         }
 
         Ok(sources)
@@ -329,5 +330,58 @@ mod tests {
         };
 
         assert_eq!(memtable_ref.generation, 5);
+    }
+
+    fn memtable_ref(generation: u64) -> InMemoryMemTableRef {
+        InMemoryMemTableRef {
+            batch_store: Arc::new(BatchStore::with_capacity(8)),
+            index_store: Arc::new(IndexStore::new()),
+            schema: Arc::new(arrow_schema::Schema::empty()),
+            generation,
+        }
+    }
+
+    /// Regression for the concurrent-read-vs-flush hole: frozen-awaiting-
+    /// flush memtables must reach the scan as their own sources alongside
+    /// the active one, so a reader sees no gap while a flush drains.
+    #[test]
+    fn test_collect_includes_active_and_frozen() {
+        let shard = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        // Frozen deliberately out of order to prove the collector sorts.
+        let mems = InMemoryMemTables {
+            active: memtable_ref(5),
+            frozen: vec![memtable_ref(4), memtable_ref(3)],
+        };
+
+        let collector = LsmDataSourceCollector::without_base_table("/tmp/x", vec![])
+            .with_in_memory_memtables(shard, mems);
+
+        // One source per in-memory memtable, in ascending generation order
+        // (the planner reverses to gen-DESC for the dedup tiebreaker, so a
+        // stale frozen row must not outrank a re-write in the active one).
+        // num_sources() must account for frozen too.
+        assert_eq!(collector.num_sources(), 3);
+        let sources = collector.collect().unwrap();
+        assert_eq!(sources.len(), 3);
+        assert!(sources.iter().all(|s| s.is_active_memtable()));
+        assert!(sources.iter().all(|s| s.shard_id() == Some(shard)));
+        let gens: Vec<u64> = sources.iter().map(|s| s.generation().as_u64()).collect();
+        assert_eq!(gens, vec![3, 4, 5]);
+
+        // Shard pruning keeps the active+frozen set together, all-or-nothing.
+        assert!(
+            collector
+                .collect_for_shards(&HashSet::from([other]))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            collector
+                .collect_for_shards(&HashSet::from([shard]))
+                .unwrap()
+                .len(),
+            3
+        );
     }
 }

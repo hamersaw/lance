@@ -3288,6 +3288,8 @@ mod tests {
         assert!(err.to_string().contains("WAL-only mode"));
         let err = writer.active_memtable_ref().await.err().unwrap();
         assert!(err.to_string().contains("WAL-only mode"));
+        let err = writer.in_memory_memtable_refs().await.err().unwrap();
+        assert!(err.to_string().contains("WAL-only mode"));
 
         writer.close().await.unwrap();
     }
@@ -4020,6 +4022,130 @@ mod tests {
         assert_eq!(manifest.flushed_generations.len(), flushed_before + 1);
 
         writer.close().await.unwrap();
+    }
+
+    /// On a successful flush commit the sealed generation is dropped from
+    /// the queryable set (no leak), and its rows land in the manifest.
+    #[tokio::test]
+    async fn test_frozen_dropped_after_successful_flush() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = create_test_schema();
+        let config = ShardWriterConfig {
+            shard_id: Uuid::new_v4(),
+            shard_spec_id: 0,
+            durable_write: false,
+            sync_indexed_write: false,
+            max_wal_buffer_size: 64 * 1024 * 1024,
+            max_wal_flush_interval: None,
+            max_memtable_size: 64 * 1024 * 1024,
+            manifest_scan_batch_size: 2,
+            ..Default::default()
+        };
+        let writer = ShardWriter::open(store, base_path, base_uri, config, schema.clone(), vec![])
+            .await
+            .unwrap();
+
+        let initial_gen = writer.memtable_stats().await.unwrap().generation;
+        writer
+            .put(vec![create_test_batch(&schema, 0, 10)])
+            .await
+            .unwrap();
+        writer.force_seal_active().await.unwrap();
+        writer.wait_for_flush_drain().await.unwrap();
+
+        let refs = writer.in_memory_memtable_refs().await.unwrap();
+        assert!(
+            refs.frozen.is_empty(),
+            "frozen handle must be dropped once the flush commit lands"
+        );
+        assert_eq!(refs.active.generation, initial_gen + 1);
+
+        let manifest = writer.manifest().await.unwrap().expect("manifest exists");
+        assert!(
+            manifest
+                .flushed_generations
+                .iter()
+                .any(|g| g.generation == initial_gen),
+            "flushed generation must be recorded in the manifest"
+        );
+
+        writer.close().await.unwrap();
+    }
+
+    /// Regression: a transient flush failure must NOT reopen the
+    /// concurrent-read-vs-flush hole. The sealed generation stays in the
+    /// queryable set (rows intact) until a later flush or WAL replay.
+    /// Failure is induced deterministically by fencing the writer with a
+    /// successor before the seal, so the flush's `check_fenced` rejects it.
+    #[tokio::test]
+    async fn test_frozen_retained_after_failed_flush() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = create_test_schema();
+        let shard_id = Uuid::new_v4();
+
+        let writer_a = ShardWriter::open(
+            store.clone(),
+            base_path.clone(),
+            base_uri.clone(),
+            memtable_config_with_pk(shard_id),
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        let initial_gen = writer_a.memtable_stats().await.unwrap().generation;
+        writer_a
+            .put(vec![create_test_batch(&schema, 0, 10)])
+            .await
+            .unwrap();
+
+        // Successor claims a higher epoch, fencing A.
+        let writer_b = ShardWriter::open(
+            store,
+            base_path,
+            base_uri,
+            memtable_config_with_pk(shard_id),
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+        assert!(writer_b.epoch() > writer_a.epoch());
+
+        // `force_seal_active` would reject up-front on a fenced writer;
+        // freeze directly so the failure surfaces at flush-commit time —
+        // exactly the freeze/flush race the fix guards.
+        match &writer_a.mode {
+            WriterMode::MemTable {
+                state,
+                writer_state,
+                ..
+            } => {
+                let mut st = state.write().await;
+                writer_state.freeze_memtable(&mut st).unwrap();
+            }
+            WriterMode::WalOnly { .. } => unreachable!("opened in memtable mode"),
+        }
+
+        // The fenced flush fails; the drain surfaces that error.
+        assert!(
+            writer_a.wait_for_flush_drain().await.is_err(),
+            "fenced flush should fail the drain"
+        );
+
+        // The hole did not reopen: the sealed generation is still queryable
+        // with its rows, alongside the new (empty) active generation.
+        let refs = writer_a.in_memory_memtable_refs().await.unwrap();
+        assert_eq!(refs.frozen.len(), 1, "sealed generation must be retained");
+        assert_eq!(refs.frozen[0].generation, initial_gen);
+        assert!(
+            !refs.frozen[0].batch_store.is_empty(),
+            "retained sealed memtable must still hold its rows"
+        );
+        assert_eq!(refs.active.generation, initial_gen + 1);
+
+        writer_b.close().await.unwrap();
     }
 }
 
