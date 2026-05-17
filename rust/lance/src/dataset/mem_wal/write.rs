@@ -686,12 +686,32 @@ struct WriterState {
     frozen_memtable_bytes: usize,
     /// Flush watchers for frozen memtables (for backpressure).
     frozen_flush_watchers: VecDeque<(usize, DurabilityWatcher)>,
+    /// Sealed-but-undrained memtables, kept queryable so a concurrent reader
+    /// sees no hole between `freeze_memtable` and the flush task's manifest
+    /// commit. Pushed in `freeze_memtable`; removed by generation in
+    /// `flush_memtable` on commit success only (retained on failure until a
+    /// later flush or WAL replay on reopen).
+    frozen_memtables: VecDeque<Arc<MemTable>>,
     /// Flag to prevent duplicate memtable flush requests.
     flush_requested: bool,
     /// Counter for WAL flush threshold crossings.
     wal_flush_trigger_count: usize,
     /// Last time a WAL flush was triggered (for time-based flush).
     last_wal_flush_trigger_time: u64,
+}
+
+/// Capture a point-in-time scan handle to one in-memory memtable (active
+/// or frozen — same shape). Shared by `active_memtable_ref` and
+/// `in_memory_memtable_refs` so both stamp identical fields.
+fn in_memory_ref(mt: &MemTable) -> crate::dataset::mem_wal::scanner::InMemoryMemTableRef {
+    crate::dataset::mem_wal::scanner::InMemoryMemTableRef {
+        batch_store: mt.batch_store(),
+        index_store: mt
+            .indexes_arc()
+            .unwrap_or_else(|| Arc::new(IndexStore::new())),
+        schema: mt.schema().clone(),
+        generation: mt.generation(),
+    }
 }
 
 fn start_time() -> std::time::Instant {
@@ -896,6 +916,11 @@ impl SharedWriterState {
             .push_back((frozen_size, flush_watcher));
 
         let frozen_memtable = Arc::new(old_memtable);
+
+        // Keep this generation queryable until its manifest commit lands
+        // (dropped in `flush_memtable`, success only). Arc refcount, not a
+        // copy — the flush task holds it alive for the whole drain anyway.
+        state.frozen_memtables.push_back(frozen_memtable.clone());
 
         debug!(
             "Frozen memtable generation {}, pending_count = {}",
@@ -1286,6 +1311,7 @@ impl ShardWriter {
             last_flushed_wal_entry_position: initial_covered_wal_entry_position,
             frozen_memtable_bytes: 0,
             frozen_flush_watchers: VecDeque::new(),
+            frozen_memtables: VecDeque::new(),
             flush_requested: false,
             wal_flush_trigger_count: 0,
             last_wal_flush_trigger_time: 0,
@@ -1684,26 +1710,38 @@ impl ShardWriter {
         Ok(state.memtable.scan())
     }
 
-    /// Get an ActiveMemTableRef for use with LsmScanner.
-    ///
-    /// This provides read access to the current in-memory MemTable data
-    /// for unified LSM scanning across base table, flushed MemTables, and
-    /// active MemTable.
+    /// A handle to just the active memtable, for unified LSM scanning.
+    /// Prefer [`Self::in_memory_memtable_refs`] on the read path — it also
+    /// carries frozen-awaiting-flush generations.
     ///
     /// Returns an error in WAL-only mode.
     pub async fn active_memtable_ref(
         &self,
-    ) -> Result<crate::dataset::mem_wal::scanner::ActiveMemTableRef> {
+    ) -> Result<crate::dataset::mem_wal::scanner::InMemoryMemTableRef> {
         let state_lock = self.memtable_state_lock()?;
         let state = state_lock.read().await;
-        Ok(crate::dataset::mem_wal::scanner::ActiveMemTableRef {
-            batch_store: state.memtable.batch_store(),
-            index_store: state
-                .memtable
-                .indexes_arc()
-                .unwrap_or_else(|| Arc::new(IndexStore::new())),
-            schema: state.memtable.schema().clone(),
-            generation: state.memtable.generation(),
+        Ok(in_memory_ref(&state.memtable))
+    }
+
+    /// The active memtable plus every frozen-awaiting-flush memtable,
+    /// captured atomically under one `state.read()` (no torn freeze).
+    /// Mirrors `WriterState { memtable, frozen_memtables }`. The WAL read
+    /// path uses this instead of [`Self::active_memtable_ref`] so a
+    /// concurrent reader sees no hole while a flush drains.
+    ///
+    /// Returns an error in WAL-only mode.
+    pub async fn in_memory_memtable_refs(
+        &self,
+    ) -> Result<crate::dataset::mem_wal::scanner::InMemoryMemTables> {
+        let state_lock = self.memtable_state_lock()?;
+        let state = state_lock.read().await;
+        Ok(crate::dataset::mem_wal::scanner::InMemoryMemTables {
+            active: in_memory_ref(&state.memtable),
+            frozen: state
+                .frozen_memtables
+                .iter()
+                .map(|m| in_memory_ref(m))
+                .collect(),
         })
     }
 
@@ -2184,9 +2222,21 @@ impl MemTableFlushHandler {
 
         {
             let mut state = self.state.write().await;
+            // Backpressure drain: unconditional so `wait_for_flush_drain`
+            // sees the watcher's error signal, not a dropped channel.
             if let Some((_size, _watcher)) = state.frozen_flush_watchers.pop_front() {
                 state.frozen_memtable_bytes =
                     state.frozen_memtable_bytes.saturating_sub(memtable_size);
+            }
+            // Drop the queryable handle ONLY on commit success. On failure
+            // keep it: rows must stay in the read union until a later flush
+            // or WAL replay, else a transient flush error reopens the hole.
+            // Keyed by generation, so non-FIFO completion is fine.
+            if flush_result.is_ok() {
+                let flushed_generation = memtable.generation();
+                state
+                    .frozen_memtables
+                    .retain(|m| m.generation() != flushed_generation);
             }
         }
 
