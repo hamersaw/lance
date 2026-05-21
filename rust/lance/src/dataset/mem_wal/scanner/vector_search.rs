@@ -1469,4 +1469,139 @@ mod tests {
             ids,
         );
     }
+
+    #[tokio::test]
+    async fn test_vector_search_stale_read_when_fresh_falls_out_of_top_k() {
+        // FAILING SPEC — exposes a stale-read gap in the per-source top-k →
+        // global-dedup pipeline (the design that replaced the bloom-based
+        // FilterStaleExec in #6881).
+        //
+        // `LsmGlobalPkDedupExec` keeps the row with the largest
+        // `(generation, freshness)` tuple PER PK, but it can only do so for
+        // PKs that actually appear in *some* source's top-k. If a PK's
+        // *fresh* version is pushed out of its own source's top-k by other
+        // (closer) rows, the dedup never sees it — so it cannot suppress the
+        // *stale* copy from an older source, which is then served.
+        //
+        // Scenario:
+        //   * Base table (gen 0): pk=1 with vector == query (distance ~0).
+        //     This is the STALE copy.
+        //   * Active memtable (gen 1):
+        //       - pk=1 re-inserted with a FAR vector (the fresh value).
+        //       - pk=2 with a vector closer to the query than fresh pk=1.
+        //
+        // With k=1 the active arm returns only pk=2 (closer than fresh
+        // pk=1), so fresh pk=1 never reaches the dedup. The base arm returns
+        // the stale pk=1 at distance ~0, which survives dedup unchallenged
+        // and wins top-1.
+        //
+        // Correct newest-wins behavior: pk=1's live vector is far, so the
+        // nearest live neighbor is pk=2. pk=1 must never be served at the
+        // stale ~0 distance of the superseded base-table copy. Today this
+        // FAILS — the stale pk=1 is returned.
+        use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
+        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+        use crate::index::DatasetIndexExt;
+        use crate::index::vector::VectorIndexParams;
+        use datafusion::prelude::SessionContext;
+        use futures::TryStreamExt;
+        use lance_index::IndexType;
+
+        let schema = create_vector_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
+
+        // Base table (gen 0): the stale copy of pk=1 sits exactly on the query.
+        let base_batch = create_test_batch_with_vector(&schema, 1, [0.1, 0.2, 0.3, 0.4]);
+        let mut base_dataset = create_dataset(&base_uri, vec![base_batch]).await;
+        let ivf_flat = VectorIndexParams::ivf_flat(1, lance_linalg::distance::DistanceType::L2);
+        base_dataset
+            .create_index(&["vector"], IndexType::Vector, None, &ivf_flat, true)
+            .await
+            .unwrap();
+        let base_dataset = Arc::new(base_dataset);
+
+        // Active memtable (gen 1): pk=1 updated to a far vector, plus a pk=2
+        // that is closer to the query than fresh pk=1 — so with k=1 the
+        // active arm surfaces pk=2 and drops fresh pk=1.
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut index_store = IndexStore::new();
+        index_store.add_hnsw(
+            "vector_hnsw".to_string(),
+            1,
+            "vector".to_string(),
+            lance_linalg::distance::DistanceType::L2,
+            64,
+            8,
+        );
+        let fresh_pk1 = create_test_batch_with_vector(&schema, 1, [9.0, 9.0, 9.0, 9.0]);
+        let pk2 = create_test_batch_with_vector(&schema, 2, [1.0, 1.0, 1.0, 1.0]);
+        let (_, _, bp1) = batch_store.append(fresh_pk1.clone()).unwrap();
+        index_store
+            .insert_with_batch_position(&fresh_pk1, 0, Some(bp1))
+            .unwrap();
+        let (_, _, bp2) = batch_store.append(pk2.clone()).unwrap();
+        index_store
+            .insert_with_batch_position(&pk2, 1, Some(bp2))
+            .unwrap();
+        let index_store = Arc::new(index_store);
+
+        let shard_id = uuid::Uuid::new_v4();
+        let collector = LsmDataSourceCollector::new(base_dataset, vec![]).with_in_memory_memtables(
+            shard_id,
+            InMemoryMemTables {
+                active: InMemoryMemTableRef {
+                    batch_store,
+                    index_store,
+                    schema: schema.clone(),
+                    generation: 1,
+                },
+                frozen: vec![],
+            },
+        );
+
+        let planner = LsmVectorSearchPlanner::new(
+            collector,
+            vec!["id".to_string()],
+            schema,
+            "vector".to_string(),
+            lance_linalg::distance::DistanceType::L2,
+        );
+
+        let query = create_query_vector();
+        let plan = planner.plan_search(&query, 1, 1, None, None).await.unwrap();
+        let ctx = SessionContext::new();
+        let stream = plan.execute(0, ctx.task_ctx()).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+
+        let mut rows: Vec<(i32, f32)> = Vec::new();
+        for b in &batches {
+            let ids = b
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let dist = b
+                .column_by_name(DISTANCE_COLUMN)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow_array::Float32Array>()
+                .unwrap();
+            for i in 0..b.num_rows() {
+                rows.push((ids.value(i), dist.value(i)));
+            }
+        }
+
+        // pk=1 was updated to a far vector; it must never be served at the
+        // stale ~0 distance of the superseded base-table copy.
+        assert!(
+            rows.iter().all(|&(id, d)| !(id == 1 && d.abs() < 1e-3)),
+            "stale read: pk=1 was updated to a far vector in gen 1, but the \
+             stale base-table copy (distance ~0) was served because fresh \
+             pk=1 fell out of the active arm's top-k and never deduped it; \
+             got {:?}",
+            rows
+        );
+    }
 }
