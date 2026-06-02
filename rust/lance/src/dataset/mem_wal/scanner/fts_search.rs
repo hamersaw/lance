@@ -561,4 +561,97 @@ mod tests {
             }
         }
     }
+
+    #[tokio::test]
+    #[ignore = "known bug: active-memtable predicate-crossing stale read in the FTS arm. \
+                A PK updated so its new text no longer matches the query still leaks its stale \
+                version, because the append-only inverted index keeps the old posting and the \
+                fresh row isn't a candidate to dedup against. Un-ignore once the active arm gains \
+                a predicate-independent recency filter over the whole memtable."]
+    async fn active_stale_update_predicate_crossing_leaks() {
+        // BUG REPRODUCTION (FTS case: a PK update that crosses out of the match set).
+        //
+        // pk=1 is inserted as "alpha lance", then updated to "beta lance". The
+        // active inverted index is append-only, so the old "alpha" posting stays
+        // live. A search for "alpha" still matches the STALE pk=1 row. The fresh
+        // row ("beta lance") doesn't contain "alpha", so it's not even a
+        // candidate — there's nothing in the result set to dedup the stale hit
+        // against. The active FTS arm has no recency filter, so pk=1 leaks.
+        //
+        // Desired (NewestPkFilterExec) behaviour: pk=1's newest row-position is
+        // the "beta lance" row, so the stale "alpha" hit is dropped predicate-
+        // independently and pk=1 must NOT be returned for the "alpha" query.
+        let schema = fts_schema();
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut indexes = IndexStore::new();
+        indexes.add_fts("text_fts".to_string(), 1, "text".to_string());
+
+        // Insert pk=1 ("alpha lance") and an unrelated live pk=2 ("alpha foo").
+        let b1 = make_batch(&schema, &[1, 2], &["alpha lance", "alpha foo"]);
+        let (_, _, bp1) = batch_store.append(b1.clone()).unwrap();
+        indexes
+            .insert_with_batch_position(&b1, 0, Some(bp1))
+            .unwrap();
+
+        // Update pk=1 → "beta lance" (no longer matches "alpha").
+        let b2 = make_batch(&schema, &[1], &["beta lance"]);
+        let (_, _, bp2) = batch_store.append(b2.clone()).unwrap();
+        indexes
+            .insert_with_batch_position(&b2, 1, Some(bp2))
+            .unwrap();
+        let indexes = Arc::new(indexes);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![])
+            .with_in_memory_memtables(
+                uuid::Uuid::new_v4(),
+                InMemoryMemTables {
+                    active: InMemoryMemTableRef {
+                        batch_store,
+                        index_store: indexes,
+                        schema: schema.clone(),
+                        generation: 1,
+                    },
+                    frozen: vec![],
+                },
+            );
+
+        let planner = LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], schema);
+        let plan = planner
+            .plan_search(
+                "text",
+                FullTextSearchQuery::new("alpha".to_string()),
+                10,
+                None,
+            )
+            .await
+            .expect("planner should produce a plan");
+
+        let ctx = datafusion::prelude::SessionContext::new();
+        let stream = plan.execute(0, ctx.task_ctx()).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+
+        let mut ids: Vec<i32> = Vec::new();
+        for b in &batches {
+            let col = b
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            for i in 0..b.num_rows() {
+                ids.push(col.value(i));
+            }
+        }
+
+        assert!(
+            !ids.contains(&1),
+            "stale pk=1 (now 'beta lance') leaked on an 'alpha' search; got ids={ids:?}"
+        );
+        assert!(
+            ids.contains(&2),
+            "live pk=2 ('alpha foo') must still match 'alpha'; got ids={ids:?}"
+        );
+    }
 }

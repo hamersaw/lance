@@ -1550,6 +1550,120 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "known bug: active-memtable predicate-crossing stale read in the vector arm. \
+                A PK updated out of the query's neighborhood leaks its stale version because the \
+                fresh row is evicted from the over-fetched top-k, so WithinSourceDedupExec never \
+                sees it. Un-ignore once the active arm gains a predicate-independent recency \
+                filter over the whole memtable."]
+    async fn test_vector_search_active_stale_update_out_of_neighborhood() {
+        // BUG REPRODUCTION (vector case: a PK update that moves out of the neighborhood).
+        //
+        // Within a *single* active memtable, pk=1 is first inserted ON the query
+        // (distance ~0), then updated to a FAR vector. The append-only HNSW keeps
+        // both nodes live. WithinSourceDedupExec(KeepMaxRowAddr) only collapses
+        // duplicate PKs that are BOTH present in the over-fetched candidate set.
+        //
+        // Here the fresh (far) pk=1 is evicted from the candidate set — there are
+        // enough nearer filler rows that it ranks below the fetch cutoff — so the
+        // dedup never sees it and the STALE near pk=1 leaks as the nearest hit.
+        // This is the predicate-crossing hole: the row that *would* suppress the
+        // stale version isn't in the result set, so result-set dedup can't help.
+        //
+        // Desired (NewestPkFilterExec) behaviour: pk=1's newest row-position is
+        // the far one, computed predicate-independently over the whole memtable,
+        // so the stale near node is dropped and pk=1 must NOT surface at ~0.
+        use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
+        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+        use datafusion::prelude::SessionContext;
+        use futures::TryStreamExt;
+
+        let schema = create_vector_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
+
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut index_store = IndexStore::new();
+        index_store.add_hnsw(
+            "vector_hnsw".to_string(),
+            1,
+            "vector".to_string(),
+            lance_linalg::distance::DistanceType::L2,
+            64,
+            8,
+        );
+
+        // First append: stale pk=1 ON the query, plus five filler rows strictly
+        // farther than pk=1 but far nearer than the eventual fresh pk=1.
+        let q = [0.1, 0.2, 0.3, 0.4];
+        let stale_then_fillers = batch_rows(
+            &schema,
+            &[
+                (1, q),
+                (10, [0.11, 0.21, 0.31, 0.41]),
+                (11, [0.13, 0.23, 0.33, 0.43]),
+                (12, [0.15, 0.25, 0.35, 0.45]),
+                (13, [0.17, 0.27, 0.37, 0.47]),
+                (14, [0.19, 0.29, 0.39, 0.49]),
+            ],
+        );
+        let (_, _, bp0) = batch_store.append(stale_then_fillers.clone()).unwrap();
+        index_store
+            .insert_with_batch_position(&stale_then_fillers, 0, Some(bp0))
+            .unwrap();
+
+        // Second append: the UPDATE — pk=1 moved far from the query. This is the
+        // newest version (largest row position) but it sits well outside top-k.
+        let fresh_pk1 = batch_rows(&schema, &[(1, [9.0, 9.0, 9.0, 9.0])]);
+        let (_, _, bp1) = batch_store.append(fresh_pk1.clone()).unwrap();
+        index_store
+            .insert_with_batch_position(&fresh_pk1, 1, Some(bp1))
+            .unwrap();
+        let index_store = Arc::new(index_store);
+
+        let shard_id = uuid::Uuid::new_v4();
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![])
+            .with_in_memory_memtables(
+                shard_id,
+                InMemoryMemTables {
+                    active: InMemoryMemTableRef {
+                        batch_store,
+                        index_store,
+                        schema: schema.clone(),
+                        generation: 1,
+                    },
+                    frozen: vec![],
+                },
+            );
+
+        let planner = LsmVectorSearchPlanner::new(
+            collector,
+            vec!["id".to_string()],
+            schema,
+            "vector".to_string(),
+            lance_linalg::distance::DistanceType::L2,
+        );
+
+        // k=3, no over-fetch: the candidate set is {pk1@near, two nearest
+        // fillers}; fresh pk1@far ranks 7th and never enters the candidates.
+        let query = create_query_vector();
+        let plan = planner
+            .plan_search(&query, 3, 1, None, false, 1.0)
+            .await
+            .unwrap();
+        let ctx = SessionContext::new();
+        let stream = plan.execute(0, ctx.task_ctx()).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        let rows = collect_id_dist(&batches);
+
+        assert!(
+            !rows.iter().any(|&(id, d)| id == 1 && d.abs() < 1e-3),
+            "stale near pk=1 leaked: its live vector is far from the query, so it \
+             must not appear at distance ~0. results={:?}",
+            rows
+        );
+    }
+
+    #[tokio::test]
     async fn test_vector_search_stale_read_when_fresh_falls_out_of_top_k() {
         // Regression for the cross-generation stale-read gap that the
         // PkHashFilterExec block-list closes.
