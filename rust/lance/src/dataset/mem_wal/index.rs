@@ -18,9 +18,10 @@ mod arena_skiplist;
 mod btree;
 mod fts;
 mod hnsw;
-mod pk_position;
+mod pk_lookup;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::memtable::batch_store::StoredBatch;
@@ -45,7 +46,7 @@ pub type RowPosition = u64;
 pub use btree::{BTreeIndexConfig, BTreeMemIndex};
 pub use fts::{FtsIndexConfig, FtsMemIndex, FtsQueryExpr, SearchOptions};
 pub use hnsw::{HnswIndexConfig, HnswMemIndex};
-pub use pk_position::PkPositionIndex;
+pub use pk_lookup::PkLookup;
 
 // ============================================================================
 // Index Store
@@ -197,17 +198,20 @@ impl MemIndexConfig {
 /// therefore safe for scanners to read. Scanners snapshot this at plan
 /// construction time so every plan keys on a stable MVCC cursor.
 pub struct IndexStore {
-    /// BTree indexes keyed by index name.
-    btree_indexes: HashMap<String, BTreeMemIndex>,
+    /// BTree indexes keyed by index name. `Arc` so the primary-key BTrees can be
+    /// shared into [`Self::pk_btrees`] without a second copy or a second insert.
+    btree_indexes: HashMap<String, Arc<BTreeMemIndex>>,
     /// HNSW vector indexes keyed by index name.
     hnsw_indexes: HashMap<String, HnswMemIndex>,
     /// FTS indexes keyed by index name.
     fts_indexes: HashMap<String, FtsMemIndex>,
-    /// MVCC primary-key → newest-position index. Present when the memtable has a
-    /// primary key; maintained on every insert and read by the active vector /
-    /// FTS arms to drop predicate-crossing stale rows. Not an `Option<&str>`-keyed
-    /// map like the others — there is at most one per memtable.
-    pk_position_index: Option<PkPositionIndex>,
+    /// The primary-key BTrees, one per PK column in primary-key order. Each
+    /// aliases an entry in `btree_indexes` (a reused user index, or an
+    /// auto-created `__pk__*` one), so it is maintained by the same insert loop.
+    /// Empty when the memtable has no primary key. Read as a [`PkLookup`] by the
+    /// active vector / FTS arms and the cross-source block-list to find the
+    /// newest visible version of a key (see [`Self::enable_pk_index`]).
+    pk_btrees: Vec<Arc<BTreeMemIndex>>,
     /// Maximum batch position that is durable in the WAL and therefore
     /// visible to scanners. Advanced unconditionally after a WAL append
     /// succeeds; not gated on whether any indexes are configured.
@@ -220,7 +224,7 @@ impl Default for IndexStore {
             btree_indexes: HashMap::new(),
             hnsw_indexes: HashMap::new(),
             fts_indexes: HashMap::new(),
-            pk_position_index: None,
+            pk_btrees: Vec::new(),
             max_visible_batch_position: AtomicUsize::new(0),
         }
     }
@@ -238,7 +242,14 @@ impl std::fmt::Debug for IndexStore {
                 &self.hnsw_indexes.keys().collect::<Vec<_>>(),
             )
             .field("fts_indexes", &self.fts_indexes.keys().collect::<Vec<_>>())
-            .field("pk_position_index", &self.pk_position_index)
+            .field(
+                "pk_btrees",
+                &self
+                    .pk_btrees
+                    .iter()
+                    .map(|b| b.column_name())
+                    .collect::<Vec<_>>(),
+            )
             .field(
                 "max_visible_batch_position",
                 &self.max_visible_batch_position.load(Ordering::Acquire),
@@ -273,7 +284,7 @@ impl IndexStore {
         for config in configs {
             match config {
                 MemIndexConfig::BTree(c) => {
-                    let index = BTreeMemIndex::new(c.field_id, c.column.clone());
+                    let index = Arc::new(BTreeMemIndex::new(c.field_id, c.column.clone()));
                     registry.btree_indexes.insert(c.name.clone(), index);
                 }
                 MemIndexConfig::Hnsw(c) => {
@@ -302,7 +313,7 @@ impl IndexStore {
     /// the production memtable path goes through [`Self::from_configs`].
     pub fn add_btree(&mut self, name: String, field_id: i32, column: String) {
         self.btree_indexes
-            .insert(name, BTreeMemIndex::new(field_id, column));
+            .insert(name, Arc::new(BTreeMemIndex::new(field_id, column)));
     }
 
     /// Add an HNSW vector index with default build parameters.
@@ -371,22 +382,42 @@ impl IndexStore {
             .insert(name, FtsMemIndex::with_params(field_id, column, params));
     }
 
-    /// Enable the MVCC primary-key → newest-position index over `pk_columns`.
+    /// Maintain a BTree index on each primary-key column so the memtable can
+    /// answer "newest visible version of this key" (see [`Self::pk_index`]).
     ///
-    /// Build this once at construction, before any inserts (it is maintained on
-    /// every subsequent insert). A no-op when `pk_columns` is empty (a memtable
-    /// without a primary key has nothing to dedup). The active vector / FTS
-    /// search arms read it via [`Self::pk_position_index`] to drop stale rows.
-    pub fn enable_pk_position_index(&mut self, pk_columns: Vec<String>) {
-        if !pk_columns.is_empty() {
-            self.pk_position_index = Some(PkPositionIndex::new(pk_columns));
+    /// For each `(column, field_id)` an existing BTree on that field is reused;
+    /// otherwise an auto-created one is registered under a synthetic `__pk__*`
+    /// name so the normal insert loop maintains it. Call this once at
+    /// construction, after [`Self::from_configs`] (so user indexes are present
+    /// to reuse) and before any inserts. A no-op when `pk_columns` is empty (a
+    /// memtable without a primary key has nothing to dedup).
+    ///
+    /// The auto-created BTrees are in-memory only — flush rebuilds indexes from
+    /// the user's index configs, not from this map — so a primary key without a
+    /// user-defined scalar index does not gain an on-disk index.
+    pub fn enable_pk_index(&mut self, pk_columns: &[(String, i32)]) {
+        for (column, field_id) in pk_columns {
+            let btree = match self
+                .btree_indexes
+                .values()
+                .find(|b| b.field_id() == *field_id)
+            {
+                Some(existing) => existing.clone(),
+                None => {
+                    let btree = Arc::new(BTreeMemIndex::new(*field_id, column.clone()));
+                    self.btree_indexes
+                        .insert(format!("__pk__{column}"), btree.clone());
+                    btree
+                }
+            };
+            self.pk_btrees.push(btree);
         }
     }
 
-    /// The MVCC primary-key → newest-position index, if the memtable has a
-    /// primary key (see [`Self::enable_pk_position_index`]).
-    pub fn pk_position_index(&self) -> Option<&PkPositionIndex> {
-        self.pk_position_index.as_ref()
+    /// A tuple-level view over the primary-key BTrees, if the memtable has a
+    /// primary key (see [`Self::enable_pk_index`]).
+    pub fn pk_index(&self) -> Option<PkLookup<'_>> {
+        (!self.pk_btrees.is_empty()).then(|| PkLookup::new(&self.pk_btrees))
     }
 
     /// Insert a batch into all indexes.
@@ -411,9 +442,8 @@ impl IndexStore {
         for index in self.fts_indexes.values() {
             index.insert(batch, row_offset)?;
         }
-        if let Some(pk_index) = &self.pk_position_index {
-            pk_index.insert(batch, row_offset)?;
-        }
+        // The primary-key BTrees are aliases of `btree_indexes` entries, so the
+        // loop above already maintained them.
 
         // Update global watermark after all indexes have been updated
         if let Some(bp) = batch_position {
@@ -470,12 +500,8 @@ impl IndexStore {
             }
         }
 
-        // PK-position index: one entry per row, in batch order.
-        if let Some(pk_index) = &self.pk_position_index {
-            for stored in batches {
-                pk_index.insert(&stored.data, stored.row_offset)?;
-            }
-        }
+        // The primary-key BTrees are aliases of `btree_indexes` entries, so the
+        // loop above already maintained them.
 
         // Update global watermark to the max batch position
         let max_bp = batches.iter().map(|b| b.batch_position).max().unwrap();
@@ -589,14 +615,9 @@ impl IndexStore {
                 .map(|(name, _idx_type, duration)| (name.to_string(), duration))
                 .collect();
 
-            // PK-position index: cheap (one skiplist insert per row), updated
-            // inline after the parallel index threads join so it is in place
-            // before the visibility watermark advances below.
-            if let Some(pk_index) = &self.pk_position_index {
-                for stored in batches {
-                    pk_index.insert(&stored.data, stored.row_offset)?;
-                }
-            }
+            // The primary-key BTrees are aliases of `btree_indexes` entries, so
+            // their per-index threads above already maintained them (and joined
+            // before the visibility watermark advances below).
 
             // Update global watermark to the max batch position
             let max_bp = batches.iter().map(|b| b.batch_position).max().unwrap();
@@ -608,7 +629,7 @@ impl IndexStore {
 
     /// Get a BTree index by name.
     pub fn get_btree(&self, name: &str) -> Option<&BTreeMemIndex> {
-        self.btree_indexes.get(name)
+        self.btree_indexes.get(name).map(Arc::as_ref)
     }
 
     /// Get an HNSW vector index by name.
@@ -629,6 +650,7 @@ impl IndexStore {
         self.btree_indexes
             .values()
             .find(|idx| idx.field_id() == field_id)
+            .map(Arc::as_ref)
     }
 
     /// Get an HNSW vector index by field ID.
@@ -653,6 +675,7 @@ impl IndexStore {
         self.btree_indexes
             .values()
             .find(|idx| idx.column_name() == column)
+            .map(Arc::as_ref)
     }
 
     /// Get an HNSW vector index by column name.

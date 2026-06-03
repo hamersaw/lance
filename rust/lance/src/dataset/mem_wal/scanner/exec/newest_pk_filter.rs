@@ -10,13 +10,13 @@
 //! stale version against — and it leaks.
 //!
 //! This node closes that hole with a predicate-independent recency check: for
-//! each hit it asks the memtable's maintained MVCC PK-position index
-//! ([`crate::dataset::mem_wal::index::PkPositionIndex`]) for the newest position
-//! of that hit's primary key visible at the query's `max_visible` watermark, and
-//! keeps the hit **iff that equals the hit's own row position**. A stale hit
-//! (some newer version exists) is dropped even when that newer version never
-//! appears in the result. This is exactly the seek point-lookup already does;
-//! the index search arms simply didn't do it.
+//! each hit it asks the memtable's maintained primary-key index
+//! ([`crate::dataset::mem_wal::index::PkLookup`]) whether the hit's own row
+//! position is the newest version of its primary key visible at the query's
+//! `max_visible` watermark, and keeps the hit **iff so**. A stale hit (some
+//! newer version exists) is dropped even when that newer version never appears
+//! in the result. This is exactly the seek point-lookup already does; the index
+//! search arms simply didn't do it.
 
 use std::any::Any;
 use std::fmt;
@@ -27,6 +27,7 @@ use std::task::{Context, Poll};
 use arrow::compute::filter_record_batch;
 use arrow_array::{Array, BooleanArray, RecordBatch, UInt64Array};
 use arrow_schema::SchemaRef;
+use datafusion::common::ScalarValue;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::EquivalenceProperties;
@@ -36,7 +37,7 @@ use datafusion::physical_plan::{
 };
 use futures::{Stream, StreamExt};
 
-use super::pk::{compute_pk_hash, resolve_pk_indices};
+use super::pk::resolve_pk_indices;
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
 /// Keeps only the index hits that are the newest visible version of their PK.
@@ -47,7 +48,7 @@ pub struct NewestPkFilterExec {
     input: Arc<dyn ExecutionPlan>,
     pk_columns: Vec<String>,
     row_id_column: String,
-    /// Holds the maintained `PkPositionIndex` queried per hit.
+    /// Holds the maintained primary-key index (`PkLookup`) queried per hit.
     index_store: Arc<IndexStore>,
     /// Resolves the `max_visible` row watermark from the visible batch prefix.
     batch_store: Arc<BatchStore>,
@@ -194,9 +195,9 @@ struct NewestPkFilterStream {
 
 impl NewestPkFilterStream {
     fn filter_batch(&self, batch: RecordBatch) -> DFResult<RecordBatch> {
-        // No PK-position index (memtable without a primary key), no visible
+        // No primary-key index (memtable without a primary key), no visible
         // rows, or an empty batch: nothing to dedup against, so pass it through.
-        let Some(pk_index) = self.index_store.pk_position_index() else {
+        let Some(pk_index) = self.index_store.pk_index() else {
             return Ok(batch);
         };
         let Some(max_visible_row) = self.max_visible_row else {
@@ -224,20 +225,23 @@ impl NewestPkFilterStream {
                 ))
             })?;
 
-        let keep: BooleanArray = (0..batch.num_rows())
-            .map(|row| {
-                // A null row position can't be ordered; keep it rather than
-                // guess (callers always project a real position here).
-                if row_ids.is_null(row) {
-                    return true;
-                }
-                let position = row_ids.value(row);
-                let hash = compute_pk_hash(&batch, &pk_indices, row);
-                // Keep iff this hit is the newest visible version of its PK.
-                pk_index.get_newest_visible(hash, max_visible_row) == Some(position)
-            })
-            .collect();
-        filter_record_batch(&batch, &keep)
+        let mut keep = Vec::with_capacity(batch.num_rows());
+        for row in 0..batch.num_rows() {
+            // A null row position can't be ordered; keep it rather than guess
+            // (callers always project a real position here).
+            if row_ids.is_null(row) {
+                keep.push(true);
+                continue;
+            }
+            let position = row_ids.value(row);
+            let values: Vec<ScalarValue> = pk_indices
+                .iter()
+                .map(|&col| ScalarValue::try_from_array(batch.column(col), row))
+                .collect::<DFResult<_>>()?;
+            // Keep iff this hit is the newest visible version of its PK.
+            keep.push(pk_index.is_newest(&values, position, max_visible_row));
+        }
+        filter_record_batch(&batch, &BooleanArray::from(keep))
             .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
     }
 }
@@ -293,12 +297,12 @@ mod tests {
         .unwrap()
     }
 
-    /// Build an active memtable whose PK-position index + BatchStore hold one
-    /// row per `id` in `appended` (positions 0..n), all committed.
+    /// Build an active memtable whose PK index + BatchStore hold one row per
+    /// `id` in `appended` (positions 0..n), all committed.
     fn active(appended: &[i32]) -> (Arc<IndexStore>, Arc<BatchStore>) {
         let batch_store = Arc::new(BatchStore::with_capacity(16));
         let mut index = IndexStore::new();
-        index.enable_pk_position_index(vec!["id".to_string()]);
+        index.enable_pk_index(&[("id".to_string(), 0)]);
         for &id in appended {
             let b = id_batch(id);
             let (bp, off, _) = batch_store.append(b.clone()).unwrap();
@@ -373,12 +377,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn passes_through_when_no_pk_position_index() {
-        // A memtable without a PK-position index can't be deduped here, so the
+    async fn passes_through_when_no_pk_index() {
+        // A memtable without a primary-key index can't be deduped here, so the
         // filter is a pass-through rather than dropping everything.
         let batch_store = Arc::new(BatchStore::with_capacity(16));
         batch_store.append(id_batch(1)).unwrap();
-        let index = Arc::new(IndexStore::new()); // no enable_pk_position_index
+        let index = Arc::new(IndexStore::new()); // no enable_pk_index
         let rows = run(index, batch_store, 0, hits(&[(1, 0), (1, 9)])).await;
         assert_eq!(rows, vec![(1, 0), (1, 9)]);
     }

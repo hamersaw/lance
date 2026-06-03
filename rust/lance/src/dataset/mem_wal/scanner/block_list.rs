@@ -4,12 +4,12 @@
 //! Per-source block-list construction for LSM vector search.
 //!
 //! A generation's membership is a [`GenMembership`]: in-memory generations
-//! (active / frozen) are **probed** against their maintained PK-position index
-//! (no per-query set), while on-disk generations (flushed, base) carry a cached
-//! `Arc<HashSet<u64>>` of PK hashes ([`compute_pk_hash`]). Each source gets a
-//! `Vec<GenMembership>` of the newer generations (`NEWER(G)`; base: all of
-//! them); the KNN drops a candidate whose PK is in any (see
-//! [`super::exec::PkHashFilterExec`]).
+//! (active / frozen) are **probed by value** against their maintained
+//! primary-key BTrees (no per-query set), while on-disk generations (flushed,
+//! base) carry a cached `Arc<HashSet<u64>>` of PK hashes ([`compute_pk_hash`]).
+//! Each source gets a `Vec<GenMembership>` of the newer generations
+//! (`NEWER(G)`; base: all of them); the KNN drops a candidate whose PK is in any
+//! (see [`super::exec::PkHashFilterExec`]).
 //!
 //! Cross-generation only: within-gen dups share a hash and fall to the global
 //! dedup's `(generation, freshness)` tiebreaker.
@@ -18,6 +18,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
+use datafusion::common::ScalarValue;
 use futures::TryStreamExt;
 use lance_core::Result;
 
@@ -31,11 +32,11 @@ use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 use crate::session::Session;
 
 /// One newer generation's PK membership, used to decide whether it shadows an
-/// older source's row. In-memory generations (active / frozen) are **probed**
-/// against their maintained MVCC PK-position index — no per-query set is built —
-/// while on-disk generations (flushed, base) carry a materialized PK-hash set
-/// (cached by path). The probe is snapshot-bounded, so a not-yet-visible write
-/// can't shadow an older visible copy.
+/// older source's row. In-memory generations (active / frozen) are **probed by
+/// value** against their maintained primary-key BTrees — no per-query set is
+/// built — while on-disk generations (flushed, base) carry a materialized
+/// PK-hash set (cached by path). The probe is snapshot-bounded, so a
+/// not-yet-visible write can't shadow an older visible copy.
 #[derive(Debug, Clone)]
 pub enum GenMembership {
     /// Probe the in-memory memtable's index, bounded to its visible prefix.
@@ -45,13 +46,16 @@ pub enum GenMembership {
         max_visible_row: Option<u64>,
     },
     /// A materialized PK-hash set (flushed / base, or an in-memory memtable that
-    /// has no PK-position index).
+    /// has no primary-key index).
     Set(Arc<HashSet<u64>>),
 }
 
 impl GenMembership {
-    /// Whether this generation contains `pk_hash` (visibly, for the index case).
-    pub fn contains(&self, pk_hash: u64) -> bool {
+    /// Whether this generation visibly contains the primary key. The on-disk
+    /// `Set` case matches on `pk_hash`; the in-memory `Index` case probes by
+    /// `pk_values` (collision-free). The caller supplies both for a candidate
+    /// row — see [`Self::needs_values`].
+    pub fn contains(&self, pk_hash: u64, pk_values: &[ScalarValue]) -> bool {
         match self {
             Self::Index {
                 index_store,
@@ -61,11 +65,18 @@ impl GenMembership {
                     return false;
                 };
                 index_store
-                    .pk_position_index()
-                    .is_some_and(|idx| idx.contains_visible(pk_hash, *max))
+                    .pk_index()
+                    .is_some_and(|idx| idx.contains_visible(pk_values, *max))
             }
             Self::Set(set) => set.contains(&pk_hash),
         }
+    }
+
+    /// Whether [`Self::contains`] needs the primary-key values (the `Index`
+    /// case) rather than just the hash. Lets the filter skip per-row value
+    /// extraction when every membership is an on-disk `Set`.
+    pub fn needs_values(&self) -> bool {
+        matches!(self, Self::Index { .. })
     }
 
     /// Whether this generation has no (visible) membership — used to skip adding
@@ -77,10 +88,7 @@ impl GenMembership {
                 index_store,
                 max_visible_row,
             } => {
-                max_visible_row.is_none()
-                    || index_store
-                        .pk_position_index()
-                        .is_none_or(|idx| idx.is_empty())
+                max_visible_row.is_none() || index_store.pk_index().is_none_or(|idx| idx.is_empty())
             }
             Self::Set(set) => set.is_empty(),
         }
@@ -198,7 +206,7 @@ pub async fn fresh_tier_block_list(
 
 /// Cross-source membership of an in-memory (active / frozen) memtable.
 ///
-/// Prefers a snapshot-bounded **probe** of the maintained PK-position index (no
+/// Prefers a snapshot-bounded **probe** of the maintained primary-key index (no
 /// per-query set built), falling back to a one-time `BatchStore` scan only when
 /// the memtable has no such index (e.g. a table without a primary key) — which
 /// the production vector-search path never hits, since that index is always
@@ -208,7 +216,7 @@ fn in_memory_membership(
     index_store: &Arc<IndexStore>,
     pk_columns: &[String],
 ) -> Result<GenMembership> {
-    if index_store.pk_position_index().is_some() {
+    if index_store.pk_index().is_some() {
         let max_visible_row = batch_store.max_visible_row(index_store.max_visible_batch_position());
         Ok(GenMembership::Index {
             index_store: index_store.clone(),
@@ -333,10 +341,11 @@ mod tests {
         compute_pk_hash(&batch, &pk_indices, 0)
     }
 
-    /// Whether `id`'s PK hash is blocked by any of a source's newer-gen
-    /// memberships.
+    /// Whether `id`'s PK is blocked by any of a source's newer-gen memberships
+    /// (supplying both the hash and the value, as the filter does).
     fn blocks(memberships: &[GenMembership], id: i32) -> bool {
-        memberships.iter().any(|m| m.contains(hash_id(id)))
+        let values = [ScalarValue::Int32(Some(id))];
+        memberships.iter().any(|m| m.contains(hash_id(id), &values))
     }
 
     #[test]
@@ -392,7 +401,7 @@ mod tests {
 
         // One membership per generation; together they cover pk=1,2,3 (not 4).
         assert_eq!(memberships.len(), 2);
-        let fresh_blocks = |id: i32| memberships.iter().any(|m| m.contains(hash_id(id)));
+        let fresh_blocks = |id: i32| blocks(&memberships, id);
         for id in [1, 2, 3] {
             assert!(fresh_blocks(id));
         }
@@ -550,7 +559,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn in_memory_membership_reads_from_pk_position_index() {
+    async fn in_memory_membership_reads_from_pk_index() {
         // When the memtable has a maintained PK-position index, the block-list
         // sources its membership from that index (no BatchStore re-scan) and
         // still suppresses an older generation's stale copy.
@@ -569,7 +578,7 @@ mod tests {
         // so the snapshot-bounded probe sees both rows.
         let active_store = BatchStore::with_capacity(8);
         let mut active_index = IndexStore::new();
-        active_index.enable_pk_position_index(vec!["id".to_string()]);
+        active_index.enable_pk_index(&[("id".to_string(), 0)]);
         let b1 = id_batch(&[1]);
         let (bp1, off1, _) = active_store.append(b1.clone()).unwrap();
         active_index
@@ -637,7 +646,7 @@ mod tests {
         // index yet not visible) — the concurrent-write race.
         let g2_store = BatchStore::with_capacity(8);
         let mut g2_index = IndexStore::new();
-        g2_index.enable_pk_position_index(vec!["id".to_string()]);
+        g2_index.enable_pk_index(&[("id".to_string(), 0)]);
         let b0 = id_batch(&[99]);
         let (bp0, off0, _) = g2_store.append(b0.clone()).unwrap();
         g2_index

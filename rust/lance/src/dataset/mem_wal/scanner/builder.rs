@@ -466,12 +466,26 @@ impl LsmScanner {
         .await?;
         let pk_indices = super::exec::resolve_pk_indices(pks, &self.pk_columns)
             .map_err(|e| Error::invalid_input(e.to_string()))?;
-        Ok((0..pks.num_rows())
-            .map(|row| {
-                let hash = super::exec::compute_pk_hash(pks, &pk_indices, row);
-                memberships.iter().any(|m| m.contains(hash))
-            })
-            .collect())
+        // On-disk generations probe by hash; in-memory ones probe their
+        // primary-key BTrees by value. Extract values only when needed.
+        let needs_values = memberships
+            .iter()
+            .any(super::block_list::GenMembership::needs_values);
+        let mut contained = Vec::with_capacity(pks.num_rows());
+        for row in 0..pks.num_rows() {
+            let hash = super::exec::compute_pk_hash(pks, &pk_indices, row);
+            let values: Vec<ScalarValue> = if needs_values {
+                pk_indices
+                    .iter()
+                    .map(|&col| ScalarValue::try_from_array(pks.column(col), row))
+                    .collect::<std::result::Result<_, _>>()
+                    .map_err(|e| Error::invalid_input(e.to_string()))?
+            } else {
+                Vec::new()
+            };
+            contained.push(memberships.iter().any(|m| m.contains(hash, &values)));
+        }
+        Ok(contained)
     }
 
     /// Build the data source collector.

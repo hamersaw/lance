@@ -669,47 +669,20 @@ fn probe_position(
     }
     let max_visible_row = visible_end - 1;
 
-    // Prefer a value-keyed scalar BTree on the PK column when one exists: it is
-    // collision-free, so a single seek-and-stop yields the answer with no value
-    // re-check.
-    if let Some(btree) = index_store.get_btree_by_column(pk_column) {
-        let Some(pos) = btree.get_newest_visible(pk_value, max_visible_row) else {
-            return Ok(ProbePos::Miss);
-        };
-        let (batch_idx, row) = resolve_position(batch_store, last_visible_idx, pos)?;
-        return Ok(ProbePos::Found { batch_idx, row });
-    }
-
-    // Otherwise probe the maintained PK-position index, which is hash-keyed and
-    // present whenever the table has a primary key (so it covers PK columns
-    // without their own scalar BTree). Hashing can collide, so verify the
-    // candidate's actual value: walk this hash's visible positions newest-first
-    // and return the first whose value equals the query — a colliding key never
-    // returns the wrong row. The common (no-collision) case checks one position.
-    let Some(pk_index) = index_store.pk_position_index() else {
+    // A single-column primary key always has a value-keyed BTree on it (a
+    // reused user index or the auto-created `__pk__*` one — see
+    // `IndexStore::enable_pk_index`). It is collision-free, so one seek-and-stop
+    // yields the answer with no value re-check. Absent only when the table has
+    // no primary-key index at all, in which case the caller falls back to the
+    // plan path.
+    let Some(btree) = index_store.get_btree_by_column(pk_column) else {
         return Ok(ProbePos::NoIndex);
     };
-    let hash = compute_pk_hash_from_scalars(std::slice::from_ref(pk_value));
-    for pos in pk_index
-        .visible_positions(hash, max_visible_row)
-        .into_iter()
-        .rev()
-    {
-        let (batch_idx, row) = resolve_position(batch_store, last_visible_idx, pos)?;
-        let stored = batch_store
-            .get(batch_idx)
-            .ok_or_else(|| lance_core::Error::internal("point-lookup: resolved batch missing"))?;
-        let col_idx = stored.data.schema_ref().index_of(pk_column).map_err(|_| {
-            lance_core::Error::internal(format!(
-                "point-lookup: PK column '{pk_column}' not found in memtable batch"
-            ))
-        })?;
-        let actual = ScalarValue::try_from_array(stored.data.column(col_idx), row)?;
-        if &actual == pk_value {
-            return Ok(ProbePos::Found { batch_idx, row });
-        }
-    }
-    Ok(ProbePos::Miss)
+    let Some(pos) = btree.get_newest_visible(pk_value, max_visible_row) else {
+        return Ok(ProbePos::Miss);
+    };
+    let (batch_idx, row) = resolve_position(batch_store, last_visible_idx, pos)?;
+    Ok(ProbePos::Found { batch_idx, row })
 }
 
 /// Map a global row `position` to its `(batch_idx, row_in_batch)` by binary
@@ -1216,11 +1189,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_point_lookup_probes_pk_position_index_without_btree() {
-        // No scalar BTree on the PK column, only the maintained PK-position
-        // index (the production default). The fast probe must resolve the newest
-        // visible version through that index — verifying the value to guard hash
-        // collisions — rather than falling back to the plan path.
+    async fn test_point_lookup_probes_auto_created_pk_btree() {
+        // No user `add_btree` on the PK column — only `enable_pk_index`, which
+        // auto-creates a BTree on the primary key (the production default). The
+        // fast probe must resolve the newest visible version through that
+        // collision-free BTree rather than falling back to the plan path.
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
         use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
@@ -1230,8 +1203,8 @@ mod tests {
 
         let batch_store = Arc::new(BatchStore::with_capacity(16));
         let mut index_store = IndexStore::new();
-        // No `add_btree` — only the PK-position index.
-        index_store.enable_pk_position_index(vec!["id".to_string()]);
+        // No `add_btree` — `enable_pk_index` auto-creates the PK BTree.
+        index_store.enable_pk_index(&[("id".to_string(), 0)]);
 
         // pk=1 written twice (the newer second), plus an unrelated pk=2.
         let b_old = create_test_batch(&schema, &[1], "old");

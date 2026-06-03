@@ -22,6 +22,7 @@ use std::task::{Context, Poll};
 use arrow::compute::filter_record_batch;
 use arrow_array::{BooleanArray, RecordBatch};
 use arrow_schema::SchemaRef;
+use datafusion::common::ScalarValue;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::EquivalenceProperties;
@@ -164,16 +165,29 @@ impl PkHashFilterStream {
             return Ok(batch);
         }
         let pk_indices = resolve_pk_indices(&batch, &self.pk_columns)?;
-        let keep: BooleanArray = (0..batch.num_rows())
-            .map(|row| {
-                let hash = compute_pk_hash(&batch, &pk_indices, row);
+        // On-disk generations probe by hash; in-memory ones probe their
+        // primary-key BTrees by value. Extract per-row values only when some
+        // membership needs them.
+        let needs_values = self.blocked.iter().any(GenMembership::needs_values);
+        let mut keep = Vec::with_capacity(batch.num_rows());
+        for row in 0..batch.num_rows() {
+            let hash = compute_pk_hash(&batch, &pk_indices, row);
+            let values: Vec<ScalarValue> = if needs_values {
+                pk_indices
+                    .iter()
+                    .map(|&col| ScalarValue::try_from_array(batch.column(col), row))
+                    .collect::<DFResult<_>>()?
+            } else {
+                Vec::new()
+            };
+            keep.push(
                 !self
                     .blocked
                     .iter()
-                    .any(|membership| membership.contains(hash))
-            })
-            .collect();
-        filter_record_batch(&batch, &keep)
+                    .any(|membership| membership.contains(hash, &values)),
+            );
+        }
+        filter_record_batch(&batch, &BooleanArray::from(keep))
             .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
     }
 }

@@ -420,7 +420,7 @@ mod tests {
         // Active memtable with its own FTS index, containing a matching row.
         let batch_store = Arc::new(BatchStore::with_capacity(16));
         let mut indexes = IndexStore::new();
-        indexes.enable_pk_position_index(vec!["id".to_string()]);
+        indexes.enable_pk_index(&[("id".to_string(), 0)]);
         indexes.add_fts("text_fts".to_string(), 1, "text".to_string());
         let active_batch = make_batch(
             &schema,
@@ -500,7 +500,7 @@ mod tests {
         let schema = fts_schema();
         let batch_store = Arc::new(BatchStore::with_capacity(16));
         let mut indexes = IndexStore::new();
-        indexes.enable_pk_position_index(vec!["id".to_string()]);
+        indexes.enable_pk_index(&[("id".to_string(), 0)]);
         // text column has field_id 1 in fts_schema()
         indexes.add_fts("text_fts".to_string(), 1, "text".to_string());
         let batch = make_batch(
@@ -597,7 +597,7 @@ mod tests {
         let schema = fts_schema();
         let batch_store = Arc::new(BatchStore::with_capacity(16));
         let mut indexes = IndexStore::new();
-        indexes.enable_pk_position_index(vec!["id".to_string()]);
+        indexes.enable_pk_index(&[("id".to_string(), 0)]);
         indexes.add_fts("text_fts".to_string(), 1, "text".to_string());
 
         // Insert pk=1 ("alpha lance") and an unrelated live pk=2 ("alpha foo").

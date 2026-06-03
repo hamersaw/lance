@@ -660,7 +660,7 @@ mod tests {
         // Active memtable with HNSW index over the "vector" column.
         let batch_store = Arc::new(BatchStore::with_capacity(16));
         let mut index_store = IndexStore::new();
-        index_store.enable_pk_position_index(vec!["id".to_string()]);
+        index_store.enable_pk_index(&[("id".to_string(), 0)]);
         index_store.add_hnsw(
             "vector_hnsw".to_string(),
             1,
@@ -779,7 +779,7 @@ mod tests {
 
         let batch_store = Arc::new(BatchStore::with_capacity(16));
         let mut index_store = IndexStore::new();
-        index_store.enable_pk_position_index(vec!["id".to_string()]);
+        index_store.enable_pk_index(&[("id".to_string(), 0)]);
         index_store.add_hnsw(
             "vector_hnsw".to_string(),
             1,
@@ -859,7 +859,7 @@ mod tests {
 
         let batch_store = Arc::new(BatchStore::with_capacity(16));
         let mut index_store = IndexStore::new();
-        index_store.enable_pk_position_index(vec!["id".to_string()]);
+        index_store.enable_pk_index(&[("id".to_string(), 0)]);
         index_store.add_hnsw(
             "vector_hnsw".to_string(),
             1,
@@ -973,7 +973,7 @@ mod tests {
 
         let batch_store = Arc::new(BatchStore::with_capacity(16));
         let mut index_store = IndexStore::new();
-        index_store.enable_pk_position_index(vec!["id".to_string()]);
+        index_store.enable_pk_index(&[("id".to_string(), 0)]);
         index_store.add_hnsw(
             "vector_hnsw".to_string(),
             1,
@@ -1113,7 +1113,7 @@ mod tests {
         // "right" vector close to the query, plus an unrelated pk=2.
         let batch_store = Arc::new(BatchStore::with_capacity(16));
         let mut index_store = IndexStore::new();
-        index_store.enable_pk_position_index(vec!["id".to_string()]);
+        index_store.enable_pk_index(&[("id".to_string(), 0)]);
         index_store.add_hnsw(
             "vector_hnsw".to_string(),
             1,
@@ -1233,7 +1233,7 @@ mod tests {
         // Active memtable: id=3 with HNSW index.
         let batch_store = Arc::new(BatchStore::with_capacity(16));
         let mut index_store = IndexStore::new();
-        index_store.enable_pk_position_index(vec!["id".to_string()]);
+        index_store.enable_pk_index(&[("id".to_string(), 0)]);
         index_store.add_hnsw(
             "vector_hnsw".to_string(),
             1,
@@ -1474,7 +1474,7 @@ mod tests {
 
         let batch_store = Arc::new(BatchStore::with_capacity(16));
         let mut index_store = IndexStore::new();
-        index_store.enable_pk_position_index(vec!["id".to_string()]);
+        index_store.enable_pk_index(&[("id".to_string(), 0)]);
         index_store.add_hnsw(
             "vector_hnsw".to_string(),
             1,
@@ -1603,7 +1603,7 @@ mod tests {
 
         let batch_store = Arc::new(BatchStore::with_capacity(16));
         let mut index_store = IndexStore::new();
-        index_store.enable_pk_position_index(vec!["id".to_string()]);
+        index_store.enable_pk_index(&[("id".to_string(), 0)]);
         index_store.add_hnsw(
             "vector_hnsw".to_string(),
             1,
@@ -1722,7 +1722,7 @@ mod tests {
         // active arm surfaces pk=2 and drops fresh pk=1.
         let batch_store = Arc::new(BatchStore::with_capacity(16));
         let mut index_store = IndexStore::new();
-        index_store.enable_pk_position_index(vec!["id".to_string()]);
+        index_store.enable_pk_index(&[("id".to_string(), 0)]);
         index_store.add_hnsw(
             "vector_hnsw".to_string(),
             1,
@@ -1919,7 +1919,7 @@ mod tests {
         // Active (gen 1): pk 1,2,3 re-inserted with a far vector (the fresh value).
         let batch_store = Arc::new(BatchStore::with_capacity(16));
         let mut index_store = IndexStore::new();
-        index_store.enable_pk_position_index(vec!["id".to_string()]);
+        index_store.enable_pk_index(&[("id".to_string(), 0)]);
         index_store.add_hnsw(
             "vector_hnsw".to_string(),
             1,
@@ -2124,7 +2124,7 @@ mod tests {
         // Active: (1,1) re-inserted far (fresh) + an unrelated nearby (2,2).
         let batch_store = Arc::new(BatchStore::with_capacity(16));
         let mut index_store = IndexStore::new();
-        index_store.enable_pk_position_index(vec!["id1".to_string(), "id2".to_string()]);
+        index_store.enable_pk_index(&[("id1".to_string(), 0), ("id2".to_string(), 1)]);
         index_store.add_hnsw(
             "vector_hnsw".to_string(),
             1,
@@ -2229,7 +2229,7 @@ mod tests {
 
         let batch_store = Arc::new(BatchStore::with_capacity(16));
         let mut index_store = IndexStore::new();
-        index_store.enable_pk_position_index(vec!["id".to_string()]);
+        index_store.enable_pk_index(&[("id".to_string(), 0)]);
         index_store.add_hnsw(
             "vector_hnsw".to_string(),
             1,

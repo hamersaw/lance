@@ -814,6 +814,16 @@ async fn replay_memtable_from_wal(
     Ok(position)
 }
 
+/// Pair each primary-key column name with its field id (both derived from the
+/// schema's primary key, in the same order) for [`IndexStore::enable_pk_index`].
+fn pk_index_columns(pk_columns: &[String], pk_field_ids: &[i32]) -> Vec<(String, i32)> {
+    pk_columns
+        .iter()
+        .cloned()
+        .zip(pk_field_ids.iter().copied())
+        .collect()
+}
+
 /// Shared state for writer operations.
 struct SharedWriterState {
     state: Arc<RwLock<WriterState>>,
@@ -886,7 +896,7 @@ impl SharedWriterState {
                 self.max_memtable_rows,
                 self.max_memtable_batches,
             )?;
-            indexes.enable_pk_position_index(self.pk_columns.clone());
+            indexes.enable_pk_index(&pk_index_columns(&self.pk_columns, &self.pk_field_ids));
             new_memtable.set_indexes_arc(Arc::new(indexes));
         }
 
@@ -1275,7 +1285,7 @@ impl ShardWriter {
                 config.max_memtable_rows,
                 config.max_memtable_batches,
             )?;
-            indexes.enable_pk_position_index(pk_columns.clone());
+            indexes.enable_pk_index(&pk_index_columns(&pk_columns, &pk_field_ids));
             memtable.set_indexes_arc(Arc::new(indexes));
         }
 
