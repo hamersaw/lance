@@ -32,11 +32,9 @@ use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 use crate::session::Session;
 
 /// One newer generation's PK membership, used to decide whether it shadows an
-/// older source's row. In-memory generations (active / frozen) are **probed by
-/// value** against their maintained primary-key BTrees — no per-query set is
-/// built — while on-disk generations (flushed, base) carry a materialized
-/// PK-hash set (cached by path). The probe is snapshot-bounded, so a
-/// not-yet-visible write can't shadow an older visible copy.
+/// older source's row. In-memory generations probe their primary-key BTrees by
+/// value (snapshot-bounded, so a not-yet-visible write can't shadow an older
+/// visible copy); on-disk generations carry a cached PK-hash set.
 #[derive(Debug, Clone)]
 pub enum GenMembership {
     /// Probe the in-memory memtable's index, bounded to its visible prefix.
@@ -64,9 +62,7 @@ impl GenMembership {
                 let Some(max) = max_visible_row else {
                     return false;
                 };
-                index_store
-                    .pk_index()
-                    .is_some_and(|idx| idx.contains_visible(pk_values, *max))
+                index_store.pk_contains_visible(pk_values, *max)
             }
             Self::Set(set) => set.contains(&pk_hash),
         }
@@ -87,9 +83,7 @@ impl GenMembership {
             Self::Index {
                 index_store,
                 max_visible_row,
-            } => {
-                max_visible_row.is_none() || index_store.pk_index().is_none_or(|idx| idx.is_empty())
-            }
+            } => max_visible_row.is_none() || index_store.pk_is_empty(),
             Self::Set(set) => set.is_empty(),
         }
     }
@@ -216,7 +210,7 @@ fn in_memory_membership(
     index_store: &Arc<IndexStore>,
     pk_columns: &[String],
 ) -> Result<GenMembership> {
-    if index_store.pk_index().is_some() {
+    if index_store.has_pk_index() {
         let max_visible_row = batch_store.max_visible_row(index_store.max_visible_batch_position());
         Ok(GenMembership::Index {
             index_store: index_store.clone(),

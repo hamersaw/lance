@@ -669,12 +669,10 @@ fn probe_position(
     }
     let max_visible_row = visible_end - 1;
 
-    // A single-column primary key always has a value-keyed BTree on it (a
-    // reused user index or the auto-created `__pk__*` one — see
-    // `IndexStore::enable_pk_index`). It is collision-free, so one seek-and-stop
-    // yields the answer with no value re-check. Absent only when the table has
-    // no primary-key index at all, in which case the caller falls back to the
-    // plan path.
+    // A single-column primary key always has a value-keyed BTree (reused or
+    // auto-created — see `IndexStore::enable_pk_index`): collision-free, so one
+    // seek yields the answer with no re-check. Absent only when the table has no
+    // PK index, where the caller falls back to the plan path.
     let Some(btree) = index_store.get_btree_by_column(pk_column) else {
         return Ok(ProbePos::NoIndex);
     };

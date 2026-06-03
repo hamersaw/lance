@@ -18,11 +18,12 @@ mod arena_skiplist;
 mod btree;
 mod fts;
 mod hnsw;
-mod pk_lookup;
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+use datafusion::common::ScalarValue;
 
 use super::memtable::batch_store::StoredBatch;
 use arrow_array::RecordBatch;
@@ -46,7 +47,6 @@ pub type RowPosition = u64;
 pub use btree::{BTreeIndexConfig, BTreeMemIndex};
 pub use fts::{FtsIndexConfig, FtsMemIndex, FtsQueryExpr, SearchOptions};
 pub use hnsw::{HnswIndexConfig, HnswMemIndex};
-pub use pk_lookup::PkLookup;
 
 // ============================================================================
 // Index Store
@@ -205,12 +205,10 @@ pub struct IndexStore {
     hnsw_indexes: HashMap<String, HnswMemIndex>,
     /// FTS indexes keyed by index name.
     fts_indexes: HashMap<String, FtsMemIndex>,
-    /// The primary-key BTrees, one per PK column in primary-key order. Each
-    /// aliases an entry in `btree_indexes` (a reused user index, or an
-    /// auto-created `__pk__*` one), so it is maintained by the same insert loop.
-    /// Empty when the memtable has no primary key. Read as a [`PkLookup`] by the
-    /// active vector / FTS arms and the cross-source block-list to find the
-    /// newest visible version of a key (see [`Self::enable_pk_index`]).
+    /// The primary-key BTrees, one per PK column in order. Each aliases a
+    /// `btree_indexes` entry (reused or auto-created), so the insert loop
+    /// maintains it. Empty without a primary key; queried via
+    /// [`Self::pk_newest_visible`] (see [`Self::enable_pk_index`]).
     pk_btrees: Vec<Arc<BTreeMemIndex>>,
     /// Maximum batch position that is durable in the WAL and therefore
     /// visible to scanners. Advanced unconditionally after a WAL append
@@ -382,19 +380,15 @@ impl IndexStore {
             .insert(name, FtsMemIndex::with_params(field_id, column, params));
     }
 
-    /// Maintain a BTree index on each primary-key column so the memtable can
-    /// answer "newest visible version of this key" (see [`Self::pk_index`]).
+    /// Maintain a BTree on each primary-key column so the memtable can answer
+    /// "newest visible version of this key" (see [`Self::pk_index`]).
     ///
-    /// For each `(column, field_id)` an existing BTree on that field is reused;
-    /// otherwise an auto-created one is registered under a synthetic `__pk__*`
-    /// name so the normal insert loop maintains it. Call this once at
-    /// construction, after [`Self::from_configs`] (so user indexes are present
-    /// to reuse) and before any inserts. A no-op when `pk_columns` is empty (a
-    /// memtable without a primary key has nothing to dedup).
-    ///
-    /// The auto-created BTrees are in-memory only — flush rebuilds indexes from
-    /// the user's index configs, not from this map — so a primary key without a
-    /// user-defined scalar index does not gain an on-disk index.
+    /// Reuses an existing BTree on the field, else auto-creates one under a
+    /// `__pk__*` name so the normal insert loop maintains it. Call once at
+    /// construction, after [`Self::from_configs`] and before any inserts; a
+    /// no-op when `pk_columns` is empty. The auto-created BTrees are in-memory
+    /// only — flush rebuilds from the user's index configs — so a primary key
+    /// without a user scalar index gains no on-disk index.
     pub fn enable_pk_index(&mut self, pk_columns: &[(String, i32)]) {
         for (column, field_id) in pk_columns {
             let btree = match self
@@ -414,10 +408,67 @@ impl IndexStore {
         }
     }
 
-    /// A tuple-level view over the primary-key BTrees, if the memtable has a
-    /// primary key (see [`Self::enable_pk_index`]).
-    pub fn pk_index(&self) -> Option<PkLookup<'_>> {
-        (!self.pk_btrees.is_empty()).then(|| PkLookup::new(&self.pk_btrees))
+    /// Whether the memtable has a primary-key index (a BTree per PK column).
+    pub fn has_pk_index(&self) -> bool {
+        !self.pk_btrees.is_empty()
+    }
+
+    /// The newest row position of the primary-key tuple `values` (in PK order)
+    /// visible at `max_visible_row`, or `None`.
+    ///
+    /// Single-column is one seek. A composite key walks the leading column's
+    /// visible positions newest-first and returns the first that every other
+    /// column also holds at the same physical position — so the whole tuple
+    /// matches that row. Collision-free, since `position` is the row identity.
+    pub fn pk_newest_visible(
+        &self,
+        values: &[ScalarValue],
+        max_visible_row: RowPosition,
+    ) -> Option<RowPosition> {
+        match self.pk_btrees.as_slice() {
+            [] => None,
+            [only] => only.get_newest_visible(&values[0], max_visible_row),
+            [leading, rest @ ..] => {
+                let mut positions = leading.visible_positions(&values[0], max_visible_row);
+                positions.reverse();
+                positions.into_iter().find(|&position| {
+                    rest.iter()
+                        .zip(&values[1..])
+                        .all(|(column, value)| column.contains_position(value, position))
+                })
+            }
+        }
+    }
+
+    /// Whether `position` is the newest visible row of `values` — the recency
+    /// check the active index-search arms apply to drop predicate-crossing
+    /// stale hits. Callers gate on [`Self::has_pk_index`] first, since this is
+    /// `false` (drop) when the memtable has no primary-key index.
+    pub fn pk_is_newest(
+        &self,
+        values: &[ScalarValue],
+        position: RowPosition,
+        max_visible_row: RowPosition,
+    ) -> bool {
+        self.pk_newest_visible(values, max_visible_row) == Some(position)
+    }
+
+    /// Whether `values` has any version visible at `max_visible_row` — the
+    /// cross-source block-list's existence query, snapshot-bounded so a
+    /// not-yet-visible write can't shadow an older visible copy.
+    pub fn pk_contains_visible(
+        &self,
+        values: &[ScalarValue],
+        max_visible_row: RowPosition,
+    ) -> bool {
+        self.pk_newest_visible(values, max_visible_row).is_some()
+    }
+
+    /// Whether the primary-key index holds no rows (or doesn't exist). All
+    /// columns are inserted together, so the leading column answers for the
+    /// tuple.
+    pub fn pk_is_empty(&self) -> bool {
+        self.pk_btrees.first().is_none_or(|c| c.is_empty())
     }
 
     /// Insert a batch into all indexes.
@@ -442,8 +493,7 @@ impl IndexStore {
         for index in self.fts_indexes.values() {
             index.insert(batch, row_offset)?;
         }
-        // The primary-key BTrees are aliases of `btree_indexes` entries, so the
-        // loop above already maintained them.
+        // PK BTrees alias `btree_indexes` entries — already maintained above.
 
         // Update global watermark after all indexes have been updated
         if let Some(bp) = batch_position {
@@ -500,8 +550,7 @@ impl IndexStore {
             }
         }
 
-        // The primary-key BTrees are aliases of `btree_indexes` entries, so the
-        // loop above already maintained them.
+        // PK BTrees alias `btree_indexes` entries — already maintained above.
 
         // Update global watermark to the max batch position
         let max_bp = batches.iter().map(|b| b.batch_position).max().unwrap();
@@ -615,9 +664,8 @@ impl IndexStore {
                 .map(|(name, _idx_type, duration)| (name.to_string(), duration))
                 .collect();
 
-            // The primary-key BTrees are aliases of `btree_indexes` entries, so
-            // their per-index threads above already maintained them (and joined
-            // before the visibility watermark advances below).
+            // PK BTrees alias `btree_indexes` entries — their threads above
+            // already maintained them (and joined before the watermark advances).
 
             // Update global watermark to the max batch position
             let max_bp = batches.iter().map(|b| b.batch_position).max().unwrap();
@@ -761,6 +809,71 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    /// Single-column `id` batch for primary-key lookup tests.
+    fn id_batch(ids: &[i32]) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![Field::new(
+                "id",
+                DataType::Int32,
+                false,
+            )])),
+            vec![Arc::new(Int32Array::from(ids.to_vec()))],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn pk_newest_visible_single_column() {
+        let mut store = IndexStore::new();
+        store.enable_pk_index(&[("id".to_string(), 0)]);
+        // id=1 at positions 0 and 2 (an update), id=2 at position 1.
+        store.insert(&id_batch(&[1, 2]), 0).unwrap();
+        store.insert(&id_batch(&[1]), 2).unwrap();
+
+        let one = [ScalarValue::Int32(Some(1))];
+        // Watermark above the update sees the newest position; below it, the older.
+        assert_eq!(store.pk_newest_visible(&one, 5), Some(2));
+        assert_eq!(store.pk_newest_visible(&one, 1), Some(0));
+        assert!(store.pk_is_newest(&one, 2, 5));
+        assert!(!store.pk_is_newest(&one, 0, 5));
+        // Absent key.
+        assert!(!store.pk_contains_visible(&[ScalarValue::Int32(Some(9))], 5));
+    }
+
+    #[test]
+    fn pk_newest_visible_composite_intersects_by_position() {
+        let mut store = IndexStore::new();
+        store.enable_pk_index(&[("id".to_string(), 0), ("name".to_string(), 1)]);
+        // Rows: (1,"a")@0, (1,"b")@1, (1,"a")@2 — an update of (1,"a").
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 1, 1])),
+                Arc::new(StringArray::from(vec!["a", "b", "a"])),
+            ],
+        )
+        .unwrap();
+        store.insert(&batch, 0).unwrap();
+
+        let tuple_1a = [ScalarValue::Int32(Some(1)), ScalarValue::from("a")];
+        let tuple_1b = [ScalarValue::Int32(Some(1)), ScalarValue::from("b")];
+        // (1,"a")'s newest visible row is its re-write at position 2.
+        assert_eq!(store.pk_newest_visible(&tuple_1a, 5), Some(2));
+        assert!(store.pk_is_newest(&tuple_1a, 2, 5));
+        assert!(!store.pk_is_newest(&tuple_1a, 0, 5));
+        // (1,"b") only exists at position 1.
+        assert_eq!(store.pk_newest_visible(&tuple_1b, 5), Some(1));
+        // Watermark below the re-write: the older (1,"a")@0 is the newest visible.
+        assert_eq!(store.pk_newest_visible(&tuple_1a, 1), Some(0));
+        // An absent tuple.
+        let tuple_2a = [ScalarValue::Int32(Some(2)), ScalarValue::from("a")];
+        assert!(!store.pk_contains_visible(&tuple_2a, 5));
     }
 
     #[test]

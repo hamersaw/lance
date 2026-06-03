@@ -416,8 +416,7 @@ impl FixedIntBackend {
         };
         let start = FixedKey { enc, position: 0 };
         let mut positions = Vec::new();
-        // Keys are ordered by (enc, position); for a fixed enc, positions are
-        // ascending, so the first position past the watermark ends the walk.
+        // For a fixed enc, positions ascend — stop at the first past the watermark.
         for key in self.reader.range_from(&start) {
             if key.enc != enc || key.position > max {
                 break;
@@ -976,11 +975,8 @@ impl BTreeMemIndex {
     }
 
     /// All row positions for `value` that are `<= max_visible_row`, ascending.
-    ///
-    /// The composite-primary-key driver: a tuple's newest visible row is found
-    /// by walking the leading column's visible positions newest-first and
-    /// keeping the first that every other column also holds at the same physical
-    /// position (see [`super::PkLookup`]).
+    /// The composite-primary-key intersection driver (see
+    /// [`super::IndexStore::pk_newest_visible`]).
     pub fn visible_positions(
         &self,
         value: &ScalarValue,
@@ -992,10 +988,10 @@ impl BTreeMemIndex {
             .unwrap_or_default()
     }
 
-    /// Whether the exact `(value, position)` entry exists. One seek-and-stop:
-    /// the newest entry for `value` at or below `position` is `position` itself
-    /// iff that entry is present. Used to test a candidate row position against
-    /// the other primary-key columns when composing a composite key.
+    /// Whether the exact `(value, position)` entry exists — one seek (the newest
+    /// entry for `value` at or below `position` equals `position` iff present).
+    /// Probes a candidate position against the other PK columns (see
+    /// [`super::IndexStore::pk_newest_visible`]).
     pub fn contains_position(&self, value: &ScalarValue, position: RowPosition) -> bool {
         self.get_newest_visible(value, position) == Some(position)
     }

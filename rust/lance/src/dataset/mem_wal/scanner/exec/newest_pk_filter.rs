@@ -11,9 +11,9 @@
 //!
 //! This node closes that hole with a predicate-independent recency check: for
 //! each hit it asks the memtable's maintained primary-key index
-//! ([`crate::dataset::mem_wal::index::PkLookup`]) whether the hit's own row
-//! position is the newest version of its primary key visible at the query's
-//! `max_visible` watermark, and keeps the hit **iff so**. A stale hit (some
+//! ([`IndexStore::pk_is_newest`]) whether the hit's own row position is the
+//! newest version of its primary key visible at the query's `max_visible`
+//! watermark, and keeps the hit **iff so**. A stale hit (some
 //! newer version exists) is dropped even when that newer version never appears
 //! in the result. This is exactly the seek point-lookup already does; the index
 //! search arms simply didn't do it.
@@ -48,7 +48,8 @@ pub struct NewestPkFilterExec {
     input: Arc<dyn ExecutionPlan>,
     pk_columns: Vec<String>,
     row_id_column: String,
-    /// Holds the maintained primary-key index (`PkLookup`) queried per hit.
+    /// Holds the maintained primary-key index, queried per hit via
+    /// [`IndexStore::pk_is_newest`].
     index_store: Arc<IndexStore>,
     /// Resolves the `max_visible` row watermark from the visible batch prefix.
     batch_store: Arc<BatchStore>,
@@ -197,9 +198,9 @@ impl NewestPkFilterStream {
     fn filter_batch(&self, batch: RecordBatch) -> DFResult<RecordBatch> {
         // No primary-key index (memtable without a primary key), no visible
         // rows, or an empty batch: nothing to dedup against, so pass it through.
-        let Some(pk_index) = self.index_store.pk_index() else {
+        if !self.index_store.has_pk_index() {
             return Ok(batch);
-        };
+        }
         let Some(max_visible_row) = self.max_visible_row else {
             return Ok(batch);
         };
@@ -239,7 +240,10 @@ impl NewestPkFilterStream {
                 .map(|&col| ScalarValue::try_from_array(batch.column(col), row))
                 .collect::<DFResult<_>>()?;
             // Keep iff this hit is the newest visible version of its PK.
-            keep.push(pk_index.is_newest(&values, position, max_visible_row));
+            keep.push(
+                self.index_store
+                    .pk_is_newest(&values, position, max_visible_row),
+            );
         }
         filter_record_batch(&batch, &BooleanArray::from(keep))
             .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
