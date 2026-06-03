@@ -5,9 +5,9 @@
 //!
 //! The active memtable's HNSW / inverted index are append-only, so an updated
 //! row's old entries stay live. When an update moves a row out of the query's
-//! match set, the fresh version isn't in the index result, so the result-set
-//! dedup ([`super::WithinSourceDedupExec`]) has nothing to suppress the stale
-//! version against — and it leaks.
+//! match set, the fresh version isn't in the index result, so a result-set
+//! dedup (keep-newest among the returned rows) has nothing to suppress the
+//! stale version against — and it leaks.
 //!
 //! This node closes that hole with a predicate-independent recency check: for
 //! each hit it asks the memtable's maintained MVCC PK-position index
@@ -100,18 +100,10 @@ impl NewestPkFilterExec {
     }
 
     /// The inclusive max visible row position for this snapshot, or `None` when
-    /// no rows are visible. Mirrors `point_lookup::probe_position`: the visible
-    /// prefix is `[0, max_visible_batch_position]`, and each batch carries its
-    /// cumulative `row_offset`.
+    /// no rows are visible.
     fn max_visible_row(&self) -> Option<u64> {
-        let len = self.batch_store.len();
-        if len == 0 {
-            return None;
-        }
-        let last_visible_idx = self.max_visible_batch_position.min(len - 1);
-        let last = self.batch_store.get(last_visible_idx)?;
-        let visible_end = last.row_offset + last.num_rows as u64; // exclusive
-        visible_end.checked_sub(1)
+        self.batch_store
+            .max_visible_row(self.max_visible_batch_position)
     }
 }
 

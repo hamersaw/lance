@@ -615,6 +615,22 @@ impl BatchStore {
         (0..end).collect()
     }
 
+    /// The inclusive maximum visible *row* position at `max_visible_batch_position`,
+    /// or `None` when no rows are visible. The visible batches are the committed
+    /// prefix `[0, last_visible_idx]`; each batch carries its cumulative
+    /// `row_offset`, so this is the end of the last visible batch minus one.
+    /// Used to bound MVCC seeks against the maintained PK-position index.
+    pub fn max_visible_row(&self, max_visible_batch_position: usize) -> Option<u64> {
+        let len = self.committed_len.load(Ordering::Acquire);
+        if len == 0 {
+            return None;
+        }
+        let last_visible_idx = max_visible_batch_position.min(len - 1);
+        let last = self.get(last_visible_idx)?;
+        let visible_end = last.row_offset + last.num_rows as u64; // exclusive
+        visible_end.checked_sub(1)
+    }
+
     /// Check if a specific batch is visible at a given visibility position.
     #[inline]
     pub fn is_batch_visible(

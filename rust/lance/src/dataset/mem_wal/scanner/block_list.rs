@@ -28,12 +28,69 @@ use crate::dataset::Dataset;
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 use crate::session::Session;
 
-/// Per-source blocked PK-hash sets, keyed by `(shard_id, generation)`. Each
-/// value is the membership sets of the generations newer than that source.
-pub type SourceBlockLists = HashMap<(Option<Uuid>, LsmGeneration), Vec<Arc<HashSet<u64>>>>;
+/// One newer generation's PK membership, used to decide whether it shadows an
+/// older source's row. In-memory generations (active / frozen) are **probed**
+/// against their maintained MVCC PK-position index — no per-query set is built —
+/// while on-disk generations (flushed, base) carry a materialized PK-hash set
+/// (cached by path). The probe is snapshot-bounded, so a not-yet-visible write
+/// can't shadow an older visible copy.
+#[derive(Debug, Clone)]
+pub enum GenMembership {
+    /// Probe the in-memory memtable's index, bounded to its visible prefix.
+    Index {
+        index_store: Arc<IndexStore>,
+        /// Inclusive visible row watermark; `None` when no rows are visible.
+        max_visible_row: Option<u64>,
+    },
+    /// A materialized PK-hash set (flushed / base, or an in-memory memtable that
+    /// has no PK-position index).
+    Set(Arc<HashSet<u64>>),
+}
 
-/// A shard's generations paired with their PK-hash membership, before sorting.
-type ShardGenSets = HashMap<Uuid, Vec<(LsmGeneration, Arc<HashSet<u64>>)>>;
+impl GenMembership {
+    /// Whether this generation contains `pk_hash` (visibly, for the index case).
+    pub fn contains(&self, pk_hash: u64) -> bool {
+        match self {
+            Self::Index {
+                index_store,
+                max_visible_row,
+            } => {
+                let Some(max) = max_visible_row else {
+                    return false;
+                };
+                index_store
+                    .pk_position_index()
+                    .is_some_and(|idx| idx.contains_visible(pk_hash, *max))
+            }
+            Self::Set(set) => set.contains(&pk_hash),
+        }
+    }
+
+    /// Whether this generation has no (visible) membership — used to skip adding
+    /// an empty blocked set. Approximate for the index case (it ignores the
+    /// watermark when counting), which only ever leaves a harmless no-op entry.
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Index {
+                index_store,
+                max_visible_row,
+            } => {
+                max_visible_row.is_none()
+                    || index_store
+                        .pk_position_index()
+                        .is_none_or(|idx| idx.is_empty())
+            }
+            Self::Set(set) => set.is_empty(),
+        }
+    }
+}
+
+/// Per-source blocked memberships, keyed by `(shard_id, generation)`. Each value
+/// is the memberships of the generations newer than that source.
+pub type SourceBlockLists = HashMap<(Option<Uuid>, LsmGeneration), Vec<GenMembership>>;
+
+/// A shard's generations paired with their membership, before sorting.
+type ShardGenSets = HashMap<Uuid, Vec<(LsmGeneration, GenMembership)>>;
 
 /// Per-source `NEWER(G)`, keyed by `(shard_id, generation)`. Generations are
 /// per-shard, so a source is superseded only by strictly-newer generations of
@@ -60,11 +117,11 @@ pub async fn compute_source_block_lists(
                 generation,
                 ..
             } => {
-                let hashes = Arc::new(in_memory_pk_hashes(batch_store, index_store, pk_columns)?);
+                let membership = in_memory_membership(batch_store, index_store, pk_columns)?;
                 by_shard
                     .entry(*shard_id)
                     .or_default()
-                    .push((*generation, hashes));
+                    .push((*generation, membership));
             }
             LsmDataSource::FlushedMemTable {
                 path,
@@ -77,25 +134,25 @@ pub async fn compute_source_block_lists(
                 by_shard
                     .entry(*shard_id)
                     .or_default()
-                    .push((*generation, hashes));
+                    .push((*generation, GenMembership::Set(hashes)));
             }
         }
     }
 
     let mut blocked: SourceBlockLists = HashMap::new();
     // Base (shardless, oldest) is superseded by every non-base generation.
-    let mut base_blocked: Vec<Arc<HashSet<u64>>> = Vec::new();
+    let mut base_blocked: Vec<GenMembership> = Vec::new();
     for (shard, mut gens) in by_shard {
         // Newest-first: a gen's blocked list is its own shard's newer gens.
         gens.sort_by_key(|(generation, _)| std::cmp::Reverse(*generation));
-        let mut newer: Vec<Arc<HashSet<u64>>> = Vec::new();
-        for (generation, hashes) in gens {
+        let mut newer: Vec<GenMembership> = Vec::new();
+        for (generation, membership) in gens {
             if !newer.is_empty() {
                 blocked.insert((Some(shard), generation), newer.clone());
             }
-            if !hashes.is_empty() {
-                base_blocked.push(hashes.clone());
-                newer.push(hashes);
+            if !membership.is_empty() {
+                base_blocked.push(membership.clone());
+                newer.push(membership);
             }
         }
     }
@@ -152,6 +209,32 @@ fn in_memory_pk_hashes(
     match index_store.pk_position_index() {
         Some(index) => Ok(index.pk_hashes()),
         None => pk_hashes_from_batch_store(batch_store, pk_columns),
+    }
+}
+
+/// Cross-source membership of an in-memory (active / frozen) memtable.
+///
+/// Prefers a snapshot-bounded **probe** of the maintained PK-position index (no
+/// per-query set built), falling back to a one-time `BatchStore` scan only when
+/// the memtable has no such index (e.g. a table without a primary key) — which
+/// the production vector-search path never hits, since that index is always
+/// enabled alongside the secondary indexes.
+fn in_memory_membership(
+    batch_store: &Arc<BatchStore>,
+    index_store: &Arc<IndexStore>,
+    pk_columns: &[String],
+) -> Result<GenMembership> {
+    if index_store.pk_position_index().is_some() {
+        let max_visible_row = batch_store.max_visible_row(index_store.max_visible_batch_position());
+        Ok(GenMembership::Index {
+            index_store: index_store.clone(),
+            max_visible_row,
+        })
+    } else {
+        Ok(GenMembership::Set(Arc::new(pk_hashes_from_batch_store(
+            batch_store,
+            pk_columns,
+        )?)))
     }
 }
 
@@ -266,9 +349,10 @@ mod tests {
         compute_pk_hash(&batch, &pk_indices, 0)
     }
 
-    /// Whether `id`'s PK hash is blocked by any of a source's newer-gen sets.
-    fn blocks(sets: &[Arc<HashSet<u64>>], id: i32) -> bool {
-        sets.iter().any(|s| s.contains(&hash_id(id)))
+    /// Whether `id`'s PK hash is blocked by any of a source's newer-gen
+    /// memberships.
+    fn blocks(memberships: &[GenMembership], id: i32) -> bool {
+        memberships.iter().any(|m| m.contains(hash_id(id)))
     }
 
     #[test]
@@ -324,10 +408,11 @@ mod tests {
 
         // One set per generation; together they cover pk=1,2,3 (not 4).
         assert_eq!(sets.len(), 2);
+        let set_blocks = |id: i32| sets.iter().any(|s| s.contains(&hash_id(id)));
         for id in [1, 2, 3] {
-            assert!(blocks(&sets, id));
+            assert!(set_blocks(id));
         }
-        assert!(!blocks(&sets, 4));
+        assert!(!set_blocks(4));
     }
 
     #[tokio::test]
@@ -496,13 +581,21 @@ mod tests {
         stale_store.append(id_batch(&[1])).unwrap();
 
         // Active gen 2: pk=1 re-written + pk=2, with the index enabled + populated.
+        // `insert_with_batch_position(Some(bp))` advances the visibility watermark
+        // so the snapshot-bounded probe sees both rows.
         let active_store = BatchStore::with_capacity(8);
         let mut active_index = IndexStore::new();
         active_index.enable_pk_position_index(vec!["id".to_string()]);
-        active_index.insert(&id_batch(&[1]), 0).unwrap();
-        active_index.insert(&id_batch(&[2]), 1).unwrap();
-        active_store.append(id_batch(&[1])).unwrap();
-        active_store.append(id_batch(&[2])).unwrap();
+        let b1 = id_batch(&[1]);
+        let (bp1, off1, _) = active_store.append(b1.clone()).unwrap();
+        active_index
+            .insert_with_batch_position(&b1, off1, Some(bp1))
+            .unwrap();
+        let b2 = id_batch(&[2]);
+        let (bp2, off2, _) = active_store.append(b2.clone()).unwrap();
+        active_index
+            .insert_with_batch_position(&b2, off2, Some(bp2))
+            .unwrap();
 
         let schema = id_batch(&[1]).schema();
         let sources = vec![

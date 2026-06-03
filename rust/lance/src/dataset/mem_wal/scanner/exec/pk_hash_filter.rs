@@ -14,7 +14,6 @@
 //! when a source had >= k candidates but < k survived (over-fetch too small).
 
 use std::any::Any;
-use std::collections::HashSet;
 use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -33,15 +32,18 @@ use datafusion::physical_plan::{
 use futures::{Stream, StreamExt};
 use tracing::warn;
 
+use super::super::block_list::GenMembership;
 use super::pk::{compute_pk_hash, resolve_pk_indices};
 
-/// Filters out rows whose PK hash is in any set of `blocked`.
+/// Filters out rows whose PK is contained in any newer generation's membership.
 #[derive(Debug)]
 pub struct PkHashFilterExec {
     input: Arc<dyn ExecutionPlan>,
     pk_columns: Vec<String>,
-    /// Newer generations' membership; a row is blocked if any set holds its hash.
-    blocked: Vec<Arc<HashSet<u64>>>,
+    /// Newer generations' membership; a row is blocked if any contains its hash.
+    /// In-memory generations are probed against their index; on-disk ones hold a
+    /// materialized hash set (see [`GenMembership`]).
+    blocked: Vec<GenMembership>,
     /// Target neighbor count, used only to warn on a per-source under-fetch.
     k: usize,
     properties: Arc<PlanProperties>,
@@ -51,7 +53,7 @@ impl PkHashFilterExec {
     pub fn new(
         input: Arc<dyn ExecutionPlan>,
         pk_columns: Vec<String>,
-        blocked: Vec<Arc<HashSet<u64>>>,
+        blocked: Vec<GenMembership>,
         k: usize,
     ) -> Self {
         // A filter preserves the input schema and partitioning.
@@ -77,13 +79,11 @@ impl DisplayAs for PkHashFilterExec {
             DisplayFormatType::Default
             | DisplayFormatType::Verbose
             | DisplayFormatType::TreeRender => {
-                let total: usize = self.blocked.iter().map(|s| s.len()).sum();
                 write!(
                     f,
-                    "PkHashFilterExec: pk_cols=[{}], gens={}, blocked={}",
+                    "PkHashFilterExec: pk_cols=[{}], gens={}",
                     self.pk_columns.join(", "),
                     self.blocked.len(),
-                    total,
                 )
             }
         }
@@ -150,7 +150,7 @@ impl ExecutionPlan for PkHashFilterExec {
 struct PkHashFilterStream {
     input: SendableRecordBatchStream,
     pk_columns: Vec<String>,
-    blocked: Vec<Arc<HashSet<u64>>>,
+    blocked: Vec<GenMembership>,
     k: usize,
     schema: SchemaRef,
     input_seen: usize,
@@ -167,7 +167,10 @@ impl PkHashFilterStream {
         let keep: BooleanArray = (0..batch.num_rows())
             .map(|row| {
                 let hash = compute_pk_hash(&batch, &pk_indices, row);
-                !self.blocked.iter().any(|set| set.contains(&hash))
+                !self
+                    .blocked
+                    .iter()
+                    .any(|membership| membership.contains(hash))
             })
             .collect();
         filter_record_batch(&batch, &keep)
@@ -223,6 +226,7 @@ mod tests {
     use datafusion::prelude::SessionContext;
     use datafusion_physical_plan::test::TestMemoryExec;
     use futures::TryStreamExt;
+    use std::collections::HashSet;
 
     /// Hash a single-column Int32 PK value the way the exec does, so a test can
     /// build blocked sets from values rather than hand-computed hashes.
@@ -237,8 +241,10 @@ mod tests {
         RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(ids.to_vec()))]).unwrap()
     }
 
-    fn blocked(ids: &[i32]) -> Vec<Arc<HashSet<u64>>> {
-        vec![Arc::new(ids.iter().map(|&id| hash_int_pk(id)).collect())]
+    fn blocked(ids: &[i32]) -> Vec<GenMembership> {
+        vec![GenMembership::Set(Arc::new(
+            ids.iter().map(|&id| hash_int_pk(id)).collect(),
+        ))]
     }
 
     async fn run(exec: PkHashFilterExec) -> Vec<i32> {
@@ -275,8 +281,8 @@ mod tests {
         // Two newer-gen sets: a row is dropped if either contains its PK.
         let b = int_batch(&[10, 20, 30]);
         let sets = vec![
-            Arc::new(HashSet::from([hash_int_pk(10)])),
-            Arc::new(HashSet::from([hash_int_pk(30)])),
+            GenMembership::Set(Arc::new(HashSet::from([hash_int_pk(10)]))),
+            GenMembership::Set(Arc::new(HashSet::from([hash_int_pk(30)]))),
         ];
         let input = TestMemoryExec::try_new_exec(&[vec![b.clone()]], b.schema(), None).unwrap();
         let exec = PkHashFilterExec::new(input, vec!["id".to_string()], sets, 1);
@@ -302,11 +308,9 @@ mod tests {
         let pk = vec!["id".to_string()];
         let null_row = with_null(vec![None]);
         let pk_indices = resolve_pk_indices(&null_row, &pk).unwrap();
-        let sets = vec![Arc::new(HashSet::from([compute_pk_hash(
-            &null_row,
-            &pk_indices,
-            0,
-        )]))];
+        let sets = vec![GenMembership::Set(Arc::new(HashSet::from([
+            compute_pk_hash(&null_row, &pk_indices, 0),
+        ])))];
 
         // Rows: 10, NULL, 30 — only the NULL-key row is dropped.
         let b = with_null(vec![Some(10), None, Some(30)]);
@@ -335,11 +339,9 @@ mod tests {
         let pk = vec!["id".to_string(), "name".to_string()];
         let one_row = mk(&[2], &["b"]);
         let pk_indices = resolve_pk_indices(&one_row, &pk).unwrap();
-        let sets = vec![Arc::new(HashSet::from([compute_pk_hash(
-            &one_row,
-            &pk_indices,
-            0,
-        )]))];
+        let sets = vec![GenMembership::Set(Arc::new(HashSet::from([
+            compute_pk_hash(&one_row, &pk_indices, 0),
+        ])))];
 
         // (1,"a") and (2,"a") survive; only the exact (2,"b") tuple is dropped.
         let b = mk(&[1, 2, 2], &["a", "a", "b"]);

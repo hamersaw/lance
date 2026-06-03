@@ -37,10 +37,12 @@ use crate::session::Session;
 /// Plans vector search queries over LSM data.
 ///
 /// Each source is independently newest-per-PK before the union — the active
-/// memtable via an over-fetched KNN + within-source dedup, flushed generations
-/// via their within-generation deletion vector — and the cross-generation
-/// block-list ([`super::exec::PkHashFilterExec`]) drops any PK superseded by a
-/// newer generation. So each PK reaches the union from exactly one source and a
+/// memtable via an over-fetched KNN + a newest-per-PK recency filter
+/// ([`super::exec::NewestPkFilterExec`], which drops a hit that isn't the newest
+/// visible version of its PK), flushed generations via their within-generation
+/// deletion vector — and the cross-generation block-list
+/// ([`super::exec::PkHashFilterExec`]) drops any PK superseded by a newer
+/// generation. So each PK reaches the union from exactly one source and a
 /// distance-ordered merge yields the global top-k; no cross-source dedup is
 /// needed.
 ///
@@ -53,7 +55,7 @@ use crate::session::Session;
 ///       UnionExec
 ///         ProjectionExec (canonical output schema)
 ///           SortExec(_distance, fetch=k)
-///             WithinSourceDedupExec: KeepMaxRowAddr           (active)
+///             NewestPkFilterExec: newest-per-PK recency        (active)
 ///               KNNExec: active memtable, fetch=ceil(k*overfetch)
 ///         ProjectionExec (canonical output schema)
 ///           ProjectionExec (null_columns _rowid)
@@ -451,8 +453,8 @@ impl LsmVectorSearchPlanner {
                     build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>());
                 // Expose `_rowid` (BatchStore row offset, monotonic with
-                // insert order) so [`WithinSourceDedupExec`] can collapse
-                // duplicate-PK rows to the newest insert. The value is
+                // insert order) so `NewestPkFilterExec` can compare each hit's
+                // position against the PK-position index. The value is
                 // per-source and NULL'd before reaching the canonical merge.
                 // (VectorIndexExec only plumbs `with_row_id`, not
                 // `with_row_address`, but the two yield identical values
@@ -1458,9 +1460,9 @@ mod tests {
     #[tokio::test]
     async fn test_vector_search_dedup_within_active_memtable() {
         // Regression: same PK inserted twice into one active memtable with
-        // *different* vectors. HNSW indexes each as a distinct node, so
-        // without WithinSourceDedupExec a KNN can return both candidates
-        // for the same PK and pollute top-k. The newer insert must win.
+        // *different* vectors. HNSW indexes each as a distinct node, so without
+        // the recency filter a KNN can return both candidates for the same PK
+        // and pollute top-k. The newer insert must win.
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
         use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use datafusion::prelude::SessionContext;
@@ -1578,8 +1580,8 @@ mod tests {
         //
         // Within a *single* active memtable, pk=1 is first inserted ON the query
         // (distance ~0), then updated to a FAR vector. The append-only HNSW keeps
-        // both nodes live. WithinSourceDedupExec(KeepMaxRowAddr) only collapses
-        // duplicate PKs that are BOTH present in the over-fetched candidate set.
+        // both nodes live. A result-set dedup only collapses duplicate PKs that
+        // are BOTH present in the over-fetched candidate set.
         //
         // Here the fresh (far) pk=1 is evicted from the candidate set — there are
         // enough nearer filler rows that it ranks below the fetch cutoff — so the

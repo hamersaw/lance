@@ -105,6 +105,41 @@ impl PkPositionIndex {
             .flatten()
     }
 
+    /// Whether `pk_hash` has any version visible at `max_visible_row`. The
+    /// cross-source block-list's existence query — "does a newer generation
+    /// contain this PK?" — reduces to this, position-bounded so a not-yet-visible
+    /// write can't shadow an older visible copy.
+    pub fn contains_visible(&self, pk_hash: u64, max_visible_row: RowPosition) -> bool {
+        self.get_newest_visible(pk_hash, max_visible_row).is_some()
+    }
+
+    /// All row positions written for `pk_hash` that are `<= max_visible_row`, in
+    /// ascending (oldest-first) order. Used by point-lookup to resolve a hash
+    /// collision: walk the matches newest-first and keep the first whose actual
+    /// primary-key value equals the query, so a colliding key never returns the
+    /// wrong row. Empty (and allocation-free past the seek) when the hash is
+    /// absent; the common no-collision lookup uses [`Self::get_newest_visible`].
+    pub fn visible_positions(
+        &self,
+        pk_hash: u64,
+        max_visible_row: RowPosition,
+    ) -> Vec<RowPosition> {
+        let start = PkPosKey {
+            hash: pk_hash,
+            position: 0,
+        };
+        let mut positions = Vec::new();
+        for key in self.reader.range_from(&start) {
+            if key.hash != pk_hash {
+                break;
+            }
+            if key.position <= max_visible_row {
+                positions.push(key.position);
+            }
+        }
+        positions
+    }
+
     /// Every distinct primary-key hash currently in the index. The cross-source
     /// block-list uses this as an in-memory generation's membership set instead
     /// of re-scanning (and re-hashing) the `BatchStore` per query.

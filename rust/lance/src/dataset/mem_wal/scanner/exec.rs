@@ -9,7 +9,6 @@
 //! - [`MemtableGenTagExec`]: Wraps a scan to add `_memtable_gen` column
 //! - [`BloomFilterGuardExec`]: Guards child execution with bloom filter check
 //! - [`CoalesceFirstExec`]: Returns first non-empty result with short-circuit
-//! - [`WithinSourceDedupExec`]: Deduplicates rows with the same PK from a single source
 //! - [`PkHashFilterExec`]: Drops rows whose PK hash was superseded by a newer generation (the cross-generation block-list)
 //! - [`NewestPkFilterExec`]: Drops active-memtable hits that aren't the newest visible version of their PK (the within-source recency filter)
 
@@ -19,7 +18,6 @@ mod generation_tag;
 mod newest_pk_filter;
 mod pk;
 mod pk_hash_filter;
-mod within_source_dedup;
 
 pub use bloom_guard::{BloomFilterGuardExec, compute_pk_hash_from_scalars};
 pub use coalesce_first::CoalesceFirstExec;
@@ -30,4 +28,3 @@ pub use pk::{
     validate_pk_types,
 };
 pub use pk_hash_filter::PkHashFilterExec;
-pub use within_source_dedup::{DedupDirection, WithinSourceDedupExec};
