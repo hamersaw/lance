@@ -25,7 +25,7 @@ use super::data_source::{LsmDataSource, LsmGeneration};
 use super::exec::{compute_pk_hash, resolve_pk_indices};
 use super::flushed_cache::{FlushedMemTableCache, open_flushed_dataset};
 use crate::dataset::Dataset;
-use crate::dataset::mem_wal::write::BatchStore;
+use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 use crate::session::Session;
 
 /// Per-source blocked PK-hash sets, keyed by `(shard_id, generation)`. Each
@@ -55,11 +55,12 @@ pub async fn compute_source_block_lists(
             LsmDataSource::BaseTable { .. } => has_base = true,
             LsmDataSource::ActiveMemTable {
                 batch_store,
+                index_store,
                 shard_id,
                 generation,
                 ..
             } => {
-                let hashes = Arc::new(pk_hashes_from_batch_store(batch_store, pk_columns)?);
+                let hashes = Arc::new(in_memory_pk_hashes(batch_store, index_store, pk_columns)?);
                 by_shard
                     .entry(*shard_id)
                     .or_default()
@@ -119,9 +120,11 @@ pub async fn fresh_tier_block_list(
     for source in sources {
         let set = match source {
             LsmDataSource::BaseTable { .. } => continue,
-            LsmDataSource::ActiveMemTable { batch_store, .. } => {
-                Arc::new(pk_hashes_from_batch_store(batch_store, pk_columns)?)
-            }
+            LsmDataSource::ActiveMemTable {
+                batch_store,
+                index_store,
+                ..
+            } => Arc::new(in_memory_pk_hashes(batch_store, index_store, pk_columns)?),
             LsmDataSource::FlushedMemTable { path, .. } => {
                 flushed_pk_hashes(path, pk_columns, session, flushed_cache).await?
             }
@@ -131,6 +134,25 @@ pub async fn fresh_tier_block_list(
         }
     }
     Ok(sets)
+}
+
+/// PK-hash membership of an in-memory (active / frozen) memtable.
+///
+/// Reads it straight from the memtable's maintained MVCC PK-position index — its
+/// keyset *is* the membership set, already hashed, so there is nothing to
+/// re-scan or re-hash. Falls back to a one-time `BatchStore` scan only when the
+/// memtable has no PK-position index (e.g. a table without a primary key), which
+/// the production vector-search path never hits since that index is always
+/// enabled alongside the secondary indexes.
+fn in_memory_pk_hashes(
+    batch_store: &BatchStore,
+    index_store: &IndexStore,
+    pk_columns: &[String],
+) -> Result<HashSet<u64>> {
+    match index_store.pk_position_index() {
+        Some(index) => Ok(index.pk_hashes()),
+        None => pk_hashes_from_batch_store(batch_store, pk_columns),
+    }
 }
 
 /// Hash the PK membership of an in-memory memtable (active or frozen) from its
@@ -456,5 +478,64 @@ mod tests {
         // The newest generation of each shard is superseded by nothing.
         assert!(!blocked.contains_key(&(Some(a), g2)));
         assert!(!blocked.contains_key(&(Some(b), g2)));
+    }
+
+    #[tokio::test]
+    async fn in_memory_membership_reads_from_pk_position_index() {
+        // When the memtable has a maintained PK-position index, the block-list
+        // sources its membership from that index (no BatchStore re-scan) and
+        // still suppresses an older generation's stale copy.
+        use crate::dataset::mem_wal::scanner::data_source::{LsmDataSource, LsmGeneration};
+        use crate::dataset::mem_wal::write::IndexStore;
+        use uuid::Uuid;
+
+        let shard = Uuid::new_v4();
+
+        // Frozen gen 1: stale pk=1, no PK-position index (exercises the fallback).
+        let stale_store = BatchStore::with_capacity(8);
+        stale_store.append(id_batch(&[1])).unwrap();
+
+        // Active gen 2: pk=1 re-written + pk=2, with the index enabled + populated.
+        let active_store = BatchStore::with_capacity(8);
+        let mut active_index = IndexStore::new();
+        active_index.enable_pk_position_index(vec!["id".to_string()]);
+        active_index.insert(&id_batch(&[1]), 0).unwrap();
+        active_index.insert(&id_batch(&[2]), 1).unwrap();
+        active_store.append(id_batch(&[1])).unwrap();
+        active_store.append(id_batch(&[2])).unwrap();
+
+        let schema = id_batch(&[1]).schema();
+        let sources = vec![
+            LsmDataSource::ActiveMemTable {
+                batch_store: Arc::new(stale_store),
+                index_store: Arc::new(IndexStore::new()),
+                schema: schema.clone(),
+                shard_id: shard,
+                generation: LsmGeneration::memtable(1),
+            },
+            LsmDataSource::ActiveMemTable {
+                batch_store: Arc::new(active_store),
+                index_store: Arc::new(active_index),
+                schema,
+                shard_id: shard,
+                generation: LsmGeneration::memtable(2),
+            },
+        ];
+
+        let blocked = Box::pin(compute_source_block_lists(
+            &sources,
+            &["id".to_string()],
+            None,
+            None,
+        ))
+        .await
+        .unwrap();
+
+        // gen 2's index-sourced membership is {pk=1, pk=2}; gen 1 (stale pk=1)
+        // is blocked on both, and the newest gen 2 has no blocked set.
+        let g1 = LsmGeneration::memtable(1);
+        assert!(blocks(&blocked[&(Some(shard), g1)], 1));
+        assert!(blocks(&blocked[&(Some(shard), g1)], 2));
+        assert!(!blocked.contains_key(&(Some(shard), LsmGeneration::memtable(2))));
     }
 }

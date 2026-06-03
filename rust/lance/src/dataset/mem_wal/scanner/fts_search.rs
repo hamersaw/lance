@@ -51,6 +51,7 @@ use tracing::instrument;
 
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
+use super::exec::NewestPkFilterExec;
 use super::flushed_cache::{FlushedMemTableCache, open_flushed_dataset};
 use super::projection::project_to_canonical;
 use crate::dataset::mem_wal::memtable::scanner::MemTableScanner;
@@ -232,6 +233,12 @@ impl LsmFtsSearchPlanner {
                     MemTableScanner::new(batch_store.clone(), index_store.clone(), schema.clone());
                 let cols = self.fts_scanner_projection(projection);
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+                // Expose the row position so the recency filter can identify the
+                // newest visible version of each PK. The append-only inverted
+                // index keeps an updated row's old postings live, so a stale hit
+                // can match a query the fresh row no longer does; the filter
+                // drops it. `project_to_canonical` strips `_rowid` afterward.
+                scanner.with_row_id();
                 // `MemTableScanner::full_text_search` takes a raw match
                 // string; richer query shapes (phrase/boolean/fuzzy) can
                 // be plumbed through once the MemTable scanner accepts a
@@ -250,7 +257,16 @@ impl LsmFtsSearchPlanner {
                 // today; the per-partition Sort+fetch above bounds the
                 // emitted rows.
                 let _ = k;
-                scanner.create_plan().await
+                let plan = scanner.create_plan().await?;
+                let filtered: Arc<dyn ExecutionPlan> = Arc::new(NewestPkFilterExec::new(
+                    plan,
+                    self.pk_columns.clone(),
+                    lance_core::ROW_ID,
+                    index_store.clone(),
+                    batch_store.clone(),
+                    scanner.max_visible_batch_position(),
+                ));
+                Ok(filtered)
             }
         }
     }
@@ -404,6 +420,7 @@ mod tests {
         // Active memtable with its own FTS index, containing a matching row.
         let batch_store = Arc::new(BatchStore::with_capacity(16));
         let mut indexes = IndexStore::new();
+        indexes.enable_pk_position_index(vec!["id".to_string()]);
         indexes.add_fts("text_fts".to_string(), 1, "text".to_string());
         let active_batch = make_batch(
             &schema,
@@ -483,6 +500,7 @@ mod tests {
         let schema = fts_schema();
         let batch_store = Arc::new(BatchStore::with_capacity(16));
         let mut indexes = IndexStore::new();
+        indexes.enable_pk_position_index(vec!["id".to_string()]);
         // text column has field_id 1 in fts_schema()
         indexes.add_fts("text_fts".to_string(), 1, "text".to_string());
         let batch = make_batch(
@@ -563,11 +581,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "known bug: active-memtable predicate-crossing stale read in the FTS arm. \
-                A PK updated so its new text no longer matches the query still leaks its stale \
-                version, because the append-only inverted index keeps the old posting and the \
-                fresh row isn't a candidate to dedup against. Un-ignore once the active arm gains \
-                a predicate-independent recency filter over the whole memtable."]
     async fn active_stale_update_predicate_crossing_leaks() {
         // BUG REPRODUCTION (FTS case: a PK update that crosses out of the match set).
         //
@@ -584,6 +597,7 @@ mod tests {
         let schema = fts_schema();
         let batch_store = Arc::new(BatchStore::with_capacity(16));
         let mut indexes = IndexStore::new();
+        indexes.enable_pk_position_index(vec!["id".to_string()]);
         indexes.add_fts("text_fts".to_string(), 1, "text".to_string());
 
         // Insert pk=1 ("alpha lance") and an unrelated live pk=2 ("alpha foo").

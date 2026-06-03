@@ -18,6 +18,7 @@ mod arena_skiplist;
 mod btree;
 mod fts;
 mod hnsw;
+mod pk_position;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -44,6 +45,7 @@ pub type RowPosition = u64;
 pub use btree::{BTreeIndexConfig, BTreeMemIndex};
 pub use fts::{FtsIndexConfig, FtsMemIndex, FtsQueryExpr, SearchOptions};
 pub use hnsw::{HnswIndexConfig, HnswMemIndex};
+pub use pk_position::PkPositionIndex;
 
 // ============================================================================
 // Index Store
@@ -201,6 +203,11 @@ pub struct IndexStore {
     hnsw_indexes: HashMap<String, HnswMemIndex>,
     /// FTS indexes keyed by index name.
     fts_indexes: HashMap<String, FtsMemIndex>,
+    /// MVCC primary-key → newest-position index. Present when the memtable has a
+    /// primary key; maintained on every insert and read by the active vector /
+    /// FTS arms to drop predicate-crossing stale rows. Not an `Option<&str>`-keyed
+    /// map like the others — there is at most one per memtable.
+    pk_position_index: Option<PkPositionIndex>,
     /// Maximum batch position that is durable in the WAL and therefore
     /// visible to scanners. Advanced unconditionally after a WAL append
     /// succeeds; not gated on whether any indexes are configured.
@@ -213,6 +220,7 @@ impl Default for IndexStore {
             btree_indexes: HashMap::new(),
             hnsw_indexes: HashMap::new(),
             fts_indexes: HashMap::new(),
+            pk_position_index: None,
             max_visible_batch_position: AtomicUsize::new(0),
         }
     }
@@ -230,6 +238,7 @@ impl std::fmt::Debug for IndexStore {
                 &self.hnsw_indexes.keys().collect::<Vec<_>>(),
             )
             .field("fts_indexes", &self.fts_indexes.keys().collect::<Vec<_>>())
+            .field("pk_position_index", &self.pk_position_index)
             .field(
                 "max_visible_batch_position",
                 &self.max_visible_batch_position.load(Ordering::Acquire),
@@ -362,6 +371,24 @@ impl IndexStore {
             .insert(name, FtsMemIndex::with_params(field_id, column, params));
     }
 
+    /// Enable the MVCC primary-key → newest-position index over `pk_columns`.
+    ///
+    /// Build this once at construction, before any inserts (it is maintained on
+    /// every subsequent insert). A no-op when `pk_columns` is empty (a memtable
+    /// without a primary key has nothing to dedup). The active vector / FTS
+    /// search arms read it via [`Self::pk_position_index`] to drop stale rows.
+    pub fn enable_pk_position_index(&mut self, pk_columns: Vec<String>) {
+        if !pk_columns.is_empty() {
+            self.pk_position_index = Some(PkPositionIndex::new(pk_columns));
+        }
+    }
+
+    /// The MVCC primary-key → newest-position index, if the memtable has a
+    /// primary key (see [`Self::enable_pk_position_index`]).
+    pub fn pk_position_index(&self) -> Option<&PkPositionIndex> {
+        self.pk_position_index.as_ref()
+    }
+
     /// Insert a batch into all indexes.
     pub fn insert(&self, batch: &RecordBatch, row_offset: u64) -> Result<()> {
         self.insert_with_batch_position(batch, row_offset, None)
@@ -383,6 +410,9 @@ impl IndexStore {
         }
         for index in self.fts_indexes.values() {
             index.insert(batch, row_offset)?;
+        }
+        if let Some(pk_index) = &self.pk_position_index {
+            pk_index.insert(batch, row_offset)?;
         }
 
         // Update global watermark after all indexes have been updated
@@ -437,6 +467,13 @@ impl IndexStore {
         for index in self.fts_indexes.values() {
             for stored in batches {
                 index.insert(&stored.data, stored.row_offset)?;
+            }
+        }
+
+        // PK-position index: one entry per row, in batch order.
+        if let Some(pk_index) = &self.pk_position_index {
+            for stored in batches {
+                pk_index.insert(&stored.data, stored.row_offset)?;
             }
         }
 
@@ -551,6 +588,15 @@ impl IndexStore {
                 .into_iter()
                 .map(|(name, _idx_type, duration)| (name.to_string(), duration))
                 .collect();
+
+            // PK-position index: cheap (one skiplist insert per row), updated
+            // inline after the parallel index threads join so it is in place
+            // before the visibility watermark advances below.
+            if let Some(pk_index) = &self.pk_position_index {
+                for stored in batches {
+                    pk_index.insert(&stored.data, stored.row_offset)?;
+                }
+            }
 
             // Update global watermark to the max batch position
             let max_bp = batches.iter().map(|b| b.batch_position).max().unwrap();
