@@ -258,3 +258,128 @@ impl datafusion::physical_plan::RecordBatchStream for NewestPkFilterStream {
         self.schema.clone()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::Int32Array;
+    use arrow_schema::{DataType, Field, Schema};
+    use datafusion::prelude::SessionContext;
+    use datafusion_physical_plan::test::TestMemoryExec;
+    use futures::TryStreamExt;
+
+    /// Single-column `id` PK batch, one per append so a caller can control
+    /// row-level visibility via `max_visible_batch_position`.
+    fn id_batch(id: i32) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![id]))]).unwrap()
+    }
+
+    /// Index-search "hits": `(id, _rowid)` pairs the filter evaluates.
+    fn hits(rows: &[(i32, u64)]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(lance_core::ROW_ID, DataType::UInt64, true),
+        ]));
+        let ids: Vec<i32> = rows.iter().map(|(id, _)| *id).collect();
+        let rowids: Vec<u64> = rows.iter().map(|(_, p)| *p).collect();
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(UInt64Array::from(rowids)),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// Build an active memtable whose PK-position index + BatchStore hold one
+    /// row per `id` in `appended` (positions 0..n), all committed.
+    fn active(appended: &[i32]) -> (Arc<IndexStore>, Arc<BatchStore>) {
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut index = IndexStore::new();
+        index.enable_pk_position_index(vec!["id".to_string()]);
+        for &id in appended {
+            let b = id_batch(id);
+            let (bp, off, _) = batch_store.append(b.clone()).unwrap();
+            index.insert_with_batch_position(&b, off, Some(bp)).unwrap();
+        }
+        (Arc::new(index), batch_store)
+    }
+
+    async fn run(
+        index_store: Arc<IndexStore>,
+        batch_store: Arc<BatchStore>,
+        max_visible_batch_position: usize,
+        hits_batch: RecordBatch,
+    ) -> Vec<(i32, u64)> {
+        let input =
+            TestMemoryExec::try_new_exec(&[vec![hits_batch.clone()]], hits_batch.schema(), None)
+                .unwrap();
+        let exec = NewestPkFilterExec::new(
+            input,
+            vec!["id".to_string()],
+            lance_core::ROW_ID,
+            index_store,
+            batch_store,
+            max_visible_batch_position,
+        );
+        let ctx = SessionContext::new();
+        let out: Vec<RecordBatch> = exec
+            .execute(0, ctx.task_ctx())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut rows = Vec::new();
+        for b in &out {
+            let ids = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+            let pos = b.column(1).as_any().downcast_ref::<UInt64Array>().unwrap();
+            for i in 0..b.num_rows() {
+                rows.push((ids.value(i), pos.value(i)));
+            }
+        }
+        rows
+    }
+
+    #[tokio::test]
+    async fn keeps_only_the_newest_visible_position_per_pk() {
+        // id=1 written at positions 0 and 2 (an update), id=2 at position 1; all
+        // visible. A stale hit (id=1 @ 0) is dropped; the newest (id=1 @ 2) and
+        // the unrelated id=2 survive — even though all three were "returned" by
+        // the index search.
+        let (index, store) = active(&[1, 2, 1]);
+        let rows = run(index, store, 2, hits(&[(1, 0), (2, 1), (1, 2)])).await;
+        assert_eq!(rows, vec![(2, 1), (1, 2)]);
+    }
+
+    #[tokio::test]
+    async fn does_not_vanish_a_visible_row_under_a_newer_invisible_write() {
+        // The store/index hold id=1 at positions 0 and 2, but the query latched
+        // `max_visible_batch_position = 0` (only position 0 visible) — i.e. the
+        // update at position 2 was committed *after* this query's snapshot. The
+        // visible older row (id=1 @ 0) must be KEPT (its newest *visible* version
+        // is itself), not dropped because of the not-yet-visible position 2.
+        let (index, store) = active(&[1, 2, 1]);
+        let kept = run(index.clone(), store.clone(), 0, hits(&[(1, 0)])).await;
+        assert_eq!(kept, vec![(1, 0)], "visible row must not vanish");
+
+        // And the not-yet-visible position is itself dropped (outside snapshot).
+        let dropped = run(index, store, 0, hits(&[(1, 2)])).await;
+        assert!(
+            dropped.is_empty(),
+            "row beyond the snapshot must be dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn passes_through_when_no_pk_position_index() {
+        // A memtable without a PK-position index can't be deduped here, so the
+        // filter is a pass-through rather than dropping everything.
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        batch_store.append(id_batch(1)).unwrap();
+        let index = Arc::new(IndexStore::new()); // no enable_pk_position_index
+        let rows = run(index, batch_store, 0, hits(&[(1, 0), (1, 9)])).await;
+        assert_eq!(rows, vec![(1, 0), (1, 9)]);
+    }
+}

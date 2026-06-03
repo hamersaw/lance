@@ -615,4 +615,73 @@ mod tests {
         assert!(blocks(&blocked[&(Some(shard), g1)], 2));
         assert!(!blocked.contains_key(&(Some(shard), LsmGeneration::memtable(2))));
     }
+
+    #[tokio::test]
+    async fn index_membership_is_snapshot_bounded() {
+        // The index-sourced membership only counts a PK whose version is visible
+        // at the source's watermark, so a newer generation's not-yet-visible
+        // write can't shadow an older generation's visible copy.
+        use crate::dataset::mem_wal::scanner::data_source::{LsmDataSource, LsmGeneration};
+        use crate::dataset::mem_wal::write::IndexStore;
+        use uuid::Uuid;
+
+        let shard = Uuid::new_v4();
+        let schema = id_batch(&[1]).schema();
+
+        // Older frozen gen 1: pk=1 (no PK-position index → Set fallback).
+        let g1_store = BatchStore::with_capacity(8);
+        g1_store.append(id_batch(&[1])).unwrap();
+
+        // Newer active gen 2: pk=99 visible at position 0, then pk=1 written at
+        // position 1 but with the watermark left at batch 0 (so pk=1 is in the
+        // index yet not visible) — the concurrent-write race.
+        let g2_store = BatchStore::with_capacity(8);
+        let mut g2_index = IndexStore::new();
+        g2_index.enable_pk_position_index(vec!["id".to_string()]);
+        let b0 = id_batch(&[99]);
+        let (bp0, off0, _) = g2_store.append(b0.clone()).unwrap();
+        g2_index
+            .insert_with_batch_position(&b0, off0, Some(bp0)) // advances watermark to 0
+            .unwrap();
+        let b1 = id_batch(&[1]);
+        let (_, off1, _) = g2_store.append(b1.clone()).unwrap();
+        g2_index
+            .insert_with_batch_position(&b1, off1, None) // index updated, watermark unchanged
+            .unwrap();
+
+        let sources = vec![
+            LsmDataSource::ActiveMemTable {
+                batch_store: Arc::new(g1_store),
+                index_store: Arc::new(IndexStore::new()),
+                schema: schema.clone(),
+                shard_id: shard,
+                generation: LsmGeneration::memtable(1),
+            },
+            LsmDataSource::ActiveMemTable {
+                batch_store: Arc::new(g2_store),
+                index_store: Arc::new(g2_index),
+                schema,
+                shard_id: shard,
+                generation: LsmGeneration::memtable(2),
+            },
+        ];
+
+        let blocked = Box::pin(compute_source_block_lists(
+            &sources,
+            &["id".to_string()],
+            None,
+            None,
+        ))
+        .await
+        .unwrap();
+
+        let g1_block = &blocked[&(Some(shard), LsmGeneration::memtable(1))];
+        // pk=99 is visible in gen 2 → it blocks gen 1's pk=99.
+        assert!(blocks(g1_block, 99));
+        // pk=1's only gen-2 copy is not yet visible → it must NOT shadow gen 1.
+        assert!(
+            !blocks(g1_block, 1),
+            "a not-yet-visible newer write must not shadow an older visible copy"
+        );
+    }
 }
