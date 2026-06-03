@@ -3,11 +3,13 @@
 
 //! Per-source block-list construction for LSM vector search.
 //!
-//! A generation's membership is an `Arc<HashSet<u64>>` of PK hashes
-//! ([`compute_pk_hash`]), built once (immutable gens cached). Each source gets a
-//! `Vec<Arc<HashSet<u64>>>` of the newer generations' sets (`NEWER(G)`; base: all
-//! of them) — referenced, never merged. The KNN drops candidates whose PK is in
-//! any (see [`super::exec::PkHashFilterExec`]).
+//! A generation's membership is a [`GenMembership`]: in-memory generations
+//! (active / frozen) are **probed** against their maintained PK-position index
+//! (no per-query set), while on-disk generations (flushed, base) carry a cached
+//! `Arc<HashSet<u64>>` of PK hashes ([`compute_pk_hash`]). Each source gets a
+//! `Vec<GenMembership>` of the newer generations (`NEWER(G)`; base: all of
+//! them); the KNN drops a candidate whose PK is in any (see
+//! [`super::exec::PkHashFilterExec`]).
 //!
 //! Cross-generation only: within-gen dups share a hash and fall to the global
 //! dedup's `(generation, freshness)` tiebreaker.
@@ -162,54 +164,36 @@ pub async fn compute_source_block_lists(
     Ok(blocked)
 }
 
-/// The fresh-tier block-list: one membership set per generation that shadows the
-/// base table — active + frozen memtables (hashed now) and flushed generations
-/// (from the cache). Same `Vec<Arc<HashSet<u64>>>` shape the vector-search filter
-/// consumes; a base/external reader can drop any row whose PK is in one of them.
-/// The base source, if present, is skipped (it is what gets shadowed).
+/// The fresh-tier block-list: one [`GenMembership`] per generation that shadows
+/// the base table — active + frozen memtables (probed against their index) and
+/// flushed generations (cached PK-hash sets). A base/external reader can test
+/// any PK against these (e.g. via `contains`) to decide whether the fresh tier
+/// shadows it. The base source, if present, is skipped (it is what gets
+/// shadowed).
 pub async fn fresh_tier_block_list(
     sources: &[LsmDataSource],
     pk_columns: &[String],
     session: Option<&Arc<Session>>,
     flushed_cache: Option<&Arc<FlushedMemTableCache>>,
-) -> Result<Vec<Arc<HashSet<u64>>>> {
-    let mut sets = Vec::new();
+) -> Result<Vec<GenMembership>> {
+    let mut memberships = Vec::new();
     for source in sources {
-        let set = match source {
+        let membership = match source {
             LsmDataSource::BaseTable { .. } => continue,
             LsmDataSource::ActiveMemTable {
                 batch_store,
                 index_store,
                 ..
-            } => Arc::new(in_memory_pk_hashes(batch_store, index_store, pk_columns)?),
-            LsmDataSource::FlushedMemTable { path, .. } => {
-                flushed_pk_hashes(path, pk_columns, session, flushed_cache).await?
-            }
+            } => in_memory_membership(batch_store, index_store, pk_columns)?,
+            LsmDataSource::FlushedMemTable { path, .. } => GenMembership::Set(
+                flushed_pk_hashes(path, pk_columns, session, flushed_cache).await?,
+            ),
         };
-        if !set.is_empty() {
-            sets.push(set);
+        if !membership.is_empty() {
+            memberships.push(membership);
         }
     }
-    Ok(sets)
-}
-
-/// PK-hash membership of an in-memory (active / frozen) memtable.
-///
-/// Reads it straight from the memtable's maintained MVCC PK-position index — its
-/// keyset *is* the membership set, already hashed, so there is nothing to
-/// re-scan or re-hash. Falls back to a one-time `BatchStore` scan only when the
-/// memtable has no PK-position index (e.g. a table without a primary key), which
-/// the production vector-search path never hits since that index is always
-/// enabled alongside the secondary indexes.
-fn in_memory_pk_hashes(
-    batch_store: &BatchStore,
-    index_store: &IndexStore,
-    pk_columns: &[String],
-) -> Result<HashSet<u64>> {
-    match index_store.pk_position_index() {
-        Some(index) => Ok(index.pk_hashes()),
-        None => pk_hashes_from_batch_store(batch_store, pk_columns),
-    }
+    Ok(memberships)
 }
 
 /// Cross-source membership of an in-memory (active / frozen) memtable.
@@ -402,17 +386,17 @@ mod tests {
         // Active gen 2: pk=1,2. Frozen gen 1: pk=3.
         let sources = vec![mk(&[1, 2], 2), mk(&[3], 1)];
 
-        let sets = fresh_tier_block_list(&sources, &["id".to_string()], None, None)
+        let memberships = fresh_tier_block_list(&sources, &["id".to_string()], None, None)
             .await
             .unwrap();
 
-        // One set per generation; together they cover pk=1,2,3 (not 4).
-        assert_eq!(sets.len(), 2);
-        let set_blocks = |id: i32| sets.iter().any(|s| s.contains(&hash_id(id)));
+        // One membership per generation; together they cover pk=1,2,3 (not 4).
+        assert_eq!(memberships.len(), 2);
+        let fresh_blocks = |id: i32| memberships.iter().any(|m| m.contains(hash_id(id)));
         for id in [1, 2, 3] {
-            assert!(set_blocks(id));
+            assert!(fresh_blocks(id));
         }
-        assert!(!set_blocks(4));
+        assert!(!fresh_blocks(4));
     }
 
     #[tokio::test]

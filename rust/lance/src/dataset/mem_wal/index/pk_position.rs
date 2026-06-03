@@ -20,7 +20,6 @@
 //! `max_visible` watermark is unaffected by concurrent appends (which only add
 //! larger positions), so no snapshot needs to be co-published with the query.
 
-use std::collections::HashSet;
 use std::sync::Mutex;
 
 use arrow_array::RecordBatch;
@@ -138,13 +137,6 @@ impl PkPositionIndex {
             }
         }
         positions
-    }
-
-    /// Every distinct primary-key hash currently in the index. The cross-source
-    /// block-list uses this as an in-memory generation's membership set instead
-    /// of re-scanning (and re-hashing) the `BatchStore` per query.
-    pub fn pk_hashes(&self) -> HashSet<u64> {
-        self.reader.iter().map(|key| key.hash).collect()
     }
 
     /// Number of entries (one per inserted row, not per distinct key).

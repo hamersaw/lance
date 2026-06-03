@@ -457,7 +457,7 @@ impl LsmScanner {
     /// [`FlushedMemTableCache`] when one is set.
     pub async fn contains_pks(&self, pks: &RecordBatch) -> Result<Vec<bool>> {
         let sources = self.build_collector().collect()?;
-        let sets = super::block_list::fresh_tier_block_list(
+        let memberships = super::block_list::fresh_tier_block_list(
             &sources,
             &self.pk_columns,
             self.session.as_ref(),
@@ -469,7 +469,7 @@ impl LsmScanner {
         Ok((0..pks.num_rows())
             .map(|row| {
                 let hash = super::exec::compute_pk_hash(pks, &pk_indices, row);
-                sets.iter().any(|set| set.contains(&hash))
+                memberships.iter().any(|m| m.contains(hash))
             })
             .collect())
     }
