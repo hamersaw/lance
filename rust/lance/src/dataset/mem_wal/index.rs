@@ -381,7 +381,7 @@ impl IndexStore {
     }
 
     /// Maintain a BTree on each primary-key column so the memtable can answer
-    /// "newest visible version of this key" (see [`Self::pk_index`]).
+    /// "newest visible version of this key" (see [`Self::pk_newest_visible`]).
     ///
     /// Reuses an existing BTree on the field, else auto-creates one under a
     /// `__pk__*` name so the normal insert loop maintains it. Call once at
