@@ -18,7 +18,6 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
 use datafusion::common::ScalarValue;
-use lance_core::cache::LanceCache;
 use lance_core::{Error, Result};
 
 use lance_index::metrics::NoOpMetricsCollector;
@@ -240,62 +239,45 @@ fn in_memory_membership(
     }
 }
 
-/// Open (or fetch the cached) standalone PK index for one flushed generation.
-/// Cached by immutable path (single-flight); pages go through a shared cache.
+/// Open the standalone PK BTree at `{flushed gen}/_pk_index` for one flushed
+/// generation. Reuses the flushed dataset's (session-configured) object store
+/// and **its index cache**, then loads the sidecar directly by path through the
+/// BTree plugin — it is not a manifest index. The opened index and its pages
+/// are cached in the session's index cache (keyed by the immutable flushed
+/// path), so repeated probes reuse them with no separate cache path and no
+/// upfront scan; concurrent first-opens may each load before the cache fills.
 async fn open_pk_index(
     path: &str,
     session: Option<&Arc<Session>>,
     flushed_cache: Option<&Arc<FlushedMemTableCache>>,
 ) -> Result<Arc<dyn ScalarIndex>> {
-    match flushed_cache {
-        Some(cache) => {
-            let page_cache = cache.index_page_cache();
-            let build_path = path.to_string();
-            let build_session = session.cloned();
-            let build_cache = cache.clone();
-            cache
-                .get_or_open_pk_index(
-                    path,
-                    // `Box::pin` keeps this open future off the caller's future
-                    // (avoids `clippy::large_futures`).
-                    Box::pin(async move {
-                        build_pk_index(
-                            &build_path,
-                            build_session.as_ref(),
-                            Some(&build_cache),
-                            page_cache,
-                        )
-                        .await
-                    }),
-                )
-                .await
-        }
-        None => build_pk_index(path, session, None, Arc::new(LanceCache::no_cache())).await,
-    }
-}
-
-/// Open the standalone PK BTree at `{flushed gen}/_pk_index`. Reuses the flushed
-/// dataset's (session-configured) object store, then loads the sidecar index
-/// directly by path through the BTree plugin — it is not a manifest index.
-async fn build_pk_index(
-    path: &str,
-    session: Option<&Arc<Session>>,
-    flushed_cache: Option<&Arc<FlushedMemTableCache>>,
-    page_cache: Arc<LanceCache>,
-) -> Result<Arc<dyn ScalarIndex>> {
     let dataset = open_flushed_dataset(path, session, flushed_cache).await?;
+    // Namespace the session index cache by the (immutable) flushed path so this
+    // sidecar's pages live alongside every other index instead of a bespoke
+    // cache. `fri_uuid` is None — flushed generations carry no fragment-reuse.
+    let index_cache = dataset.index_cache.for_index(path, None);
     let index_dir = dataset.base.clone().join(PK_INDEX_DIR);
     let store: Arc<dyn ScalarIndexStore> = Arc::new(LanceIndexStore::new(
         dataset.object_store.clone(),
         index_dir,
-        page_cache.clone(),
+        Arc::new(index_cache.clone()),
     ));
+
     let plugin = PK_BTREE_REGISTRY.get_plugin_by_name("BTree")?;
+    // Cache the opened index in the session cache (mirrors `open_scalar_index`).
+    if let Some(index) = plugin
+        .get_from_cache(store.clone(), None, &index_cache)
+        .await?
+    {
+        return Ok(index);
+    }
     let details = prost_types::Any::from_msg(&lance_index::pbold::BTreeIndexDetails::default())
         .map_err(|e| Error::io(e.to_string()))?;
-    plugin
-        .load_index(store, &details, None, page_cache.as_ref())
-        .await
+    let index = plugin
+        .load_index(store, &details, None, &index_cache)
+        .await?;
+    plugin.put_in_cache(&index_cache, index.clone()).await?;
+    Ok(index)
 }
 
 /// Test helper: write a flushed generation's standalone PK sidecar at
@@ -310,6 +292,7 @@ pub async fn write_test_pk_sidecar(
     pk_columns: &[&str],
 ) -> Result<()> {
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use lance_core::cache::LanceCache;
     use lance_index::scalar::btree::train_btree_index;
     use lance_io::object_store::ObjectStore;
 

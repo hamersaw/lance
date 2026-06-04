@@ -22,17 +22,10 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use lance_core::cache::LanceCache;
 use lance_core::{Error, Result};
-use lance_index::scalar::ScalarIndex;
 
 use crate::dataset::{Dataset, DatasetBuilder};
 use crate::session::Session;
-
-/// Byte budget for the shared on-disk PK-index page cache. Generously sized:
-/// PK BTree pages are small and re-probed across queries, so caching them keeps
-/// the block-list probe cheap after the first touch.
-const PK_INDEX_PAGE_CACHE_BYTES: usize = 256 * 1024 * 1024;
 
 /// Cache of opened flushed-generation datasets, keyed by resolved path.
 ///
@@ -48,15 +41,10 @@ const PK_INDEX_PAGE_CACHE_BYTES: usize = 256 * 1024 * 1024;
 pub struct FlushedMemTableCache {
     // `moka`'s async cache gives a bounded size plus single-flight
     // `try_get_with`, so concurrent first-queries on a just-flushed
-    // generation open the dataset exactly once.
+    // generation open the dataset exactly once. The opened dataset carries the
+    // session index cache, which also backs each generation's standalone PK
+    // dedup index (see `block_list::open_pk_index`) — no separate cache path.
     inner: moka::future::Cache<String, Arc<Dataset>>,
-    // Opened standalone PK dedup index per flushed generation, keyed by the same
-    // immutable flushed path. Opened lazily on the first query that needs it
-    // (single-flight) so repeated searches reuse one `ScalarIndex`.
-    pk_indices: moka::future::Cache<String, Arc<dyn ScalarIndex>>,
-    // Shared page cache for the on-disk PK indexes' leaf pages, so probes after
-    // the first touch stay in memory instead of re-reading the object store.
-    index_page_cache: Arc<LanceCache>,
 }
 
 impl FlushedMemTableCache {
@@ -73,11 +61,6 @@ impl FlushedMemTableCache {
                 // into at build time.
                 .support_invalidation_closures()
                 .build(),
-            pk_indices: moka::future::Cache::builder()
-                .max_capacity(max_entries)
-                .support_invalidation_closures()
-                .build(),
-            index_page_cache: Arc::new(LanceCache::with_capacity(PK_INDEX_PAGE_CACHE_BYTES)),
         }
     }
 
@@ -107,27 +90,6 @@ impl FlushedMemTableCache {
             .map_err(|e: Arc<Error>| Error::cloned(e.to_string()))
     }
 
-    /// Get the opened PK dedup index for `path`, opening it (exactly once) on a
-    /// miss via `open`. The flushed path is immutable, so a cached index is
-    /// never stale; concurrent first-queries share one open via `moka`'s
-    /// single-flight `try_get_with`.
-    pub async fn get_or_open_pk_index(
-        &self,
-        path: &str,
-        open: impl std::future::Future<Output = Result<Arc<dyn ScalarIndex>>>,
-    ) -> Result<Arc<dyn ScalarIndex>> {
-        self.pk_indices
-            .try_get_with(path.to_string(), open)
-            .await
-            .map_err(|e: Arc<Error>| Error::cloned(e.to_string()))
-    }
-
-    /// The shared page cache to hand to the on-disk PK index loader so its leaf
-    /// pages are cached across probes.
-    pub fn index_page_cache(&self) -> Arc<LanceCache> {
-        self.index_page_cache.clone()
-    }
-
     /// Drop cached entries whose path is not in `live_paths`.
     ///
     /// Called by the consumer after compaction retires generations. Purely a
@@ -141,10 +103,6 @@ impl FlushedMemTableCache {
         // would just defer reclamation — never a correctness issue.
         let _ = self
             .inner
-            .invalidate_entries_if(move |path, _| !live.contains(path));
-        let live = live_paths.clone();
-        let _ = self
-            .pk_indices
             .invalidate_entries_if(move |path, _| !live.contains(path));
     }
 }
