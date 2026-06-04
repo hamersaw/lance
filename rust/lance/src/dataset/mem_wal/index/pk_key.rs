@@ -1,30 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Composite primary-key encoding + index for MemWAL dedup.
+//! Composite primary-key encoding for MemWAL dedup.
 //!
 //! A multi-column primary key is reduced to a single order-preserving byte
 //! string ([`encode_pk_tuple`]) so the whole tuple is one comparable key:
 //! lexicographic byte order equals tuple order, and distinct tuples never
-//! collide. The same key drives both the in-memory composite index
-//! ([`PkKeyIndex`], a skiplist) and the flushed on-disk BTree (the key is the
-//! index's `Binary` value column), so a probe builds `ScalarValue::Binary(key)`
-//! and both ends agree.
+//! collide. Encoded as a `Binary` value, the tuple is indexed directly by a
+//! [`super::BTreeMemIndex`] (its byte backend) — both in memory and, after
+//! flush, as the on-disk BTree's `Binary` value column — so a probe builds
+//! `ScalarValue::Binary(key)` and every layer agrees.
 //!
-//! Single-column primary keys do **not** use this — they keep the compact typed
-//! BTree directly (see [`super::BTreeMemIndex`]).
+//! Single-column primary keys do **not** use this — they key the typed
+//! `BTreeMemIndex` on the column value directly.
 
-use std::sync::Mutex;
-
-use arrow_array::{BinaryArray, RecordBatch, UInt64Array};
-use arrow_schema::{DataType, Field, Schema};
+use arrow_array::{BinaryArray, RecordBatch};
 use datafusion::common::ScalarValue;
-use lance_core::{Error, ROW_ID, Result};
-use lance_index::scalar::registry::VALUE_COLUMN_NAME;
-use std::sync::Arc;
-
-use super::RowPosition;
-use super::arena_skiplist::{SkipListReader, SkipListWriter, new_skiplist};
+use lance_core::{Error, Result};
 
 /// Sign-flip a signed integer to an order-preserving unsigned key (matches the
 /// fixed-int BTree backend). Big-endian bytes of the result sort like the value.
@@ -108,132 +100,24 @@ fn encode_pk_row(batch: &RecordBatch, pk_indices: &[usize], row: usize) -> Resul
     Ok(out)
 }
 
-/// Skiplist key: the encoded tuple plus the row position (makes every entry
-/// unique, so a non-unique key keeps every version). Sorts by `(bytes, pos)`.
-#[derive(PartialEq, Eq)]
-struct EncodedKey {
-    bytes: Box<[u8]>,
-    position: RowPosition,
-}
-
-impl PartialOrd for EncodedKey {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
+/// Encode every row of `batch`'s PK columns (at `pk_indices`) into a `Binary`
+/// column of order-preserving composite keys — the form a [`super::BTreeMemIndex`]
+/// indexes directly (its byte backend), so the composite PK reuses the same
+/// index as a single-column one.
+pub fn encode_pk_batch(batch: &RecordBatch, pk_indices: &[usize]) -> Result<BinaryArray> {
+    let mut keys: Vec<Vec<u8>> = Vec::with_capacity(batch.num_rows());
+    for row in 0..batch.num_rows() {
+        keys.push(encode_pk_row(batch, pk_indices, row)?);
     }
-}
-
-impl Ord for EncodedKey {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.bytes
-            .cmp(&other.bytes)
-            .then(self.position.cmp(&other.position))
-    }
-}
-
-/// In-memory composite primary-key index: a skiplist over `(encoded_tuple,
-/// position)`. Answers "newest visible version of this tuple" in one seek, the
-/// composite analogue of [`super::BTreeMemIndex::get_newest_visible`].
-pub struct PkKeyIndex {
-    reader: SkipListReader<EncodedKey>,
-    writer: Mutex<SkipListWriter<EncodedKey>>,
-}
-
-impl std::fmt::Debug for PkKeyIndex {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PkKeyIndex")
-            .field("len", &self.len())
-            .finish()
-    }
-}
-
-impl PkKeyIndex {
-    pub fn new() -> Self {
-        let (writer, reader) = new_skiplist::<EncodedKey>();
-        Self {
-            reader,
-            writer: Mutex::new(writer),
-        }
-    }
-
-    /// Insert every row of `batch`, encoding the PK columns at `pk_indices`.
-    /// `row_offset` is the absolute position of the first row.
-    pub fn insert(&self, batch: &RecordBatch, pk_indices: &[usize], row_offset: u64) -> Result<()> {
-        let mut writer = self.writer.lock().unwrap();
-        for row in 0..batch.num_rows() {
-            let bytes = encode_pk_row(batch, pk_indices, row)?;
-            writer.insert(EncodedKey {
-                bytes: bytes.into_boxed_slice(),
-                position: row_offset + row as u64,
-            });
-        }
-        Ok(())
-    }
-
-    /// Newest position of the pre-encoded tuple `key` visible at
-    /// `max_visible_row`, or `None`. A single seek-and-stop (no allocation).
-    pub fn get_newest_visible(
-        &self,
-        key: &[u8],
-        max_visible_row: RowPosition,
-    ) -> Option<RowPosition> {
-        let target = EncodedKey {
-            bytes: key.into(),
-            position: max_visible_row,
-        };
-        self.reader
-            .upper_bound_with(&target, |found| {
-                (found.bytes.as_ref() == key).then_some(found.position)
-            })
-            .flatten()
-    }
-
-    pub fn len(&self) -> usize {
-        self.reader.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.reader.len() == 0
-    }
-
-    /// Export as sorted `(Binary value, row_id)` batches to train the flushed
-    /// on-disk BTree. Entries are already in `(bytes, position)` order, so the
-    /// stream is sorted by value as `train_btree_index` requires.
-    pub fn to_training_batches(&self, batch_size: usize) -> Result<Vec<RecordBatch>> {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new(VALUE_COLUMN_NAME, DataType::Binary, true),
-            Field::new(ROW_ID, DataType::UInt64, false),
-        ]));
-
-        let mut batches = Vec::new();
-        let mut keys: Vec<Vec<u8>> = Vec::with_capacity(batch_size);
-        let mut row_ids: Vec<u64> = Vec::with_capacity(batch_size);
-        for entry in self.reader.iter() {
-            keys.push(entry.bytes.to_vec());
-            row_ids.push(entry.position);
-            if keys.len() >= batch_size {
-                batches.push(build_batch(&schema, &keys, &row_ids)?);
-                keys.clear();
-                row_ids.clear();
-            }
-        }
-        if !keys.is_empty() {
-            batches.push(build_batch(&schema, &keys, &row_ids)?);
-        }
-        Ok(batches)
-    }
-}
-
-fn build_batch(schema: &Arc<Schema>, keys: &[Vec<u8>], row_ids: &[u64]) -> Result<RecordBatch> {
-    let values = BinaryArray::from_iter_values(keys.iter());
-    let ids = UInt64Array::from(row_ids.to_vec());
-    RecordBatch::try_new(schema.clone(), vec![Arc::new(values), Arc::new(ids)])
-        .map_err(|e| Error::io(e.to_string()))
+    Ok(BinaryArray::from_iter_values(keys.iter()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use arrow_array::{Int32Array, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use std::sync::Arc;
 
     fn tuple(a: i32, b: &str) -> Vec<ScalarValue> {
         vec![ScalarValue::Int32(Some(a)), ScalarValue::from(b)]
@@ -294,55 +178,27 @@ mod tests {
         assert!(encode_pk_tuple(&empty).unwrap() < encode_pk_tuple(&with_zero).unwrap());
     }
 
-    fn id_name_batch(ids: &[i32], names: &[&str]) -> RecordBatch {
+    #[test]
+    fn encode_pk_batch_matches_per_tuple_encoding() {
+        // Each row of the encoded `Binary` column equals `encode_pk_tuple` of
+        // that row's PK values — so the column a BTreeMemIndex indexes is exactly
+        // what a probe builds.
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int32, false),
             Field::new("name", DataType::Utf8, false),
         ]));
-        RecordBatch::try_new(
+        let batch = RecordBatch::try_new(
             schema,
             vec![
-                Arc::new(Int32Array::from(ids.to_vec())),
-                Arc::new(StringArray::from(names.to_vec())),
+                Arc::new(Int32Array::from(vec![2, 1])),
+                Arc::new(StringArray::from(vec!["a", "b"])),
             ],
         )
-        .unwrap()
-    }
-
-    #[test]
-    fn pk_key_index_newest_visible_is_snapshot_bounded() {
-        let index = PkKeyIndex::new();
-        // (1,"a")@0, (1,"b")@1, (1,"a")@2 — an update of (1,"a").
-        index
-            .insert(&id_name_batch(&[1, 1, 1], &["a", "b", "a"]), &[0, 1], 0)
-            .unwrap();
-
-        let key_1a = encode_pk_tuple(&tuple(1, "a")).unwrap();
-        let key_1b = encode_pk_tuple(&tuple(1, "b")).unwrap();
-        // Newest visible (1,"a") is its re-write at position 2...
-        assert_eq!(index.get_newest_visible(&key_1a, 5), Some(2));
-        // ...but bounded below the re-write, the older copy at 0.
-        assert_eq!(index.get_newest_visible(&key_1a, 1), Some(0));
-        assert_eq!(index.get_newest_visible(&key_1b, 5), Some(1));
-        // Absent tuple.
-        let key_2a = encode_pk_tuple(&tuple(2, "a")).unwrap();
-        assert_eq!(index.get_newest_visible(&key_2a, 5), None);
-    }
-
-    #[test]
-    fn training_batches_are_value_sorted() {
-        let index = PkKeyIndex::new();
-        index
-            .insert(&id_name_batch(&[2, 1], &["a", "b"]), &[0, 1], 0)
-            .unwrap();
-        let batches = index.to_training_batches(8192).unwrap();
-        assert_eq!(batches.len(), 1);
-        let values = batches[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<BinaryArray>()
-            .unwrap();
-        // (1,"b") encodes below (2,"a"), so it comes first.
-        assert!(values.value(0) < values.value(1));
+        .unwrap();
+        let encoded = encode_pk_batch(&batch, &[0, 1]).unwrap();
+        assert_eq!(encoded.value(0), encode_pk_tuple(&tuple(2, "a")).unwrap());
+        assert_eq!(encoded.value(1), encode_pk_tuple(&tuple(1, "b")).unwrap());
+        // (1,"b") encodes below (2,"a").
+        assert!(encoded.value(1) < encoded.value(0));
     }
 }

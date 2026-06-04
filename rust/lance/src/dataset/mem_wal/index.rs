@@ -50,21 +50,27 @@ pub use fts::{FtsIndexConfig, FtsMemIndex, FtsQueryExpr, SearchOptions};
 pub use hnsw::{HnswIndexConfig, HnswMemIndex};
 pub use pk_key::encode_pk_tuple;
 
-use pk_key::PkKeyIndex;
+use pk_key::encode_pk_batch;
+
+/// Synthetic column the composite PK index is keyed on: the order-preserving
+/// encoded tuple (see [`encode_pk_tuple`]), stored as `Binary` so a
+/// [`BTreeMemIndex`]'s byte backend indexes it directly.
+const PK_KEY_COLUMN: &str = "__pk_key__";
 
 /// The memtable's primary-key index, used to answer "newest visible version of
 /// this key" for dedup. Single-column PKs reuse the column's compact typed
-/// [`BTreeMemIndex`] (no second copy); composite PKs use one [`PkKeyIndex`] over
-/// the order-preserving encoded tuple ([`encode_pk_tuple`]). Either way the
-/// lookup is a single seek.
+/// [`BTreeMemIndex`] (no second copy); composite PKs key a `BTreeMemIndex` on
+/// the order-preserving encoded tuple ([`encode_pk_tuple`]) instead. Either way
+/// the lookup is a single seek on one `BTreeMemIndex`.
 enum PkIndex {
     /// Arity 1: aliases a `btree_indexes` entry, so the insert loop maintains it.
     Single(Arc<BTreeMemIndex>),
-    /// Arity >= 2: a dedicated encoded-tuple skiplist, maintained explicitly in
-    /// the insert paths. `columns` are the PK columns in order, resolved against
-    /// each batch's schema at insert time.
+    /// Arity >= 2: a `BTreeMemIndex` over the encoded-tuple `Binary` key,
+    /// maintained explicitly in the insert paths (the original batch lacks the
+    /// synthetic key column). `columns` are the PK columns in order, resolved
+    /// against each batch's schema at insert time.
     Composite {
-        index: Arc<PkKeyIndex>,
+        index: Arc<BTreeMemIndex>,
         columns: Vec<String>,
     },
 }
@@ -407,10 +413,11 @@ impl IndexStore {
     ///
     /// Single-column PKs reuse an existing BTree on the field, else auto-create
     /// one under a `__pk__*` name so the normal insert loop maintains it (no
-    /// second copy). Composite (arity >= 2) PKs build a dedicated encoded-tuple
-    /// [`PkKeyIndex`], maintained explicitly in the insert paths. Call once at
-    /// construction, after [`Self::from_configs`] and before any inserts; a
-    /// no-op when `pk_columns` is empty.
+    /// second copy). Composite (arity >= 2) PKs key a `BTreeMemIndex` on the
+    /// order-preserving encoded tuple (synthetic [`PK_KEY_COLUMN`]), maintained
+    /// explicitly in the insert paths. Call once at construction, after
+    /// [`Self::from_configs`] and before any inserts; a no-op when `pk_columns`
+    /// is empty.
     pub fn enable_pk_index(&mut self, pk_columns: &[(String, i32)]) {
         self.pk_index = match pk_columns {
             [] => None,
@@ -431,7 +438,9 @@ impl IndexStore {
                 Some(PkIndex::Single(btree))
             }
             multi => Some(PkIndex::Composite {
-                index: Arc::new(PkKeyIndex::new()),
+                // Synthetic field id (-1): the composite index is held directly,
+                // never resolved by field id.
+                index: Arc::new(BTreeMemIndex::new(-1, PK_KEY_COLUMN.to_string())),
                 columns: multi.iter().map(|(c, _)| c.clone()).collect(),
             }),
         };
@@ -471,11 +480,21 @@ impl IndexStore {
             .collect()
     }
 
-    /// Maintain the composite PK index for `batch` (no-op for single/no PK).
+    /// Maintain the composite PK index for `batch` (no-op for single/no PK):
+    /// encode the PK columns into the synthetic [`PK_KEY_COLUMN`] `Binary` column
+    /// and feed that to the keyed `BTreeMemIndex`.
     fn insert_composite_pk(&self, batch: &RecordBatch, row_offset: u64) -> Result<()> {
         if let Some(PkIndex::Composite { index, columns }) = &self.pk_index {
             let pk_indices = Self::pk_batch_indices(batch, columns)?;
-            index.insert(batch, &pk_indices, row_offset)?;
+            let encoded = encode_pk_batch(batch, &pk_indices)?;
+            let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                PK_KEY_COLUMN,
+                arrow_schema::DataType::Binary,
+                false,
+            )]));
+            let key_batch = RecordBatch::try_new(schema, vec![Arc::new(encoded)])
+                .map_err(|e| Error::invalid_input(e.to_string()))?;
+            index.insert(&key_batch, row_offset)?;
         }
         Ok(())
     }
@@ -494,9 +513,10 @@ impl IndexStore {
             Some(PkIndex::Single(btree)) => btree.get_newest_visible(&values[0], max_visible_row),
             Some(PkIndex::Composite { index, .. }) => {
                 // An unsupported PK type would have failed at insert, so the
-                // index can't hold a tuple this fails to encode.
+                // index can't hold a tuple this fails to encode. The probe key is
+                // the same `Binary`-encoded tuple the insert path indexed.
                 let key = encode_pk_tuple(values).ok()?;
-                index.get_newest_visible(&key, max_visible_row)
+                index.get_newest_visible(&ScalarValue::Binary(Some(key)), max_visible_row)
             }
         }
     }
