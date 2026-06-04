@@ -20,6 +20,7 @@ use blob::LanceBlobFile;
 use chrono::{Duration, TimeDelta, Utc};
 use futures::{StreamExt, TryFutureExt};
 use lance_index::vector::bq::RQBuildParams;
+use lance_index::vector::bq::storage::RabitQuantizationMetadata;
 use log::error;
 use object_store::path::Path;
 use pyo3::exceptions::{PyStopIteration, PyTypeError};
@@ -173,7 +174,8 @@ fn writer_config_from_kwargs(
     async_index_interval_ms: Option<u64>,
     backpressure_log_interval_ms: Option<u64>,
     stats_log_interval_ms: Option<u64>,
-) -> Option<lance::dataset::mem_wal::ShardWriterConfig> {
+    hnsw_params: Option<HashMap<String, HashMap<String, u32>>>,
+) -> PyResult<Option<lance::dataset::mem_wal::ShardWriterConfig>> {
     use std::time::Duration;
 
     let mut config = lance::dataset::mem_wal::ShardWriterConfig::default();
@@ -230,7 +232,30 @@ fn writer_config_from_kwargs(
         config = config.with_stats_log_interval(stats_log_interval_from_millis(v));
         any = true;
     }
-    any.then_some(config)
+    if let Some(overrides) = hnsw_params {
+        // {index_name: {param: value}} -> HnswBuildParams, rejecting unknown
+        // keys so typos surface instead of being silently ignored.
+        for (index_name, params) in overrides {
+            let mut build = HnswBuildParams::default();
+            for (key, value) in params {
+                match key.as_str() {
+                    "num_edges" => build = build.num_edges(value as usize),
+                    "ef_construction" => build = build.ef_construction(value as usize),
+                    "max_level" => build = build.max_level(value as u16),
+                    other => {
+                        return Err(PyValueError::new_err(format!(
+                            "unknown HNSW build param '{}' for index '{}'; \
+                             expected one of 'num_edges', 'ef_construction', 'max_level'",
+                            other, index_name
+                        )));
+                    }
+                }
+            }
+            config = config.with_hnsw_params(index_name, build);
+            any = true;
+        }
+    }
+    Ok(any.then_some(config))
 }
 
 fn convert_reader(reader: &Bound<PyAny>) -> PyResult<Box<dyn RecordBatchReader + Send>> {
@@ -3174,6 +3199,7 @@ impl Dataset {
         async_index_interval_ms=None,
         backpressure_log_interval_ms=None,
         stats_log_interval_ms=None,
+        hnsw_params=None,
     ))]
     fn initialize_mem_wal(
         &mut self,
@@ -3196,6 +3222,7 @@ impl Dataset {
         async_index_interval_ms: Option<u64>,
         backpressure_log_interval_ms: Option<u64>,
         stats_log_interval_ms: Option<u64>,
+        hnsw_params: Option<HashMap<String, HashMap<String, u32>>>,
     ) -> PyResult<()> {
         use lance::dataset::mem_wal::DatasetMemWalExt;
 
@@ -3232,7 +3259,8 @@ impl Dataset {
             async_index_interval_ms,
             backpressure_log_interval_ms,
             stats_log_interval_ms,
-        );
+            hnsw_params,
+        )?;
         let maintained_indexes = maintained_indexes.unwrap_or_default();
 
         let mut ds = Arc::clone(&self.ds);
@@ -3322,6 +3350,7 @@ impl Dataset {
         async_index_interval_ms=None,
         backpressure_log_interval_ms=None,
         stats_log_interval_ms=None,
+        hnsw_params=None,
     ))]
     fn mem_wal_writer(
         &self,
@@ -3340,6 +3369,7 @@ impl Dataset {
         async_index_interval_ms: Option<u64>,
         backpressure_log_interval_ms: Option<u64>,
         stats_log_interval_ms: Option<u64>,
+        hnsw_params: Option<HashMap<String, HashMap<String, u32>>>,
     ) -> PyResult<crate::mem_wal::PyShardWriter> {
         use lance::dataset::mem_wal::DatasetMemWalExt;
 
@@ -3360,7 +3390,8 @@ impl Dataset {
             async_index_interval_ms,
             backpressure_log_interval_ms,
             stats_log_interval_ms,
-        )
+            hnsw_params,
+        )?
         .unwrap_or_default();
 
         let ds = self.ds.clone();
@@ -3578,7 +3609,7 @@ impl PyWriteDest {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum IndexProgressEventType {
     Start,
     Progress,
@@ -3734,7 +3765,20 @@ impl IndexProgressDispatcher {
 
     fn drain(&mut self) -> PyResult<()> {
         while let Ok(event) = self.receiver.try_recv() {
-            self.dispatch(event)?;
+            let is_complete = event.event == IndexProgressEventType::Complete;
+            if let Err(err) = self.dispatch(event) {
+                if is_complete {
+                    // Complete events are purely informational — the stage's work
+                    // is already done. Propagating a callback error here would
+                    // abort the operation after the real work has succeeded.
+                    log::warn!(
+                        "Ignoring progress callback error on stage-complete event: {}",
+                        err
+                    );
+                } else {
+                    return Err(err);
+                }
+            }
         }
         Ok(())
     }
@@ -4329,6 +4373,13 @@ fn prepare_vector_index_params(
             }
             let codebook = as_fixed_size_list_array(batch.column(0));
             pq_params.codebook = Some(codebook.values().clone())
+        };
+
+        if let Some(r) = kwargs.get_item("rabitq_model")? {
+            let json: String = r.extract()?;
+            let meta: RabitQuantizationMetadata = serde_json::from_str(&json)
+                .map_err(|e| PyValueError::new_err(format!("Invalid rabitq_model JSON: {e}")))?;
+            rq_params.rotation = Some(meta);
         };
 
         if let Some(version) = kwargs.get_item("index_file_version")? {

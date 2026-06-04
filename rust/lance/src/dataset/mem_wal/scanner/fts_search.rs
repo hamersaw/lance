@@ -49,9 +49,10 @@ use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::query::FtsQuery as IndexFtsQuery;
 use tracing::instrument;
 
+use super::block_list::compute_source_block_lists;
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
-use super::exec::NewestPkFilterExec;
+use super::exec::{NewestPkFilterExec, PkBlockFilterExec};
 use super::flushed_cache::{FlushedMemTableCache, open_flushed_dataset};
 use super::projection::project_to_canonical;
 use crate::dataset::mem_wal::memtable::scanner::MemTableScanner;
@@ -62,6 +63,11 @@ use crate::session::Session;
 /// require an import for one string constant.
 pub const SCORE_COLUMN: &str = "_score";
 
+/// Default over-fetch multiple for blocked sources. `1.0` keeps cross-generation
+/// dedup on with no over-fetch; callers (e.g. the sophon WAL handler) raise it
+/// so a blocked source still yields `k` live rows after the block-list filter.
+const DEFAULT_OVERFETCH_FACTOR: f64 = 1.0;
+
 /// Plans local-scoring FTS queries over LSM data.
 pub struct LsmFtsSearchPlanner {
     collector: LsmDataSourceCollector,
@@ -71,6 +77,8 @@ pub struct LsmFtsSearchPlanner {
     session: Option<Arc<Session>>,
     /// Cache of opened flushed-generation datasets.
     flushed_cache: Option<Arc<FlushedMemTableCache>>,
+    /// Over-fetch multiple for blocked sources (clamped to `>= 1.0`).
+    overfetch_factor: f64,
 }
 
 impl LsmFtsSearchPlanner {
@@ -86,7 +94,15 @@ impl LsmFtsSearchPlanner {
             base_schema,
             session: None,
             flushed_cache: None,
+            overfetch_factor: DEFAULT_OVERFETCH_FACTOR,
         }
+    }
+
+    /// Set the over-fetch multiple for blocked sources so they still yield `k`
+    /// live rows after cross-generation block-list filtering. Clamped to `>= 1.0`.
+    pub fn with_overfetch_factor(mut self, factor: f64) -> Self {
+        self.overfetch_factor = factor;
+        self
     }
 
     /// Thread a session into flushed-generation opens so the first open
@@ -138,12 +154,57 @@ impl LsmFtsSearchPlanner {
             return self.empty_plan(&target_schema);
         }
 
+        // Per-source PK block sets for cross-generation dedup (NEWER(G) per
+        // shard; base = union of all gens). Query-type-agnostic — same call the
+        // vector planner makes. `Box::pin` keeps the future off
+        // `clippy::large_futures`.
+        let block_lists = Box::pin(compute_source_block_lists(
+            &sources,
+            self.session.as_ref(),
+            self.flushed_cache.as_ref(),
+        ))
+        .await?;
+        let overfetch = self.overfetch_factor.max(1.0);
+
         let mut per_source_plans: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(sources.len());
         for source in &sources {
+            let is_active = matches!(source, LsmDataSource::ActiveMemTable { .. });
+            let blocked = block_lists.get(&(source.shard_id(), source.generation()));
+            // Over-fetch a blocked source so the post-filter still yields k live
+            // rows. The active arm returns all matches (no builder limit), so its
+            // within-source recency filter needs no over-fetch hint.
+            let fetch_k = if blocked.is_some() {
+                ((k as f64) * overfetch).ceil() as usize
+            } else {
+                k
+            };
+
             let plan = self
-                .build_source_plan(source, column, &query, k, projection)
+                .build_source_plan(source, column, &query, fetch_k, projection)
                 .await?;
-            let normalized = project_to_canonical(plan, &target_schema)?;
+
+            // Dedup, mirroring LsmVectorSearchPlanner:
+            //  * active: already wrapped in `NewestPkFilterExec` inside
+            //    `build_source_plan` (drops predicate-crossing stale hits, which a
+            //    result-set dedup can't catch).
+            //  * flushed/base: drop rows superseded by a newer generation via the
+            //    block-list (within-gen is handled by the flushed deletion vector).
+            let deduped = if is_active {
+                plan
+            } else if let Some(set) = blocked {
+                Arc::new(PkBlockFilterExec::new(
+                    plan,
+                    self.pk_columns.clone(),
+                    set.clone(),
+                    k,
+                )) as Arc<dyn ExecutionPlan>
+            } else {
+                plan
+            };
+
+            // Normalize to canonical. This also drops the active arm's _rowid,
+            // which the canonical FTS schema omits — it served only the dedup.
+            let normalized = project_to_canonical(deduped, &target_schema)?;
             per_source_plans.push(normalized);
         }
 
@@ -258,6 +319,9 @@ impl LsmFtsSearchPlanner {
                 // emitted rows.
                 let _ = k;
                 let plan = scanner.create_plan().await?;
+                // Drop predicate-crossing stale hits: keep a hit iff it is the
+                // newest visible version of its PK (collapses duplicate-PK
+                // appends too — supersedes the old WithinSourceDedupExec).
                 let filtered: Arc<dyn ExecutionPlan> = Arc::new(NewestPkFilterExec::new(
                     plan,
                     self.pk_columns.clone(),
@@ -500,7 +564,6 @@ mod tests {
         let schema = fts_schema();
         let batch_store = Arc::new(BatchStore::with_capacity(16));
         let mut indexes = IndexStore::new();
-        indexes.enable_pk_index(&[("id".to_string(), 0)]);
         // text column has field_id 1 in fts_schema()
         indexes.add_fts("text_fts".to_string(), 1, "text".to_string());
         let batch = make_batch(
@@ -581,19 +644,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_mode_active_dedups_updated_pk_keeping_newest() {
+        // The active memtable is an append log and the FTS index is
+        // append-only, so a PK updated before flush is searchable as two
+        // row-positions. WithinSourceDedupExec(KeepMaxRowAddr) must collapse
+        // them to the newest insert. Without it the same PK would surface
+        // twice (criterion 2 violation).
+        let schema = fts_schema();
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut indexes = IndexStore::new();
+        indexes.enable_pk_index(&[("id".to_string(), 0)]);
+        indexes.add_fts("text_fts".to_string(), 1, "text".to_string());
+
+        // First append (positions 0,1): id=1 is the stale version of the PK.
+        let batch_old = make_batch(&schema, &[1, 2], &["lance stale version", "other doc"]);
+        batch_store.append(batch_old.clone()).unwrap();
+        indexes
+            .insert_with_batch_position(&batch_old, 0, Some(0))
+            .unwrap();
+
+        // Second append (position 2): id=1 updated — same PK, later row.
+        let batch_new = make_batch(&schema, &[1], &["lance fresh version"]);
+        batch_store.append(batch_new.clone()).unwrap();
+        indexes
+            .insert_with_batch_position(&batch_new, 2, Some(1))
+            .unwrap();
+        let indexes = Arc::new(indexes);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![])
+            .with_in_memory_memtables(
+                uuid::Uuid::new_v4(),
+                InMemoryMemTables {
+                    active: InMemoryMemTableRef {
+                        batch_store,
+                        index_store: indexes,
+                        schema: schema.clone(),
+                        generation: 1,
+                    },
+                    frozen: vec![],
+                },
+            );
+
+        let planner = LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], schema);
+        let plan = planner
+            .plan_search(
+                "text",
+                FullTextSearchQuery::new("lance".to_string()),
+                10,
+                None,
+            )
+            .await
+            .expect("planner should produce an active-only plan");
+
+        let ctx = datafusion::prelude::SessionContext::new();
+        let stream = plan.execute(0, ctx.task_ctx()).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+
+        let mut rows: Vec<(i32, String)> = Vec::new();
+        for b in &batches {
+            let ids = b
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let texts = b
+                .column_by_name("text")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            for i in 0..b.num_rows() {
+                rows.push((ids.value(i), texts.value(i).to_string()));
+            }
+        }
+
+        // id=1 must appear exactly once, and it must be the *newest* version.
+        let id1: Vec<&(i32, String)> = rows.iter().filter(|(id, _)| *id == 1).collect();
+        assert_eq!(
+            id1.len(),
+            1,
+            "updated PK id=1 must be deduped to one row; got {rows:?}"
+        );
+        assert_eq!(
+            id1[0].1, "lance fresh version",
+            "dedup must keep the newest (max row-position) version"
+        );
+    }
+
+    #[tokio::test]
     async fn active_stale_update_predicate_crossing_leaks() {
-        // BUG REPRODUCTION (FTS case: a PK update that crosses out of the match set).
-        //
-        // pk=1 is inserted as "alpha lance", then updated to "beta lance". The
-        // active inverted index is append-only, so the old "alpha" posting stays
-        // live. A search for "alpha" still matches the STALE pk=1 row. The fresh
-        // row ("beta lance") doesn't contain "alpha", so it's not even a
-        // candidate — there's nothing in the result set to dedup the stale hit
-        // against. The active FTS arm has no recency filter, so pk=1 leaks.
-        //
-        // Desired (NewestPkFilterExec) behaviour: pk=1's newest row-position is
-        // the "beta lance" row, so the stale "alpha" hit is dropped predicate-
-        // independently and pk=1 must NOT be returned for the "alpha" query.
+        // A PK update that crosses out of the match set: pk=1 inserted as
+        // "alpha lance", then updated to "beta lance". The append-only inverted
+        // index keeps the old "alpha" posting live, so an "alpha" search still
+        // matches the STALE pk=1 row — and the fresh "beta lance" row isn't even
+        // a candidate, so a result-set dedup has nothing to suppress it against.
+        // `NewestPkFilterExec` drops it predicate-independently: pk=1's newest
+        // visible row is "beta lance", so the "alpha" hit is not the newest.
         let schema = fts_schema();
         let batch_store = Arc::new(BatchStore::with_capacity(16));
         let mut indexes = IndexStore::new();

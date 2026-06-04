@@ -54,14 +54,13 @@ io-uring = { workspace = true }
 
 [dev-dependencies]
 criterion.workspace = true
+lance-testing.workspace = true
 test-log.workspace = true
 mockall.workspace = true
 rstest.workspace = true
 mock_instant.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 tracing-mock = { workspace = true }
-
-[target.'cfg(target_os = "linux")'.dev-dependencies]
-pprof.workspace = true
 
 [[bench]]
 name = "scheduler"
@@ -76,6 +75,8 @@ azure = ["object_store/azure", "dep:opendal", "opendal/services-azblob", "openda
 oss = ["dep:opendal", "opendal/services-oss", "dep:object_store_opendal"]
 tencent = ["dep:opendal", "opendal/services-cos", "dep:object_store_opendal"]
 huggingface = ["dep:opendal", "opendal/services-huggingface", "dep:object_store_opendal"]
+tos = ["dep:opendal", "opendal/services-tos", "dep:object_store_opendal"]
+tos-test = ["tos"]
 test-util = []
 
 [lints]
