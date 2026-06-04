@@ -398,34 +398,6 @@ impl FixedIntBackend {
         positions
     }
 
-    fn visible_positions(&self, value: &ScalarValue, max: RowPosition) -> Vec<RowPosition> {
-        let Some(enc) = encode_scalar(value) else {
-            if value.is_null() {
-                let mut positions: Vec<RowPosition> = self
-                    .null_positions
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .copied()
-                    .filter(|p| *p <= max)
-                    .collect();
-                positions.sort_unstable();
-                return positions;
-            }
-            return Vec::new();
-        };
-        let start = FixedKey { enc, position: 0 };
-        let mut positions = Vec::new();
-        // For a fixed enc, positions ascend — stop at the first past the watermark.
-        for key in self.reader.range_from(&start) {
-            if key.enc != enc || key.position > max {
-                break;
-            }
-            positions.push(key.position);
-        }
-        positions
-    }
-
     fn len(&self) -> usize {
         self.reader.len() + self.null_positions.lock().unwrap().len()
     }
@@ -575,36 +547,6 @@ impl BytesBackend {
         let mut positions = Vec::new();
         for key in self.reader.range_from(&start) {
             if key.bytes.as_slice() != bytes {
-                break;
-            }
-            positions.push(key.position);
-        }
-        positions
-    }
-
-    fn visible_positions(&self, value: &ScalarValue, max: RowPosition) -> Vec<RowPosition> {
-        let Some(bytes) = value_bytes(value) else {
-            if value.is_null() {
-                let mut positions: Vec<RowPosition> = self
-                    .null_positions
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .copied()
-                    .filter(|p| *p <= max)
-                    .collect();
-                positions.sort_unstable();
-                return positions;
-            }
-            return Vec::new();
-        };
-        let start = BytesKey {
-            bytes: InlineBytes::new(bytes),
-            position: 0,
-        };
-        let mut positions = Vec::new();
-        for key in self.reader.range_from(&start) {
-            if key.bytes.as_slice() != bytes || key.position > max {
                 break;
             }
             positions.push(key.position);
@@ -786,21 +728,6 @@ impl ScalarBackend {
         positions
     }
 
-    fn visible_positions(&self, value: &ScalarValue, max: RowPosition) -> Vec<RowPosition> {
-        let start = IndexKey {
-            value: OrderableScalarValue(value.clone()),
-            row_position: 0,
-        };
-        let mut positions = Vec::new();
-        for key in self.reader.range_from(&start) {
-            if key.value.0 != *value || key.row_position > max {
-                break;
-            }
-            positions.push(key.row_position);
-        }
-        positions
-    }
-
     fn len(&self) -> usize {
         self.reader.len()
     }
@@ -863,14 +790,6 @@ impl Backend {
             Self::FixedInt(b) => b.get(value),
             Self::Bytes(b) => b.get(value),
             Self::Scalar(b) => b.get(value),
-        }
-    }
-
-    fn visible_positions(&self, value: &ScalarValue, max: RowPosition) -> Vec<RowPosition> {
-        match self {
-            Self::FixedInt(b) => b.visible_positions(value, max),
-            Self::Bytes(b) => b.visible_positions(value, max),
-            Self::Scalar(b) => b.visible_positions(value, max),
         }
     }
 
@@ -972,28 +891,6 @@ impl BTreeMemIndex {
     /// Look up row positions for an exact value.
     pub fn get(&self, value: &ScalarValue) -> Vec<RowPosition> {
         self.backend.get().map(|b| b.get(value)).unwrap_or_default()
-    }
-
-    /// All row positions for `value` that are `<= max_visible_row`, ascending.
-    /// The composite-primary-key intersection driver (see
-    /// [`super::IndexStore::pk_newest_visible`]).
-    pub fn visible_positions(
-        &self,
-        value: &ScalarValue,
-        max_visible_row: RowPosition,
-    ) -> Vec<RowPosition> {
-        self.backend
-            .get()
-            .map(|b| b.visible_positions(value, max_visible_row))
-            .unwrap_or_default()
-    }
-
-    /// Whether the exact `(value, position)` entry exists — one seek (the newest
-    /// entry for `value` at or below `position` equals `position` iff present).
-    /// Probes a candidate position against the other PK columns (see
-    /// [`super::IndexStore::pk_newest_visible`]).
-    pub fn contains_position(&self, value: &ScalarValue, position: RowPosition) -> bool {
-        self.get_newest_visible(value, position) == Some(position)
     }
 
     /// Get the number of entries (not unique values).

@@ -41,7 +41,7 @@ use crate::session::Session;
 /// ([`super::exec::NewestPkFilterExec`], which drops a hit that isn't the newest
 /// visible version of its PK), flushed generations via their within-generation
 /// deletion vector — and the cross-generation block-list
-/// ([`super::exec::PkHashFilterExec`]) drops any PK superseded by a newer
+/// ([`super::exec::PkBlockFilterExec`]) drops any PK superseded by a newer
 /// generation. So each PK reaches the union from exactly one source and a
 /// distance-ordered merge yields the global top-k; no cross-source dedup is
 /// needed.
@@ -59,11 +59,11 @@ use crate::session::Session;
 ///               KNNExec: active memtable, fetch=ceil(k*overfetch)
 ///         ProjectionExec (canonical output schema)
 ///           ProjectionExec (null_columns _rowid)
-///             PkHashFilterExec: block-list                   (flushed)
+///             PkBlockFilterExec: block-list                   (flushed)
 ///               KNNExec: flushed gen N, fetch=ceil(k*overfetch) (fast_search)
 ///         … one per flushed gen …
 ///         ProjectionExec (canonical output schema)
-///           PkHashFilterExec: block-list                     (base)
+///           PkBlockFilterExec: block-list                     (base)
 ///             KNNExec: base table, k (fast_search)[.refine()?]
 /// ```
 ///
@@ -169,7 +169,7 @@ impl LsmVectorSearchPlanner {
     ///   the rows that filtering drops:
     ///
     ///   - `factor < 1.0` (e.g. `0.0`): **stale filtering off.** The per-source
-    ///     block-list / [`super::exec::PkHashFilterExec`] is not built or applied,
+    ///     block-list / [`super::exec::PkBlockFilterExec`] is not built or applied,
     ///     so rows superseded by a newer generation can surface. The global PK
     ///     dedup still runs, so it still suppresses stale copies in the cases
     ///     where both the stale and the fresh row reach it.
@@ -211,11 +211,10 @@ impl LsmVectorSearchPlanner {
         // live candidates after the post-filter.
         let overfetch_factor = overfetch_factor.max(1.0);
 
-        // Per-source PK-hash block sets (`NEWER(G)`; base = union of all gens).
+        // Per-source PK block sets (`NEWER(G)`; base = union of all gens).
         // `Box::pin` keeps the future off `clippy::large_futures`.
         let block_lists = Box::pin(super::block_list::compute_source_block_lists(
             &sources,
-            &self.pk_columns,
             self.session.as_ref(),
             self.flushed_cache.as_ref(),
         ))
@@ -288,7 +287,7 @@ impl LsmVectorSearchPlanner {
                 sort_by_distance(filtered, k)?
             } else {
                 match blocked {
-                    Some(set) => Arc::new(super::exec::PkHashFilterExec::new(
+                    Some(set) => Arc::new(super::exec::PkBlockFilterExec::new(
                         knn,
                         self.pk_columns.clone(),
                         set.clone(),
@@ -377,7 +376,7 @@ impl LsmVectorSearchPlanner {
             merged_sorted
         };
 
-        // Under-fetch is warned per-source inside `PkHashFilterExec`.
+        // Under-fetch is warned per-source inside `PkBlockFilterExec`.
         Ok(result)
     }
 
@@ -586,10 +585,23 @@ mod tests {
 
     async fn create_dataset(uri: &str, batches: Vec<RecordBatch>) -> Dataset {
         let schema = batches[0].schema();
-        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
-        Dataset::write(reader, uri, Some(WriteParams::default()))
+        let has_id = schema.column_with_name("id").is_some();
+        let reader = RecordBatchIterator::new(batches.clone().into_iter().map(Ok), schema);
+        let dataset = Dataset::write(reader, uri, Some(WriteParams::default()))
             .await
-            .unwrap()
+            .unwrap();
+        // Also write the standalone PK sidecar (on `id`) so a flushed-generation
+        // source can be probed by the block-list (harmless for a base table).
+        if has_id {
+            crate::dataset::mem_wal::scanner::block_list::write_test_pk_sidecar(
+                uri,
+                &batches,
+                &["id"],
+            )
+            .await
+            .unwrap();
+        }
+        dataset
     }
 
     #[tokio::test]
@@ -1687,7 +1699,7 @@ mod tests {
     #[tokio::test]
     async fn test_vector_search_stale_read_when_fresh_falls_out_of_top_k() {
         // Regression for the cross-generation stale-read gap that the
-        // PkHashFilterExec block-list closes.
+        // PkBlockFilterExec block-list closes.
         //
         // Scenario:
         //   * Base (gen 0): stale pk=1 sitting on the query (distance ~0).

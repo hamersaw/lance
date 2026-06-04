@@ -459,31 +459,30 @@ impl LsmScanner {
         let sources = self.build_collector().collect()?;
         let memberships = super::block_list::fresh_tier_block_list(
             &sources,
-            &self.pk_columns,
             self.session.as_ref(),
             self.flushed_cache.as_ref(),
         )
         .await?;
         let pk_indices = super::exec::resolve_pk_indices(pks, &self.pk_columns)
             .map_err(|e| Error::invalid_input(e.to_string()))?;
-        // On-disk generations probe by hash; in-memory ones probe their
-        // primary-key BTrees by value. Extract values only when needed.
-        let needs_values = memberships
-            .iter()
-            .any(super::block_list::GenMembership::needs_values);
         let mut contained = Vec::with_capacity(pks.num_rows());
         for row in 0..pks.num_rows() {
-            let hash = super::exec::compute_pk_hash(pks, &pk_indices, row);
-            let values: Vec<ScalarValue> = if needs_values {
-                pk_indices
-                    .iter()
-                    .map(|&col| ScalarValue::try_from_array(pks.column(col), row))
-                    .collect::<std::result::Result<_, _>>()
-                    .map_err(|e| Error::invalid_input(e.to_string()))?
-            } else {
-                Vec::new()
-            };
-            contained.push(memberships.iter().any(|m| m.contains(hash, &values)));
+            // In-memory generations probe by value; flushed ones probe their
+            // on-disk PK BTree with the typed/encoded key.
+            let values: Vec<ScalarValue> = pk_indices
+                .iter()
+                .map(|&col| ScalarValue::try_from_array(pks.column(col), row))
+                .collect::<std::result::Result<_, _>>()
+                .map_err(|e| Error::invalid_input(e.to_string()))?;
+            let on_disk_key = super::block_list::on_disk_pk_key(&values)?;
+            let mut found = false;
+            for membership in &memberships {
+                if membership.contains(&values, &on_disk_key).await? {
+                    found = true;
+                    break;
+                }
+            }
+            contained.push(found);
         }
         Ok(contained)
     }
@@ -602,10 +601,14 @@ mod tests {
         };
         let mk = |ids: &[i32], generation: u64| {
             let store = BatchStore::with_capacity(8);
-            store.append(id_batch(ids)).unwrap();
+            let mut index = IndexStore::new();
+            index.enable_pk_index(&[("id".to_string(), 0)]);
+            let b = id_batch(ids);
+            let (bp, off, _) = store.append(b.clone()).unwrap();
+            index.insert_with_batch_position(&b, off, Some(bp)).unwrap();
             InMemoryMemTableRef {
                 batch_store: Arc::new(store),
-                index_store: Arc::new(IndexStore::new()),
+                index_store: Arc::new(index),
                 schema: schema.clone(),
                 generation,
             }
