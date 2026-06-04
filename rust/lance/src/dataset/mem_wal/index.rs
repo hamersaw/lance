@@ -534,15 +534,21 @@ impl IndexStore {
         self.pk_newest_visible(values, max_visible_row) == Some(position)
     }
 
-    /// Whether `values` has any version visible at `max_visible_row` — the
+    /// Whether `key` has any version visible at `max_visible_row` — the
     /// cross-source block-list's existence query, snapshot-bounded so a
     /// not-yet-visible write can't shadow an older visible copy.
-    pub fn pk_contains_visible(
-        &self,
-        values: &[ScalarValue],
-        max_visible_row: RowPosition,
-    ) -> bool {
-        self.pk_newest_visible(values, max_visible_row).is_some()
+    ///
+    /// `key` is already in the index's key space: the typed PK value for a
+    /// single-column key, the `Binary`-encoded tuple for a composite one (built
+    /// by `block_list::on_disk_pk_key`, the same key the flushed on-disk index is
+    /// probed with). Both arities forward it straight to the keyed BTree.
+    pub fn pk_contains_key(&self, key: &ScalarValue, max_visible_row: RowPosition) -> bool {
+        match &self.pk_index {
+            None => false,
+            Some(PkIndex::Single(btree)) | Some(PkIndex::Composite { index: btree, .. }) => {
+                btree.get_newest_visible(key, max_visible_row).is_some()
+            }
+        }
     }
 
     /// Whether the primary-key index holds no rows (or doesn't exist).
@@ -932,8 +938,8 @@ mod tests {
         assert_eq!(store.pk_newest_visible(&one, 1), Some(0));
         assert!(store.pk_is_newest(&one, 2, 5));
         assert!(!store.pk_is_newest(&one, 0, 5));
-        // Absent key.
-        assert!(!store.pk_contains_visible(&[ScalarValue::Int32(Some(9))], 5));
+        // Absent key (probed by the typed value, as the block-list does).
+        assert!(!store.pk_contains_key(&ScalarValue::Int32(Some(9)), 5));
     }
 
     #[test]
@@ -965,9 +971,11 @@ mod tests {
         assert_eq!(store.pk_newest_visible(&tuple_1b, 5), Some(1));
         // Watermark below the re-write: the older (1,"a")@0 is the newest visible.
         assert_eq!(store.pk_newest_visible(&tuple_1a, 1), Some(0));
-        // An absent tuple.
+        // An absent tuple (probed by its Binary-encoded key, as the block-list
+        // does).
         let tuple_2a = [ScalarValue::Int32(Some(2)), ScalarValue::from("a")];
-        assert!(!store.pk_contains_visible(&tuple_2a, 5));
+        let key_2a = ScalarValue::Binary(Some(encode_pk_tuple(&tuple_2a).unwrap()));
+        assert!(!store.pk_contains_key(&key_2a, 5));
     }
 
     #[test]

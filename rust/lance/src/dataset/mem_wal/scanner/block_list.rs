@@ -56,28 +56,19 @@ pub enum GenMembership {
 }
 
 impl GenMembership {
-    /// Whether this generation visibly contains the primary key. The caller
-    /// supplies both the PK `values` (for the in-memory probe) and the
-    /// pre-built `on_disk_key` (typed value for a single-column PK, encoded
-    /// `Binary` tuple for a composite one — see [`on_disk_pk_key`]).
-    pub async fn contains(
-        &self,
-        values: &[ScalarValue],
-        on_disk_key: &ScalarValue,
-    ) -> Result<bool> {
+    /// Whether this generation visibly contains the primary `key` — the typed
+    /// value for a single-column PK, the encoded `Binary` tuple for a composite
+    /// one (built by [`on_disk_pk_key`]). The same key probes the in-memory
+    /// BTree and the flushed on-disk BTree, which now share a key space.
+    pub async fn contains(&self, key: &ScalarValue) -> Result<bool> {
         match self {
             Self::InMemory {
                 index_store,
                 max_visible_row,
-            } => {
-                Ok(max_visible_row.is_some_and(|max| index_store.pk_contains_visible(values, max)))
-            }
+            } => Ok(max_visible_row.is_some_and(|max| index_store.pk_contains_key(key, max))),
             Self::OnDisk(index) => {
                 let result = index
-                    .search(
-                        &SargableQuery::Equals(on_disk_key.clone()),
-                        &NoOpMetricsCollector,
-                    )
+                    .search(&SargableQuery::Equals(key.clone()), &NoOpMetricsCollector)
                     .await
                     .map_err(|e| Error::io(e.to_string()))?;
                 Ok(!search_is_empty(&result))
@@ -366,10 +357,9 @@ mod tests {
 
     /// Whether `id`'s PK is blocked by any of a source's newer-gen memberships.
     async fn blocks(memberships: &[GenMembership], id: i32) -> bool {
-        let values = [ScalarValue::Int32(Some(id))];
-        let key = on_disk_pk_key(&values).unwrap();
+        let key = on_disk_pk_key(&[ScalarValue::Int32(Some(id))]).unwrap();
         for m in memberships {
-            if m.contains(&values, &key).await.unwrap() {
+            if m.contains(&key).await.unwrap() {
                 return true;
             }
         }

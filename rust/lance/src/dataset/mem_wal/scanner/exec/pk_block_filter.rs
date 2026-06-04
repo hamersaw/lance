@@ -191,14 +191,10 @@ async fn filter_batch(
             .iter()
             .map(|&col| ScalarValue::try_from_array(batch.column(col), row))
             .collect::<DFResult<_>>()?;
-        let on_disk_key = on_disk_pk_key(&values).map_err(to_df)?;
+        let key = on_disk_pk_key(&values).map_err(to_df)?;
         let mut blocked_row = false;
         for membership in &blocked {
-            if membership
-                .contains(&values, &on_disk_key)
-                .await
-                .map_err(to_df)?
-            {
+            if membership.contains(&key).await.map_err(to_df)? {
                 blocked_row = true;
                 break;
             }

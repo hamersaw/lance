@@ -467,17 +467,17 @@ impl LsmScanner {
             .map_err(|e| Error::invalid_input(e.to_string()))?;
         let mut contained = Vec::with_capacity(pks.num_rows());
         for row in 0..pks.num_rows() {
-            // In-memory generations probe by value; flushed ones probe their
-            // on-disk PK BTree with the typed/encoded key.
+            // Both in-memory and flushed generations probe by the same key (the
+            // typed value, or the encoded `Binary` tuple for a composite PK).
             let values: Vec<ScalarValue> = pk_indices
                 .iter()
                 .map(|&col| ScalarValue::try_from_array(pks.column(col), row))
                 .collect::<std::result::Result<_, _>>()
                 .map_err(|e| Error::invalid_input(e.to_string()))?;
-            let on_disk_key = super::block_list::on_disk_pk_key(&values)?;
+            let key = super::block_list::on_disk_pk_key(&values)?;
             let mut found = false;
             for membership in &memberships {
-                if membership.contains(&values, &on_disk_key).await? {
+                if membership.contains(&key).await? {
                     found = true;
                     break;
                 }
