@@ -1261,7 +1261,7 @@ impl BTreeIndex {
     /// probes: keys are grouped by page using the same page resolution as
     /// [`ScalarIndex::search`] (`pages_eq`), each touched page is loaded once
     /// (session-cached), and membership is tested against the page's values via
-    /// [`FlatIndex::contains_values`]. Avoids the per-key `SearchResult` /
+    /// `FlatIndex::contains_values`. Avoids the per-key `SearchResult` /
     /// `RowAddrTreeMap` allocation when the caller only wants a yes/no.
     ///
     /// Intended for primary-key dedup, where keys are non-null; a null key maps
