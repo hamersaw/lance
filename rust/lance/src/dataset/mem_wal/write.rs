@@ -922,7 +922,10 @@ impl SharedWriterState {
             self.max_memtable_batches,
         )?;
 
-        if !self.index_configs.is_empty() {
+        // Build an IndexStore when there are user indexes *or* a primary key:
+        // the PK dedup index (and its flushed on-disk sidecar) is required for
+        // cross-generation dedup even when no secondary index is configured.
+        if !self.index_configs.is_empty() || !self.pk_columns.is_empty() {
             let mut indexes = IndexStore::from_configs(
                 &self.index_configs,
                 self.max_memtable_rows,
@@ -1316,8 +1319,9 @@ impl ShardWriter {
 
         // Create indexes if configured and set them on the MemTable. The
         // PK-position index is enabled before any WAL replay below so replayed
-        // rows are recorded in it.
-        if !index_configs.is_empty() {
+        // rows are recorded in it. A primary key alone (no secondary index)
+        // still needs the PK index so flush writes its on-disk dedup sidecar.
+        if !index_configs.is_empty() || !pk_columns.is_empty() {
             let mut indexes = IndexStore::from_configs(
                 index_configs,
                 config.max_memtable_rows,
