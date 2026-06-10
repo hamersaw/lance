@@ -1639,17 +1639,17 @@ mod tests {
                 (14, [0.19, 0.29, 0.39, 0.49]),
             ],
         );
-        let (_, _, bp0) = batch_store.append(stale_then_fillers.clone()).unwrap();
+        let (bp0, off0, _) = batch_store.append(stale_then_fillers.clone()).unwrap();
         index_store
-            .insert_with_batch_position(&stale_then_fillers, 0, Some(bp0))
+            .insert_with_batch_position(&stale_then_fillers, off0, Some(bp0))
             .unwrap();
 
         // Second append: the UPDATE — pk=1 moved far from the query. This is the
         // newest version (largest row position) but it sits well outside top-k.
         let fresh_pk1 = batch_rows(&schema, &[(1, [9.0, 9.0, 9.0, 9.0])]);
-        let (_, _, bp1) = batch_store.append(fresh_pk1.clone()).unwrap();
+        let (bp1, off1, _) = batch_store.append(fresh_pk1.clone()).unwrap();
         index_store
-            .insert_with_batch_position(&fresh_pk1, 1, Some(bp1))
+            .insert_with_batch_position(&fresh_pk1, off1, Some(bp1))
             .unwrap();
         let index_store = Arc::new(index_store);
 

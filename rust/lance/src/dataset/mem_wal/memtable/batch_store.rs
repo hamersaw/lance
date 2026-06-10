@@ -927,6 +927,37 @@ mod tests {
     }
 
     #[test]
+    fn test_max_visible_row() {
+        // (1) Empty store: no rows are visible at any position.
+        let store = BatchStore::with_capacity(10);
+        assert_eq!(store.max_visible_row(0), None);
+        assert_eq!(store.max_visible_row(100), None);
+
+        // Three batches → rows [0,10) [10,30) [30,60); row_offsets 0, 10, 30.
+        store.append(create_test_batch(10)).unwrap(); // position 0
+        store.append(create_test_batch(20)).unwrap(); // position 1
+        store.append(create_test_batch(30)).unwrap(); // position 2
+
+        // (2) A position within range yields the inclusive end of that prefix.
+        assert_eq!(store.max_visible_row(0), Some(9)); // batch 0: 0..10
+        assert_eq!(store.max_visible_row(1), Some(29)); // batch 1: 10..30
+        assert_eq!(store.max_visible_row(2), Some(59)); // batch 2: 30..60
+
+        // (3) A position beyond the committed range clamps to the last batch,
+        // i.e. the inclusive max over all rows.
+        assert_eq!(store.max_visible_row(100), Some(59));
+
+        // (4) An empty leading batch contributes no rows: at its own position
+        // the inclusive end underflows to None, while a later non-empty batch
+        // is reported correctly.
+        let store = BatchStore::with_capacity(10);
+        store.append(create_test_batch(0)).unwrap(); // position 0: rows [0,0)
+        store.append(create_test_batch(5)).unwrap(); // position 1: rows [0,5)
+        assert_eq!(store.max_visible_row(0), None); // empty prefix → no rows
+        assert_eq!(store.max_visible_row(1), Some(4)); // through batch 1
+    }
+
+    #[test]
     fn test_recommended_capacity() {
         // 64MB memtable, 64KB avg batch = 1024 batches * 1.2 = ~1228
         let cap = BatchStore::recommended_capacity(64 * 1024 * 1024);

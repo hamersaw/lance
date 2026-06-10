@@ -751,16 +751,16 @@ mod tests {
 
         // Insert pk=1 ("alpha lance") and an unrelated live pk=2 ("alpha foo").
         let b1 = make_batch(&schema, &[1, 2], &["alpha lance", "alpha foo"]);
-        let (_, _, bp1) = batch_store.append(b1.clone()).unwrap();
+        let (bp1, off1, _) = batch_store.append(b1.clone()).unwrap();
         indexes
-            .insert_with_batch_position(&b1, 0, Some(bp1))
+            .insert_with_batch_position(&b1, off1, Some(bp1))
             .unwrap();
 
         // Update pk=1 → "beta lance" (no longer matches "alpha").
         let b2 = make_batch(&schema, &[1], &["beta lance"]);
-        let (_, _, bp2) = batch_store.append(b2.clone()).unwrap();
+        let (bp2, off2, _) = batch_store.append(b2.clone()).unwrap();
         indexes
-            .insert_with_batch_position(&b2, 1, Some(bp2))
+            .insert_with_batch_position(&b2, off2, Some(bp2))
             .unwrap();
         let indexes = Arc::new(indexes);
 

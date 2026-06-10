@@ -1136,17 +1136,17 @@ mod tests {
         let b_old = create_test_batch(&schema, &[1], "old");
         let b_new = create_test_batch(&schema, &[1], "new");
         let b_other = create_test_batch(&schema, &[2], "two");
-        let (_, _, bp_old) = batch_store.append(b_old.clone()).unwrap();
+        let (bp_old, off_old, _) = batch_store.append(b_old.clone()).unwrap();
         index_store
-            .insert_with_batch_position(&b_old, 0, Some(bp_old))
+            .insert_with_batch_position(&b_old, off_old, Some(bp_old))
             .unwrap();
-        let (_, _, bp_new) = batch_store.append(b_new.clone()).unwrap();
+        let (bp_new, off_new, _) = batch_store.append(b_new.clone()).unwrap();
         index_store
-            .insert_with_batch_position(&b_new, 1, Some(bp_new))
+            .insert_with_batch_position(&b_new, off_new, Some(bp_new))
             .unwrap();
-        let (_, _, bp_other) = batch_store.append(b_other.clone()).unwrap();
+        let (bp_other, off_other, _) = batch_store.append(b_other.clone()).unwrap();
         index_store
-            .insert_with_batch_position(&b_other, 2, Some(bp_other))
+            .insert_with_batch_position(&b_other, off_other, Some(bp_other))
             .unwrap();
         let index_store = Arc::new(index_store);
 
@@ -1208,17 +1208,17 @@ mod tests {
         let b_old = create_test_batch(&schema, &[1], "old");
         let b_new = create_test_batch(&schema, &[1], "new");
         let b_other = create_test_batch(&schema, &[2], "two");
-        let (_, _, bp_old) = batch_store.append(b_old.clone()).unwrap();
+        let (bp_old, off_old, _) = batch_store.append(b_old.clone()).unwrap();
         index_store
-            .insert_with_batch_position(&b_old, 0, Some(bp_old))
+            .insert_with_batch_position(&b_old, off_old, Some(bp_old))
             .unwrap();
-        let (_, _, bp_new) = batch_store.append(b_new.clone()).unwrap();
+        let (bp_new, off_new, _) = batch_store.append(b_new.clone()).unwrap();
         index_store
-            .insert_with_batch_position(&b_new, 1, Some(bp_new))
+            .insert_with_batch_position(&b_new, off_new, Some(bp_new))
             .unwrap();
-        let (_, _, bp_other) = batch_store.append(b_other.clone()).unwrap();
+        let (bp_other, off_other, _) = batch_store.append(b_other.clone()).unwrap();
         index_store
-            .insert_with_batch_position(&b_other, 2, Some(bp_other))
+            .insert_with_batch_position(&b_other, off_other, Some(bp_other))
             .unwrap();
         let index_store = Arc::new(index_store);
 
