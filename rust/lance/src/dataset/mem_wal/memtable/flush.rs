@@ -178,6 +178,12 @@ impl MemTableFlusher {
         self.write_bloom_filter(&bloom_path, memtable.bloom_filter())
             .await?;
 
+        // Write the standalone primary-key dedup sidecar. A primary key needs
+        // no secondary index, so this is required on the plain-flush path too —
+        // the LSM scanner opens it to dedup the generation. (`flush_with_indexes`
+        // writes it on the indexed path.) No-op when the memtable has no PK.
+        self.create_pk_index(&gen_path, memtable.indexes()).await?;
+
         let new_manifest = self
             .update_manifest(
                 epoch,
@@ -1370,6 +1376,101 @@ mod tests {
         };
         // Both PKs present (id=1 even though its first version was superseded);
         // an absent PK is not.
+        assert!(contains(1).await);
+        assert!(contains(2).await);
+        assert!(!contains(99).await);
+    }
+
+    /// Regression: production dispatches a PK-only flush (a primary key, no
+    /// secondary index) to `flush`, not `flush_with_indexes`. `flush` must still
+    /// write the PK dedup sidecar, otherwise cross-generation dedup fails with
+    /// `page_lookup.lance not found`.
+    #[tokio::test]
+    async fn plain_flush_writes_pk_sidecar() {
+        use lance_core::cache::LanceCache;
+        use lance_index::metrics::NoOpMetricsCollector;
+        use lance_index::registry::IndexPluginRegistry;
+        use lance_index::scalar::lance_format::LanceIndexStore;
+        use lance_index::scalar::{SargableQuery, SearchResult};
+
+        use super::super::super::index::IndexStore;
+        use crate::dataset::mem_wal::util::pk_index_path;
+        use datafusion::common::ScalarValue;
+
+        let (store, base_path, _base_uri, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let manifest_store = Arc::new(ShardManifestStore::new(
+            store.clone(),
+            &base_path,
+            shard_id,
+            2,
+        ));
+        let (epoch, _manifest) = manifest_store.claim_epoch(0).await.unwrap();
+
+        // Primary-key index on `id`, no user indexes.
+        let schema = create_pk_schema();
+        let mut memtable = MemTable::new(schema.clone(), 1, vec![0]).unwrap();
+        let mut registry = IndexStore::new();
+        registry.enable_pk_index(&[("id".to_string(), 0)]);
+        memtable.set_indexes(registry);
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["a", "b"])),
+            ],
+        )
+        .unwrap();
+        let frag_id = memtable.insert(batch).await.unwrap();
+        memtable.mark_wal_flushed(&[frag_id], 1, &[0]);
+
+        let flusher = MemTableFlusher::new(
+            store.clone(),
+            base_path.clone(),
+            _base_uri.clone(),
+            shard_id,
+            manifest_store.clone(),
+        );
+        // The plain-flush path — what the writer dispatches to with no indexes.
+        let result = flusher.flush(&memtable, epoch, 1).await.unwrap();
+
+        let gen_path = base_path
+            .clone()
+            .join("_mem_wal")
+            .join(shard_id.to_string())
+            .join(result.generation.path.as_str());
+        let index_store = Arc::new(LanceIndexStore::new(
+            store.clone(),
+            pk_index_path(&gen_path),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let registry = IndexPluginRegistry::with_default_plugins();
+        let plugin = registry.get_plugin_by_name("BTree").unwrap();
+        let details =
+            prost_types::Any::from_msg(&lance_index::pbold::BTreeIndexDetails::default()).unwrap();
+        let index = plugin
+            .load_index(index_store, &details, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        let contains = |id: i32| {
+            let index = index.clone();
+            async move {
+                let result = index
+                    .search(
+                        &SargableQuery::Equals(ScalarValue::Int32(Some(id))),
+                        &NoOpMetricsCollector,
+                    )
+                    .await
+                    .unwrap();
+                match result {
+                    SearchResult::Exact(s) | SearchResult::AtMost(s) | SearchResult::AtLeast(s) => {
+                        !s.is_empty()
+                    }
+                }
+            }
+        };
         assert!(contains(1).await);
         assert!(contains(2).await);
         assert!(!contains(99).await);
