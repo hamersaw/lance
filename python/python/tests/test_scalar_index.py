@@ -108,6 +108,23 @@ def _commit_segmented_btree_index(dataset, column, index_name):
     return dataset.commit_existing_index_segments(index_name, column, segments)
 
 
+def test_create_scalar_index_rejects_invalid_uuid(tmp_path):
+    """Invalid UUID strings passed to create_scalar_index and merge_index_metadata
+    must surface as a Python ValueError at the FFI boundary."""
+    data = pa.table({"id": pa.array(range(100), type=pa.int64())})
+    dataset = lance.write_dataset(data, tmp_path / "ds")
+
+    with pytest.raises(ValueError, match="Invalid UUID"):
+        dataset.create_scalar_index(
+            column="id",
+            index_type="BTREE",
+            index_uuid="not-a-uuid",
+        )
+
+    with pytest.raises(ValueError, match="Invalid UUID"):
+        dataset.merge_index_metadata("also-not-a-uuid", index_type="BTREE")
+
+
 @pytest.fixture
 def btree_comparison_datasets(tmp_path):
     """Setup datasets for B-tree comparison tests"""
@@ -147,12 +164,160 @@ def btree_comparison_datasets(tmp_path):
     }
 
 
-def test_load_indices(indexed_dataset: lance.LanceDataset):
+def test_describe_indices_vector_and_scalar(indexed_dataset: lance.LanceDataset):
     indices = indexed_dataset.describe_indices()
     vec_idx = next(idx for idx in indices if "VectorIndex" in idx.type_url)
     scalar_idx = next(idx for idx in indices if idx.index_type == "BTree")
     assert vec_idx is not None
     assert scalar_idx is not None
+
+
+def test_list_indices_characterization(indexed_dataset: lance.LanceDataset):
+    """Lock down the backwards-compatible shape of the deprecated list_indices().
+
+    list_indices() returns a list of plain dicts (one per index segment), not
+    Index dataclasses. This characterization test guards the dict keys and
+    values so the deprecated method stays backwards compatible.
+    """
+    with pytest.warns(DeprecationWarning):
+        indices = indexed_dataset.list_indices()
+
+    assert len(indices) == 2
+    by_name = {idx["name"]: idx for idx in indices}
+    assert set(by_name) == {"vector_idx", "meta_idx"}
+
+    expected_keys = {
+        "name",
+        "type",
+        "uuid",
+        "fields",
+        "version",
+        "fragment_ids",
+        "base_id",
+    }
+    for idx in indices:
+        assert set(idx) == expected_keys
+        assert isinstance(idx["uuid"], str) and len(idx["uuid"]) > 0
+        assert isinstance(idx["fields"], list)
+        assert isinstance(idx["fragment_ids"], set)
+        assert isinstance(idx["version"], int)
+        assert idx["type"] != "Unknown"
+        assert idx["base_id"] is None
+
+    vector_idx = by_name["vector_idx"]
+    assert vector_idx["type"] == "IVF_PQ"
+    assert vector_idx["fields"] == ["vector"]
+    assert vector_idx["fragment_ids"] == {0}
+
+    meta_idx = by_name["meta_idx"]
+    assert meta_idx["type"] == "BTree"
+    assert meta_idx["fields"] == ["meta"]
+    assert meta_idx["fragment_ids"] == {0}
+
+
+def test_list_indices_nested_field_path(tmp_path):
+    """list_indices() reports nested fields as full dotted paths."""
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64()),
+            pa.field("meta", pa.struct([pa.field("lang", pa.string())])),
+        ]
+    )
+    data = pa.table(
+        {
+            "id": [1, 2, 3],
+            "meta": [{"lang": "en"}, {"lang": "fr"}, {"lang": "en"}],
+        },
+        schema=schema,
+    )
+    ds = lance.write_dataset(data, tmp_path)
+    ds.create_scalar_index(column="meta.lang", index_type="BTREE")
+
+    with pytest.warns(DeprecationWarning):
+        indices = ds.list_indices()
+
+    assert len(indices) == 1
+    assert indices[0]["fields"] == ["meta.lang"]
+
+
+def _commit_index(ds, index):
+    """Commit a single raw Index entry via the CreateIndex operation."""
+    return lance.LanceDataset.commit(
+        ds.uri,
+        lance.LanceOperation.CreateIndex(new_indices=[index], removed_indices=[]),
+        read_version=ds.version,
+    )
+
+
+def test_list_indices_index_without_details(tmp_path):
+    """An index whose manifest entry has no index details (e.g. committed by an
+    older writer) is still reported on a best-effort basis: describe_indices()
+    does not error, and the type is reported as "Unknown"."""
+    from lance.dataset import Index
+
+    data = pa.table({"id": range(100), "val": range(100)})
+    ds = lance.write_dataset(data, tmp_path)
+
+    field_id = ds.schema.get_field_index("id")
+    fragment_ids = {f.fragment_id for f in ds.get_fragments()}
+    ds = _commit_index(
+        ds,
+        Index(
+            uuid=str(uuid.uuid4()),
+            name="legacy_idx",
+            fields=[field_id],
+            dataset_version=ds.version,
+            fragment_ids=fragment_ids,
+            index_version=0,
+        ),
+    )
+
+    described = ds.describe_indices()
+    assert len(described) == 1
+    assert described[0].name == "legacy_idx"
+    assert described[0].index_type == "Unknown"
+    assert described[0].type_url == ""
+
+    with pytest.warns(DeprecationWarning):
+        listed = ds.list_indices()
+    assert len(listed) == 1
+    assert listed[0]["name"] == "legacy_idx"
+    assert listed[0]["type"] == "Unknown"
+
+
+def test_list_indices_legacy_vector_index_without_details(tmp_path):
+    """A legacy vector index predates VectorIndexDetails: it has no index
+    details but stores a monolithic index file. Its type is recognized as
+    "Vector" from the index file rather than reported as "Unknown"."""
+    from lance.dataset import Index, IndexFile
+
+    data = pa.table({"id": range(100), "val": range(100)})
+    ds = lance.write_dataset(data, tmp_path)
+
+    field_id = ds.schema.get_field_index("id")
+    fragment_ids = {f.fragment_id for f in ds.get_fragments()}
+    ds = _commit_index(
+        ds,
+        Index(
+            uuid=str(uuid.uuid4()),
+            name="legacy_vector_idx",
+            fields=[field_id],
+            dataset_version=ds.version,
+            fragment_ids=fragment_ids,
+            index_version=0,
+            # "index.idx" is the legacy monolithic index file name; its presence
+            # is how a pre-details vector index is recognized.
+            files=[IndexFile(path="index.idx", size_bytes=0)],
+        ),
+    )
+
+    described = ds.describe_indices()
+    assert len(described) == 1
+    assert described[0].index_type == "Vector"
+
+    with pytest.warns(DeprecationWarning):
+        listed = ds.list_indices()
+    assert listed[0]["type"] == "Vector"
 
 
 def test_indexed_scalar_scan(indexed_dataset: lance.LanceDataset, data_table: pa.Table):
@@ -3212,6 +3377,52 @@ def test_build_distributed_fts_index_basic(tmp_path):
     assert results.num_rows > 0, "No results found for search term 'frodo'"
 
 
+@pytest.mark.parametrize("index_type", ["INVERTED", "FTS"])
+def test_segment_fts(tmp_path, index_type):
+    ds = generate_multi_fragment_dataset(
+        tmp_path, num_fragments=3, rows_per_fragment=100
+    )
+
+    index_name = f"text_{index_type.lower()}_segment_idx"
+    segments = [
+        ds.create_index_uncommitted(
+            column="text",
+            index_type=index_type,
+            name=index_name,
+            fragment_ids=[fragment.fragment_id],
+            with_position=False,
+            remove_stop_words=False,
+        )
+        for fragment in ds.get_fragments()
+    ]
+    committed_ds = ds.commit_existing_index_segments(index_name, "text", segments)
+
+    query = MatchQuery("frodo", "text")
+    results_without_index = committed_ds.scanner(
+        full_text_query=query,
+        columns=["id", "text"],
+        use_scalar_index=False,
+    ).to_table()
+    results_with_index = committed_ds.scanner(
+        full_text_query=query,
+        columns=["id", "text"],
+        use_scalar_index=True,
+    ).to_table()
+
+    compare_fts_results(results_without_index, results_with_index)
+    assert any(
+        idx.name == index_name and idx.index_type == "Inverted"
+        for idx in committed_ds.describe_indices()
+    )
+    assert (
+        "FlatMatchQuery"
+        not in committed_ds.scanner(
+            full_text_query=query,
+            use_scalar_index=True,
+        ).explain_plan()
+    )
+
+
 def test_compare_fts_results_identical(tmp_path):
     """
     Test compare_fts_results function with identical results.
@@ -4187,7 +4398,7 @@ def test_nested_field_btree_index(tmp_path):
     # Verify index was created
     indices = dataset.describe_indices()
     assert len(indices) == 1
-    assert indices[0].field_names == ["lang"]
+    assert indices[0].field_names == ["meta.lang"]
     assert indices[0].index_type == "BTree"
 
     # Test query using the index - filter for English language
@@ -4288,7 +4499,7 @@ def test_nested_field_fts_index(tmp_path):
     # Verify index was created
     indices = ds.describe_indices()
     assert len(indices) == 1
-    assert indices[0].field_names == ["text"]
+    assert indices[0].field_names == ["data.text"]
     assert indices[0].index_type == "Inverted"
 
     # Test full text search on nested field
@@ -4362,7 +4573,7 @@ def test_nested_field_bitmap_index(tmp_path):
     # Verify index was created
     indices = ds.describe_indices()
     assert len(indices) == 1
-    assert indices[0].field_names == ["color"]
+    assert indices[0].field_names == ["attributes.color"]
     assert indices[0].index_type == "Bitmap"
 
     # Test equality query

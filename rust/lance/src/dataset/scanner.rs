@@ -72,7 +72,7 @@ use lance_index::scalar::inverted::query::{
     FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery, PhraseQuery, fill_fts_query_column,
 };
 use lance_index::scalar::inverted::{SCORE_COL, SCORE_FIELD};
-use lance_index::vector::{DEFAULT_QUERY_PARALLELISM, DIST_COL, Query};
+use lance_index::vector::{ApproxMode, DEFAULT_QUERY_PARALLELISM, DIST_COL, Query};
 use lance_index::{metrics::NoOpMetricsCollector, scalar::inverted::FTS_SCHEMA};
 use lance_io::stream::RecordBatchStream;
 use lance_linalg::distance::MetricType;
@@ -829,6 +829,15 @@ pub struct Scanner {
     /// Which version of the relational algebra to use when generating the physical plan
     relational_algebra_version: u32,
 
+    /// Target degree of parallelism for the physical optimizer.
+    ///
+    /// This is passed as `ConfigOptions::execution::target_partitions` to the
+    /// physical optimizer (e.g. `EnforceDistribution`), which uses it to decide
+    /// how many parallel partitions to target when inserting exchange nodes.
+    ///
+    /// Defaults to `get_num_compute_intensive_cpus()`.
+    target_parallelism: Option<usize>,
+
     // Legacy fields to help migrate some old projection behavior to new behavior
     //
     // There are two behaviors we are moving away from:
@@ -1053,6 +1062,7 @@ impl Scanner {
             explicit_projection: false,
             autoproject_scoring_columns: true,
             relational_algebra_version: LANCE_RELATIONAL_ALGEBRA_VERSION,
+            target_parallelism: None,
         };
         scanner.apply_blob_handling();
         scanner
@@ -1379,6 +1389,16 @@ impl Scanner {
         self
     }
 
+    /// Set the target number of partitions for the physical optimizer.
+    ///
+    /// Overrides the default (`get_num_compute_intensive_cpus()`). Used by
+    /// `EnforceDistribution` and similar rules to decide how many parallel
+    /// partitions to use. Set to 1 in tests that assert specific plan shapes.
+    pub fn target_parallelism(&mut self, n: usize) -> &mut Self {
+        self.target_parallelism = Some(n);
+        self
+    }
+
     /// Set whether to read data in order (default: true)
     ///
     /// A scan will always read from the disk concurrently.  If this property
@@ -1572,6 +1592,7 @@ impl Scanner {
             use_index: true,
             query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
+            approx_mode: Default::default(),
         });
         self.nearest_query_count = query_count;
         self.is_batch_nearest = is_batch_nearest;
@@ -1736,6 +1757,19 @@ impl Scanner {
     pub fn use_index(&mut self, use_index: bool) -> &mut Self {
         if let Some(q) = self.nearest.as_mut() {
             q.use_index = use_index
+        }
+        self
+    }
+
+    /// Configure the speed / accuracy tradeoff for approximate vector search.
+    ///
+    /// This setting is currently only used by RQ-quantized indexes, such as
+    /// IVF_RQ. Other index types ignore this setting.
+    pub fn approx_mode(&mut self, approx_mode: ApproxMode) -> &mut Self {
+        if let Some(q) = self.nearest.as_mut() {
+            q.approx_mode = approx_mode;
+        } else {
+            log::warn!("approx_mode is not set because nearest has not been called yet");
         }
         self
     }
@@ -2617,7 +2651,10 @@ impl Scanner {
             plan = self.apply_aggregate(plan, agg).await?;
 
             let optimizer = get_physical_optimizer();
-            let options = Default::default();
+            let mut options = ConfigOptions::default();
+            options.execution.target_partitions = self
+                .target_parallelism
+                .unwrap_or_else(get_num_compute_intensive_cpus);
             for rule in optimizer.rules {
                 plan = rule.optimize(plan, &options)?;
             }
@@ -2681,7 +2718,10 @@ impl Scanner {
         }
 
         let optimizer = get_physical_optimizer();
-        let options: ConfigOptions = Default::default();
+        let mut options = ConfigOptions::default();
+        options.execution.target_partitions = self
+            .target_parallelism
+            .unwrap_or_else(get_num_compute_intensive_cpus);
         for rule in optimizer.rules {
             plan = rule.optimize(plan, &options)?;
         }
@@ -3655,7 +3695,7 @@ impl Scanner {
                         .dataset
                         .open_vector_index(
                             q.column.as_str(),
-                            &selected_index_segments[0].uuid.to_string(),
+                            &selected_index_segments[0].uuid,
                             &NoOpMetricsCollector,
                         )
                         .await?;
@@ -3689,11 +3729,7 @@ impl Scanner {
                     // Fall back to opening the index for legacy indices without details
                     let idx = self
                         .dataset
-                        .open_vector_index(
-                            q.column.as_str(),
-                            &index.uuid.to_string(),
-                            &NoOpMetricsCollector,
-                        )
+                        .open_vector_index(q.column.as_str(), &index.uuid, &NoOpMetricsCollector)
                         .await?;
                     idx.metric_type()
                 };
@@ -8297,6 +8333,9 @@ mod test {
         expected: &str,
     ) -> Result<()> {
         let mut scan = dataset.scan();
+        // Pin target_parallelism=1 so EnforceDistribution produces deterministic plans
+        // regardless of the machine's CPU count.
+        scan.target_parallelism(1);
         plan(&mut scan)?;
         let exec_plan = scan.create_plan().await?;
         assert_plan_node_equals(exec_plan, expected).await
@@ -9675,7 +9714,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
       FilterExec: _distance@... IS NOT NULL
         SortExec: TopK(fetch=6), expr=...
           KNNVectorDistance: metric=l2
-            RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+            CoalescePartitionsExec
               UnionExec
                 ProjectionExec: expr=[_distance@2 as _distance, _rowid@1 as _rowid, vec@0 as vec]
                   FilterExec: _distance@... IS NOT NULL
@@ -9707,7 +9746,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             FilterExec: _distance@... IS NOT NULL
               SortExec: TopK(fetch=15), expr=...
                 KNNVectorDistance: metric=l2
-                  RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+                  CoalescePartitionsExec
                     UnionExec
                       ProjectionExec: expr=[_distance@2 as _distance, _rowid@1 as _rowid, vec@0 as vec]
                         FilterExec: _distance@... IS NOT NULL
@@ -9735,7 +9774,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
       FilterExec: _distance@... IS NOT NULL
         SortExec: TopK(fetch=5), expr=...
           KNNVectorDistance: metric=l2
-            RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+            CoalescePartitionsExec
               UnionExec
                 ProjectionExec: expr=[_distance@3 as _distance, _rowid@2 as _rowid, vec@0 as vec]
                   FilterExec: _distance@... IS NOT NULL
@@ -9757,7 +9796,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
       FilterExec: _distance@... IS NOT NULL
         SortExec: TopK(fetch=5), expr=...
           KNNVectorDistance: metric=l2
-            RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+            CoalescePartitionsExec
               UnionExec
                 ProjectionExec: expr=[_distance@3 as _distance, _rowid@2 as _rowid, vec@0 as vec]
                   FilterExec: _distance@... IS NOT NULL
@@ -9856,7 +9895,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
       FilterExec: _distance@... IS NOT NULL
         SortExec: TopK(fetch=8), expr=...
           KNNVectorDistance: metric=l2
-            RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+            CoalescePartitionsExec
               UnionExec
                 ProjectionExec: expr=[_distance@3 as _distance, _rowid@2 as _rowid, vec@0 as vec]
                   FilterExec: _distance@... IS NOT NULL
@@ -9892,7 +9931,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
       FilterExec: _distance@... IS NOT NULL
         SortExec: TopK(fetch=11), expr=...
           KNNVectorDistance: metric=l2
-            RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+            CoalescePartitionsExec
               UnionExec
                 ProjectionExec: expr=[_distance@3 as _distance, _rowid@2 as _rowid, vec@0 as vec]
                   FilterExec: _distance@... IS NOT NULL
@@ -9985,14 +10024,13 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         log::info!("Test case: Combined Scalar/non-scalar filtered read");
         let expected = if data_storage_version == LanceFileVersion::Legacy {
             "ProjectionExec: expr=[s@1 as s]
-  RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
-    UnionExec
-      Take: columns=\"_rowid, (s)\"
-        CoalesceBatchesExec: target_batch_size=8192
-          MaterializeIndex: query=[i > 10]@i_idx(BTree)
-      ProjectionExec: expr=[_rowid@2 as _rowid, s@1 as s]
-        FilterExec: i@0 > 10
-          LanceScan: uri=..., projection=[i, s], row_id=true, row_addr=false, ordered=false, range=None"
+  UnionExec
+    Take: columns=\"_rowid, (s)\"
+      CoalesceBatchesExec: target_batch_size=8192
+        MaterializeIndex: query=[i > 10]@i_idx(BTree)
+    ProjectionExec: expr=[_rowid@2 as _rowid, s@1 as s]
+      FilterExec: i@0 > 10
+        LanceScan: uri=..., projection=[i, s], row_id=true, row_addr=false, ordered=false, range=None"
         } else {
             "LanceRead: uri=..., projection=[s], num_fragments=5, range_before=None, \
             range_after=None, row_id=false, row_addr=false, full_filter=i > Int32(10), refine_filter=--
@@ -10008,13 +10046,12 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         log::info!("Test case: Combined Scalar/non-scalar filtered read with empty projection");
         let expected = if data_storage_version == LanceFileVersion::Legacy {
             "ProjectionExec: expr=[_rowaddr@0 as _rowaddr]
-  RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
-    UnionExec
-      AddRowAddrExec
-        MaterializeIndex: query=[i > 10]@i_idx(BTree)
-      ProjectionExec: expr=[_rowaddr@2 as _rowaddr, _rowid@1 as _rowid]
-        FilterExec: i@0 > 10
-          LanceScan: uri=..., projection=[i], row_id=true, row_addr=true, ordered=false, range=None"
+  UnionExec
+    AddRowAddrExec
+      MaterializeIndex: query=[i > 10]@i_idx(BTree)
+    ProjectionExec: expr=[_rowaddr@2 as _rowaddr, _rowid@1 as _rowid]
+      FilterExec: i@0 > 10
+        LanceScan: uri=..., projection=[i], row_id=true, row_addr=true, ordered=false, range=None"
         } else {
             "LanceRead: uri=..., projection=[], num_fragments=5, range_before=None, \
             range_after=None, row_id=false, row_addr=true, full_filter=i > Int32(10), refine_filter=--
@@ -10037,14 +10074,13 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         log::info!("Test case: Dynamic projection");
         let expected = if data_storage_version == LanceFileVersion::Legacy {
             "ProjectionExec: expr=[regexp_match(s@1, .*) as matches]
-  RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
-    UnionExec
-      Take: columns=\"_rowid, (s)\"
-        CoalesceBatchesExec: target_batch_size=8192
-          MaterializeIndex: query=[i > 10]@i_idx(BTree)
-      ProjectionExec: expr=[_rowid@2 as _rowid, s@1 as s]
-        FilterExec: i@0 > 10
-          LanceScan: uri=..., row_id=true, row_addr=false, ordered=false, range=None"
+  UnionExec
+    Take: columns=\"_rowid, (s)\"
+      CoalesceBatchesExec: target_batch_size=8192
+        MaterializeIndex: query=[i > 10]@i_idx(BTree)
+    ProjectionExec: expr=[_rowid@2 as _rowid, s@1 as s]
+      FilterExec: i@0 > 10
+        LanceScan: uri=..., row_id=true, row_addr=false, ordered=false, range=None"
         } else {
             "ProjectionExec: expr=[regexp_match(s@0, .*) as matches]
   LanceRead: uri=..., projection=[s], num_fragments=5, range_before=None, \
@@ -10127,7 +10163,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
       MatchQuery: column=s, query=hello
-        RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+        CoalescePartitionsExec
           UnionExec
             MaterializeIndex: query=[i > 10]@i_idx(BTree)
             ProjectionExec: expr=[_rowid@1 as _rowid]
@@ -10159,7 +10195,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
-        RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+        CoalescePartitionsExec
           UnionExec
             MatchQuery: column=s, query=hello
             FlatMatchQuery: column=s, query=hello
@@ -10201,10 +10237,10 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
-        RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+        CoalescePartitionsExec
           UnionExec
             MatchQuery: column=s, query=hello
-              RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+              CoalescePartitionsExec
                 UnionExec
                   MaterializeIndex: query=[i > 10]@i_idx(BTree)
                   ProjectionExec: expr=[_rowid@1 as _rowid]
@@ -10218,7 +10254,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
-        RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+        CoalescePartitionsExec
           UnionExec
             MatchQuery: column=s, query=hello
               LanceRead: uri=..., projection=[], num_fragments=5, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=--
@@ -10295,7 +10331,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
   FilterExec: _distance@2 IS NOT NULL
     SortExec: TopK(fetch=34), expr=[_distance@2 ASC NULLS LAST, _rowid@0 ASC NULLS LAST]...
       KNNVectorDistance: metric=l2
-        RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+        CoalescePartitionsExec
           UnionExec
             ProjectionExec: expr=[_distance@2 as _distance, _rowid@1 as _rowid, vec@0 as vec]
               FilterExec: _distance@2 IS NOT NULL
@@ -10346,6 +10382,41 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
 
         assert_eq!(batch.num_rows(), 0);
         assert_query_index_field(&batch);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_fts_multiple_unindexed_appends() {
+        // An FTS query over an indexed dataset plus more than one unindexed append
+        // must return matches from every unindexed fragment, not just the first. The
+        // flat search over unindexed data reads only a single input partition, so when
+        // the default parallelism splits the scan across partitions it used to drop
+        // every append but the first.
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        test_ds.make_fts_index().await.unwrap();
+        // Two separate appends -> two unindexed fragments, each large enough that the
+        // physical optimizer parallelizes the flat scan across partitions.
+        test_ds.append_data_with_range(400, 5400).await.unwrap();
+        test_ds.append_data_with_range(5400, 10400).await.unwrap();
+
+        // Every row's `s` value contains the token "s", so FTS("s") matches all rows.
+        let total = test_ds.dataset.count_rows(None).await.unwrap();
+        let returned = test_ds
+            .dataset
+            .scan()
+            .full_text_search(FullTextSearchQuery::new("s".to_owned()))
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_fold(
+                0usize,
+                |acc, batch| async move { Ok(acc + batch.num_rows()) },
+            )
+            .await
+            .unwrap();
+        assert_eq!(returned, total);
     }
 
     #[rstest]
@@ -10826,6 +10897,26 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
 
         scanner.query_parallelism(-1);
         assert_eq!(scanner.nearest_mut().unwrap().query_parallelism, -1);
+    }
+
+    #[tokio::test]
+    async fn test_knn_approx_mode_defaults_and_setter() {
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        let query_vector = Float32Array::from(vec![0.0; 32]);
+        let mut scanner = test_ds.dataset.scan();
+        scanner.nearest("vec", &query_vector, 5).unwrap();
+        assert_eq!(
+            scanner.nearest_mut().unwrap().approx_mode,
+            ApproxMode::Normal
+        );
+
+        scanner.approx_mode(ApproxMode::Accurate);
+        assert_eq!(
+            scanner.nearest_mut().unwrap().approx_mode,
+            ApproxMode::Accurate
+        );
     }
 
     #[tokio::test]

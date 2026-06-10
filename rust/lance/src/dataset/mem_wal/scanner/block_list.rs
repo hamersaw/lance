@@ -270,6 +270,24 @@ fn in_memory_membership(
 /// are cached in the session's index cache (keyed by the immutable flushed
 /// path), so repeated probes reuse them with no separate cache path and no
 /// upfront scan; concurrent first-opens may each load before the cache fills.
+/// A stable cache UUID for a non-manifest index identified only by its path.
+///
+/// `DSIndexCache::for_index` keys by `&Uuid`, but the flushed PK sidecar has no
+/// manifest UUID — its identity is its immutable path. Derive a deterministic
+/// UUID from the path so the cache namespace is per-path and stable across
+/// probes (the `uuid` crate lacks the `v5` "name-based" feature here, so hash to
+/// a `u128` instead).
+fn path_cache_uuid(path: &str) -> Uuid {
+    use std::hash::{Hash, Hasher};
+    let mut lo = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut lo);
+    let mut hi = std::collections::hash_map::DefaultHasher::new();
+    // Seed the high half differently so it never equals the low half.
+    "lance/flushed-pk-index".hash(&mut hi);
+    path.hash(&mut hi);
+    Uuid::from_u128(((hi.finish() as u128) << 64) | lo.finish() as u128)
+}
+
 async fn open_pk_index(
     path: &str,
     session: Option<&Arc<Session>>,
@@ -279,7 +297,7 @@ async fn open_pk_index(
     // Namespace the session index cache by the (immutable) flushed path so this
     // sidecar's pages live alongside every other index instead of a bespoke
     // cache. `fri_uuid` is None — flushed generations carry no fragment-reuse.
-    let index_cache = dataset.index_cache.for_index(path, None);
+    let index_cache = dataset.index_cache.for_index(&path_cache_uuid(path), None);
     let index_dir = dataset.base.clone().join(PK_INDEX_DIR);
     let store: Arc<dyn ScalarIndexStore> = Arc::new(LanceIndexStore::new(
         dataset.object_store.clone(),
@@ -350,7 +368,10 @@ pub async fn write_test_pk_sidecar(
         schema,
         futures::stream::iter(training.into_iter().map(Ok)),
     ));
-    train_btree_index(stream, &store, 8192, None, None).await
+    // `train_btree_index` now returns the written index files; the sidecar
+    // writer only needs success/failure.
+    train_btree_index(stream, &store, 8192, None, None).await?;
+    Ok(())
 }
 
 #[cfg(test)]

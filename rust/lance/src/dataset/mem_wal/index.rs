@@ -414,7 +414,7 @@ impl IndexStore {
     /// Single-column PKs reuse an existing BTree on the field, else auto-create
     /// one under a `__pk__*` name so the normal insert loop maintains it (no
     /// second copy). Composite (arity >= 2) PKs key a `BTreeMemIndex` on the
-    /// order-preserving encoded tuple (synthetic [`PK_KEY_COLUMN`]), maintained
+    /// order-preserving encoded tuple (synthetic `PK_KEY_COLUMN`), maintained
     /// explicitly in the insert paths. Call once at construction, after
     /// [`Self::from_configs`] and before any inserts; a no-op when `pk_columns`
     /// is empty.
@@ -481,7 +481,7 @@ impl IndexStore {
     }
 
     /// Maintain the composite PK index for `batch` (no-op for single/no PK):
-    /// encode the PK columns into the synthetic [`PK_KEY_COLUMN`] `Binary` column
+    /// encode the PK columns into the synthetic `PK_KEY_COLUMN` `Binary` column
     /// and feed that to the keyed `BTreeMemIndex`.
     fn insert_composite_pk(&self, batch: &RecordBatch, row_offset: u64) -> Result<()> {
         if let Some(PkIndex::Composite { index, columns }) = &self.pk_index {
