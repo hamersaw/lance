@@ -593,13 +593,9 @@ mod tests {
         // Also write the standalone PK sidecar (on `id`) so a flushed-generation
         // source can be probed by the block-list (harmless for a base table).
         if has_id {
-            crate::dataset::mem_wal::scanner::block_list::write_test_pk_sidecar(
-                uri,
-                &batches,
-                &["id"],
-            )
-            .await
-            .unwrap();
+            crate::dataset::mem_wal::scanner::block_list::write_pk_sidecar(uri, &batches, &["id"])
+                .await
+                .unwrap();
         }
         dataset
     }

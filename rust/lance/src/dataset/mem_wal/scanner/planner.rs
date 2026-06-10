@@ -423,7 +423,7 @@ mod integration_tests {
             .await
             .unwrap();
         if has_id {
-            super::super::block_list::write_test_pk_sidecar(uri, &batches, &["id"])
+            super::super::block_list::write_pk_sidecar(uri, &batches, &["id"])
                 .await
                 .unwrap();
         }

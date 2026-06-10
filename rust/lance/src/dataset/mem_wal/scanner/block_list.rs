@@ -322,13 +322,15 @@ async fn open_pk_index(
     Ok(index)
 }
 
-/// Test helper: write a flushed generation's standalone PK sidecar at
-/// `{uri}/_pk_index` from `batches`, mirroring what flush does in production.
-/// `pk_columns` are the primary-key column names (field ids are synthesized by
-/// position — `insert` resolves columns by name). A no-op when no batch carries
-/// the PK columns.
-#[cfg(test)]
-pub async fn write_test_pk_sidecar(
+/// Write a flushed generation's standalone PK sidecar at `{uri}/_pk_index` from
+/// `batches`, mirroring what flush does in production. `pk_columns` are the
+/// primary-key column names (field ids are synthesized by position — `insert`
+/// resolves columns by name). A no-op when no batch carries the PK columns.
+///
+/// Used by Rust scanner tests and by the Python test-support binding to stage
+/// faithful flushed generations (a flushed dataset alone, with no sidecar, is
+/// not a state production ever produces).
+pub async fn write_pk_sidecar(
     uri: &str,
     batches: &[arrow_array::RecordBatch],
     pk_columns: &[&str],
