@@ -5,9 +5,10 @@
 //!
 //! Drops a row when any newer generation's membership ([`GenMembership`])
 //! contains its primary key — in-memory generations probe their PK index by
-//! value, flushed generations probe their on-disk PK BTree with `Equals`. Used
-//! both as the KNN post-filter (vector search, with over-fetch) and the
-//! cross-generation scan filter (`k = 0`).
+//! value, flushed generations probe their on-disk PK BTree. Each generation is
+//! probed once per batch (see the perf note below). Used both as the KNN
+//! post-filter (vector search, with over-fetch) and the cross-generation scan
+//! filter (`k = 0`).
 //!
 //! Cross-generation only: within-gen duplicates collapse via the global dedup's
 //! `(generation, freshness)` tiebreaker.
@@ -15,13 +16,16 @@
 //! Post-filters an over-fetched KNN (the planner's `overfetch_factor`); warns
 //! when a source had >= k candidates but < k survived (over-fetch too small).
 //!
-//! Perf note: the on-disk probe is one `Equals` per row per flushed generation.
-//! It is not disk-bound in steady state — the opened index and its (small,
+//! Perf note: each generation is probed once per batch via
+//! [`GenMembership::contains_keys`] — a batched existence check over the
+//! batch's keys — not once per row. The on-disk arm issues a single
+//! `BTreeIndex::contains_keys` (one page pass, no per-key `SearchResult`
+//! allocation); the in-memory arm maps a sync PK lookup over the keys. Probes
+//! are not disk-bound in steady state: the opened index and its (small,
 //! memtable-sized) pages are held by the injected `FlushedMemTableCache` /
-//! `LanceCache`, so after the first touch every probe is memory-resident. The
-//! residual per-row cost is the in-memory BTree search plus a `SearchResult`
-//! allocation per lookup; a batched/existence-only membership probe (avoiding
-//! the per-row allocation) is the future optimization.
+//! `LanceCache`, so after the first touch every probe is memory-resident.
+//! Already-blocked rows are dropped from the key set before probing older
+//! generations, preserving the per-row short-circuit.
 
 use std::any::Any;
 use std::fmt;
@@ -146,8 +150,10 @@ impl ExecutionPlan for PkBlockFilterExec {
         let input_stream = self.input.execute(partition, context)?;
         Ok(Box::pin(PkBlockFilterStream {
             input: input_stream,
-            pk_columns: self.pk_columns.clone(),
-            blocked: self.blocked.clone(),
+            config: Arc::new(FilterConfig {
+                pk_columns: self.pk_columns.clone(),
+                blocked: self.blocked.clone(),
+            }),
             k: self.k,
             schema: self.schema(),
             pending: None,
@@ -158,10 +164,17 @@ impl ExecutionPlan for PkBlockFilterExec {
     }
 }
 
-struct PkBlockFilterStream {
-    input: SendableRecordBatchStream,
+/// Immutable per-stream filter config. Shared into each batch's `'static` async
+/// future by a single `Arc` clone, rather than deep-cloning the PK columns and
+/// memberships per batch.
+struct FilterConfig {
     pk_columns: Vec<String>,
     blocked: Vec<GenMembership>,
+}
+
+struct PkBlockFilterStream {
+    input: SendableRecordBatchStream,
+    config: Arc<FilterConfig>,
     k: usize,
     schema: SchemaRef,
     /// The in-flight filter for the batch currently being processed (the probe
@@ -174,35 +187,53 @@ struct PkBlockFilterStream {
 
 /// Keep only the rows no newer-gen membership contains. Async because flushed
 /// generations are probed against their on-disk PK BTree.
-async fn filter_batch(
-    batch: RecordBatch,
-    pk_columns: Vec<String>,
-    blocked: Vec<GenMembership>,
-) -> DFResult<RecordBatch> {
+async fn filter_batch(batch: RecordBatch, config: Arc<FilterConfig>) -> DFResult<RecordBatch> {
+    let FilterConfig {
+        pk_columns,
+        blocked,
+    } = config.as_ref();
     if blocked.is_empty() || batch.num_rows() == 0 {
         return Ok(batch);
     }
-    let pk_indices = resolve_pk_indices(&batch, &pk_columns)?;
+    let pk_indices = resolve_pk_indices(&batch, pk_columns)?;
     let to_df = |e: lance_core::Error| DataFusionError::Execution(e.to_string());
 
-    let mut keep = Vec::with_capacity(batch.num_rows());
-    for row in 0..batch.num_rows() {
-        let values: Vec<ScalarValue> = pk_indices
-            .iter()
-            .map(|&col| ScalarValue::try_from_array(batch.column(col), row))
-            .collect::<DFResult<_>>()?;
-        let key = on_disk_pk_key(&values).map_err(to_df)?;
-        let mut blocked_row = false;
-        for membership in &blocked {
-            if membership.contains(&key).await.map_err(to_df)? {
-                blocked_row = true;
-                break;
+    // One key per row, in the index key space.
+    let keys: Vec<ScalarValue> = (0..batch.num_rows())
+        .map(|row| {
+            let values: Vec<ScalarValue> = pk_indices
+                .iter()
+                .map(|&col| ScalarValue::try_from_array(batch.column(col), row))
+                .collect::<DFResult<_>>()?;
+            on_disk_pk_key(&values).map_err(to_df)
+        })
+        .collect::<DFResult<_>>()?;
+
+    // A row is dropped if any newer generation contains its key. Probe each
+    // generation once (batched) rather than once per row, narrowing to the
+    // still-live rows so an already-blocked row isn't re-probed against older
+    // generations.
+    let mut blocked_row = vec![false; keys.len()];
+    let mut live: Vec<usize> = (0..keys.len()).collect();
+    for membership in blocked {
+        if live.is_empty() {
+            break;
+        }
+        let live_keys: Vec<ScalarValue> = live.iter().map(|&i| keys[i].clone()).collect();
+        let mask = membership.contains_keys(&live_keys).await.map_err(to_df)?;
+        let mut next_live = Vec::with_capacity(live.len());
+        for (pos, &row) in live.iter().enumerate() {
+            if mask[pos] {
+                blocked_row[row] = true;
+            } else {
+                next_live.push(row);
             }
         }
-        keep.push(!blocked_row);
+        live = next_live;
     }
-    filter_record_batch(&batch, &BooleanArray::from(keep))
-        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+
+    let keep = BooleanArray::from_iter(blocked_row.into_iter().map(|b| Some(!b)));
+    filter_record_batch(&batch, &keep).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
 }
 
 impl Stream for PkBlockFilterStream {
@@ -230,9 +261,7 @@ impl Stream for PkBlockFilterStream {
             match this.input.poll_next_unpin(cx) {
                 Poll::Ready(Some(Ok(batch))) => {
                     this.input_seen += batch.num_rows();
-                    this.pending = Some(
-                        filter_batch(batch, this.pk_columns.clone(), this.blocked.clone()).boxed(),
-                    );
+                    this.pending = Some(filter_batch(batch, this.config.clone()).boxed());
                     // Loop to poll the just-created future.
                 }
                 Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),

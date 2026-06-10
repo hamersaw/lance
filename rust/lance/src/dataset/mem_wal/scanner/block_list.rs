@@ -6,10 +6,12 @@
 //! A generation's membership is a [`GenMembership`]: in-memory generations
 //! (active / frozen) are probed by value against their maintained primary-key
 //! index (no per-query set), while flushed generations are probed against their
-//! standalone on-disk PK BTree (the sidecar written at flush, opened by path and
-//! queried with `Equals`). Each source gets a `Vec<GenMembership>` of the newer
-//! generations (`NEWER(G)`; base: all of them); the KNN drops a candidate whose
-//! PK any of them contains (see [`super::exec::PkBlockFilterExec`]).
+//! standalone on-disk PK BTree (the sidecar written at flush, opened by path).
+//! Probing is batched — [`GenMembership::contains_keys`] tests a whole batch of
+//! keys per generation in one pass. Each source gets a `Vec<GenMembership>` of
+//! the newer generations (`NEWER(G)`; base: all of them); the KNN drops a
+//! candidate whose PK any of them contains (see
+//! [`super::exec::PkBlockFilterExec`]).
 //!
 //! Cross-generation only: within-gen dups collapse via the global dedup's
 //! `(generation, freshness)` tiebreaker.
@@ -22,6 +24,7 @@ use lance_core::{Error, Result};
 
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::registry::IndexPluginRegistry;
+use lance_index::scalar::btree::BTreeIndex;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::{
     IndexStore as ScalarIndexStore, SargableQuery, ScalarIndex, SearchResult,
@@ -72,6 +75,36 @@ impl GenMembership {
                     .await
                     .map_err(|e| Error::io(e.to_string()))?;
                 Ok(!search_is_empty(&result))
+            }
+        }
+    }
+
+    /// Batched [`Self::contains`]: for each key in `keys`, whether this
+    /// generation visibly contains it, returned as a mask aligned to `keys`.
+    ///
+    /// One probe replaces N. The on-disk arm issues a single
+    /// [`BTreeIndex::contains_keys`] (no per-key `SearchResult` allocation); the
+    /// in-memory arm maps the sync, allocation-free PK lookup over the slice.
+    /// Keys are in the index's key space (see [`on_disk_pk_key`]).
+    pub async fn contains_keys(&self, keys: &[ScalarValue]) -> Result<Vec<bool>> {
+        match self {
+            Self::InMemory {
+                index_store,
+                max_visible_row,
+            } => Ok(keys
+                .iter()
+                .map(|key| max_visible_row.is_some_and(|max| index_store.pk_contains_key(key, max)))
+                .collect()),
+            Self::OnDisk(index) => {
+                // The flushed PK sidecar is always a BTree (built via
+                // `PK_BTREE_REGISTRY`); downcast to reach the batched probe.
+                let btree = index.as_any().downcast_ref::<BTreeIndex>().ok_or_else(|| {
+                    Error::io("flushed PK dedup index is not a BTree".to_string())
+                })?;
+                btree
+                    .contains_keys(keys, &NoOpMetricsCollector)
+                    .await
+                    .map_err(|e| Error::io(e.to_string()))
             }
         }
     }
