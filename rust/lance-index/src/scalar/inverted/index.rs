@@ -2048,7 +2048,7 @@ impl PostingListReader {
         match &self.metadata {
             PostingMetadata::LegacyV1 { .. } => Ok(self.posting_len(token_id)),
             PostingMetadata::V2 { metadata } => {
-                if let Some(metadata) = metadata.get() {
+                if let Some(metadata) = self.small_index_bulk_metadata(metadata).await? {
                     return Ok(metadata.lengths[token_id as usize] as usize);
                 }
                 let token_id = token_id as usize;
@@ -2060,6 +2060,25 @@ impl PostingListReader {
                 Ok(len as usize)
             }
         }
+    }
+
+    /// For small token sets, bulk-load (and afterwards serve) the v2 posting
+    /// metadata instead of the per-token single-row path. The single-row
+    /// reads are never cached, so every query pays one tiny ranged GET per
+    /// term per partition — for a small index (e.g. a mem_wal flushed
+    /// generation) the entire metadata costs one read of comparable latency
+    /// and the index object itself is cached. Large indexes keep the O(1)
+    /// single-row behavior. Returns the loaded metadata when (now) resident.
+    async fn small_index_bulk_metadata<'a>(
+        &self,
+        metadata: &'a tokio::sync::OnceCell<LoadedPostingMetadata>,
+    ) -> Result<Option<&'a LoadedPostingMetadata>> {
+        // 8 bytes/token (u32 length + f32 max_score): 256Ki tokens ≈ 2 MiB.
+        const BULK_LOAD_MAX_TOKENS: usize = 256 * 1024;
+        if metadata.get().is_none() && self.reader.num_rows() <= BULK_LOAD_MAX_TOKENS {
+            self.ensure_metadata_loaded().await?;
+        }
+        Ok(metadata.get())
     }
 
     /// Async access to a single token's `(max_score, length)` pair. Mirrors
@@ -2077,7 +2096,7 @@ impl PostingListReader {
                 Ok((max_scores.as_ref().map(|m| m[token_id as usize]), None))
             }
             PostingMetadata::V2 { metadata } => {
-                if let Some(loaded) = metadata.get() {
+                if let Some(loaded) = self.small_index_bulk_metadata(metadata).await? {
                     return Ok((
                         Some(loaded.max_scores[token_id as usize]),
                         Some(loaded.lengths[token_id as usize]),
@@ -6524,15 +6543,15 @@ mod tests {
     ///
     /// * `InvertedIndex::load` does not touch the posting file at all
     ///   (`InvertedPartition::load` only needs the token file and docs file).
-    /// * `bm25_stats_for_terms(["t0"])` reads exactly one row from the
-    ///   posting file (the single LENGTH_COL entry for token 0) regardless
-    ///   of how many unique tokens the partition has.
+    /// * the first `bm25_stats_for_terms` call issues exactly one
+    ///   `read_range` against the posting file — for a small (≤
+    ///   `BULK_LOAD_MAX_TOKENS`) index that is the one-time bulk metadata
+    ///   load — and subsequent stats calls read nothing at all.
     ///
-    /// Before this refactor, `PostingListReader::try_new` did
-    /// `read_range(0..num_rows, [MAX_SCORE_COL, LENGTH_COL])`, so the
-    /// `metadata_rows_read` figure scaled linearly with `num_tokens` even
-    /// when nobody asked for those stats. The cases below exercise that
-    /// scaling explicitly.
+    /// Before the lazy refactor, `PostingListReader::try_new` did
+    /// `read_range(0..num_rows, [MAX_SCORE_COL, LENGTH_COL])` at *open*
+    /// time, even when nobody asked for stats. Large indexes (above the
+    /// bulk threshold) keep the uncached single-row-per-term path.
     #[rstest::rstest]
     #[case::tokens_10(10)]
     #[case::tokens_100(100)]
@@ -6564,18 +6583,30 @@ mod tests {
         assert_eq!(num_docs, num_tokens);
         assert_eq!(dfs, vec![1]);
 
-        // Stats must pull a constant number of metadata rows from the posting
-        // file regardless of how many tokens the partition has. One term, one
-        // partition, one row.
+        // Small index: the first stats lookup pays exactly one read_range
+        // (the bulk metadata load), never per-term call scaling.
         assert_eq!(
-            counter.metadata_rows_read(),
+            counter.read_range_calls(),
             1,
-            "stats path should read exactly 1 metadata row per (term, partition); \
-             got {} (read_range_calls={}, rows_read={}, num_tokens={})",
-            counter.metadata_rows_read(),
+            "first stats lookup should issue exactly one posting-file read \
+             (the small-index bulk metadata load); got {} calls \
+             (rows_read={}, num_tokens={})",
             counter.read_range_calls(),
             counter.rows_read(),
             num_tokens,
+        );
+
+        // Every later lookup is served from the loaded metadata: zero reads.
+        let (_, _, dfs) = index
+            .bm25_stats_for_terms(&[format!("t{}", num_tokens - 1)])
+            .await
+            .unwrap();
+        assert_eq!(dfs, vec![1]);
+        assert_eq!(
+            counter.read_range_calls(),
+            1,
+            "subsequent stats lookups must be served from the bulk-loaded \
+             metadata without touching the posting file",
         );
     }
 

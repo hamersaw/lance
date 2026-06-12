@@ -1837,14 +1837,28 @@ impl DatasetIndexInternalExt for Dataset {
             // If we have file metadata, check if INDEX_FILE_NAME is in the list
             files.iter().any(|f| f.path == INDEX_FILE_NAME)
         } else {
-            // Fall back to file existence check for older indices without file metadata
-            let index_dir = self.indice_files_dir(&index_meta)?;
-            let index_file = index_dir
-                .clone()
-                .join(uuid.to_string())
-                .join(INDEX_FILE_NAME);
-            let object_store = self.object_store_for_index(&index_meta).await?;
-            object_store.exists(&index_file).await?
+            // Fall back to file existence check for older indices without file
+            // metadata. Memoized per uuid: index files are immutable, and
+            // without the memo every generic open re-pays a HEAD request.
+            let probe_key = crate::session::index_caches::IsVectorIndexProbeKey { uuid };
+            if let Some(probe) = self.index_cache.get_with_key(&probe_key).await {
+                probe.0
+            } else {
+                let index_dir = self.indice_files_dir(&index_meta)?;
+                let index_file = index_dir
+                    .clone()
+                    .join(uuid.to_string())
+                    .join(INDEX_FILE_NAME);
+                let object_store = self.object_store_for_index(&index_meta).await?;
+                let is_vector = object_store.exists(&index_file).await?;
+                self.index_cache
+                    .insert_with_key(
+                        &probe_key,
+                        Arc::new(crate::session::index_caches::IsVectorIndexProbe(is_vector)),
+                    )
+                    .await;
+                is_vector
+            }
         };
 
         if is_vector_index {

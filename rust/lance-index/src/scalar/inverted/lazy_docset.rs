@@ -331,7 +331,13 @@ impl DeferredDocSet {
         {
             return Ok(doc_ids.iter().map(|&d| full.row_id(d)).collect());
         }
-        if let Some(arr) = self.row_ids_col.get() {
+        // Small partition: load (and cache) the whole ROW_ID column instead
+        // of targeted reads — the targeted path is never cached, so every
+        // query re-pays its IO. 256Ki docs = 2 MiB, one read of comparable
+        // latency to a single targeted read.
+        const BULK_LOAD_MAX_DOCS: usize = 256 * 1024;
+        if self.row_ids_col.get().is_some() || self.num_rows <= BULK_LOAD_MAX_DOCS {
+            let arr = self.row_ids_column().await?;
             return Ok(doc_ids.iter().map(|&d| arr.value(d as usize)).collect());
         }
         let ranges: Vec<std::ops::Range<usize>> = doc_ids

@@ -145,3 +145,33 @@ impl CacheKey for ScalarIndexDetailsKey<'_> {
         "ScalarIndexDetails"
     }
 }
+
+/// Cached result of the "is this a vector index?" file-existence probe.
+///
+/// Indexes without `files` metadata (e.g. mem_wal flushed-generation
+/// indexes) force a HEAD on `index.idx` to classify them; without this
+/// memo the probe re-runs on every query that opens the index generically.
+pub struct IsVectorIndexProbe(pub bool);
+
+impl DeepSizeOf for IsVectorIndexProbe {
+    fn deep_size_of_children(&self, _context: &mut Context) -> usize {
+        0
+    }
+}
+
+#[derive(Debug)]
+pub struct IsVectorIndexProbeKey<'a> {
+    pub uuid: &'a Uuid,
+}
+
+impl CacheKey for IsVectorIndexProbeKey<'_> {
+    type ValueType = IsVectorIndexProbe;
+
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Owned(format!("is-vector-probe/{}", self.uuid))
+    }
+
+    fn type_name() -> &'static str {
+        "IsVectorIndexProbe"
+    }
+}
