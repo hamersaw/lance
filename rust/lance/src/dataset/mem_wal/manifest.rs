@@ -35,7 +35,7 @@ use bytes::Bytes;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use lance_core::{Error, Result};
-use lance_index::mem_wal::ShardManifest;
+use lance_index::mem_wal::{ShardManifest, ShardStatus};
 use lance_io::object_store::ObjectStore;
 use lance_table::format::pb;
 use log::{info, warn};
@@ -147,6 +147,7 @@ impl ShardManifestStore {
             wal_entry_position_last_seen: 0,
             current_generation: 1,
             flushed_generations: vec![],
+            status: ShardStatus::Active,
         };
 
         match self.write(&manifest).await {
@@ -425,6 +426,21 @@ impl ShardManifestStore {
         for _ in 0..MAX_CLAIM_RETRIES {
             let current = self.read_latest().await?;
 
+            // A sealed shard is mid-drop (drop-table 2PC). Refuse the claim
+            // with a distinguishable error rather than minting a new epoch,
+            // so a caller that skips its own status check still cannot
+            // resurrect a shard being dropped. Sophon's reconcile keys on
+            // the "sealed" marker in this message to tell it apart from an
+            // ordinary epoch fence.
+            if let Some(m) = &current {
+                if m.status == ShardStatus::Sealed {
+                    return Err(Error::invalid_input(format!(
+                        "shard {} is sealed; refusing claim (drop in flight)",
+                        self.shard_id
+                    )));
+                }
+            }
+
             let (next_version, next_epoch, base_manifest) = match current {
                 Some(m) => (m.version + 1, m.writer_epoch + 1, Some(m)),
                 None => (1, 1, None),
@@ -447,6 +463,7 @@ impl ShardManifestStore {
                     wal_entry_position_last_seen: 0,
                     current_generation: 1,
                     flushed_generations: vec![],
+                    status: ShardStatus::Active,
                 }
             };
 
@@ -603,6 +620,7 @@ mod tests {
             wal_entry_position_last_seen: 0,
             current_generation: 1,
             flushed_generations: vec![],
+            status: ShardStatus::Active,
         }
     }
 
