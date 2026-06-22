@@ -200,29 +200,6 @@ impl Session {
         &self.metadata_cache.0
     }
 
-    /// Invalidate every cached entry belonging to the dataset at `uri`.
-    ///
-    /// Clears both Session caches scoped to the dataset: the metadata cache
-    /// (manifests, deletion vectors, row-id maps, per-file metadata) and the
-    /// index cache (every vector/scalar/FTS index nested under the URI). Both
-    /// cache families namespace their keys by the dataset URI via
-    /// [`LanceCache::with_key_prefix`], which appends a trailing `/`, so the
-    /// `"{uri}/"` prefix targets exactly this dataset and never bleeds into a
-    /// sibling whose URI shares this one as a prefix (e.g. `t.lance` vs
-    /// `t.lance2`).
-    ///
-    /// Used when a dataset at a reusable URI is dropped so a later
-    /// same-URI recreate cold-reads its own fresh state instead of serving
-    /// the dropped incarnation's cached manifests/indices. The `uri` MUST be
-    /// byte-identical to the URI the dataset was opened/cached under — the
-    /// match is a raw prefix comparison, so any normalization drift silently
-    /// clears nothing.
-    pub async fn invalidate_dataset(&self, uri: &str) {
-        let scoped = format!("{uri}/");
-        self.metadata_cache.0.invalidate_prefix(&scoped).await;
-        self.index_cache.0.invalidate_prefix(&scoped).await;
-    }
-
     /// Fetch statistics for the metadata cache
     pub async fn metadata_cache_stats(&self) -> lance_core::cache::CacheStats {
         self.metadata_cache.0.stats().await
@@ -361,81 +338,5 @@ mod tests {
         assert_eq!(metadata_keys[0].type_name(), "TestVec");
 
         assert_ne!(index_keys, metadata_keys);
-    }
-
-    #[tokio::test]
-    async fn test_invalidate_dataset_clears_only_that_uri() {
-        let session = Session::new(10_000, 10_000, Default::default());
-
-        // Two datasets whose URIs share a prefix (`t.lance` is a prefix of
-        // `t.lance2`) — the trailing-slash scoping must clear the first
-        // without touching the second.
-        let uri = "memory://db/t.lance";
-        let sibling = "memory://db/t.lance2";
-
-        // Per-dataset caches namespace their keys under `{uri}/`, exactly
-        // as the read path does via `for_dataset(uri)`.
-        session
-            .metadata_cache
-            .for_dataset(uri)
-            .insert_with_key(&TestKey("manifest/1"), Arc::new(vec![1]))
-            .await;
-        session
-            .index_cache
-            .for_dataset(uri)
-            .insert_with_key(&TestKey("idx/1"), Arc::new(vec![1]))
-            .await;
-        session
-            .metadata_cache
-            .for_dataset(sibling)
-            .insert_with_key(&TestKey("manifest/1"), Arc::new(vec![2]))
-            .await;
-        session
-            .index_cache
-            .for_dataset(sibling)
-            .insert_with_key(&TestKey("idx/1"), Arc::new(vec![2]))
-            .await;
-
-        session.invalidate_dataset(uri).await;
-
-        // The dropped dataset's metadata + index entries are gone...
-        assert!(
-            session
-                .metadata_cache
-                .for_dataset(uri)
-                .get_with_key(&TestKey("manifest/1"))
-                .await
-                .is_none(),
-            "metadata entry for the invalidated dataset must be cleared"
-        );
-        assert!(
-            session
-                .index_cache
-                .for_dataset(uri)
-                .get_with_key(&TestKey("idx/1"))
-                .await
-                .is_none(),
-            "index entry for the invalidated dataset must be cleared"
-        );
-
-        // ...while the prefix-sharing sibling is untouched.
-        assert!(
-            session
-                .metadata_cache
-                .for_dataset(sibling)
-                .get_with_key(&TestKey("manifest/1"))
-                .await
-                .is_some(),
-            "sibling dataset whose URI shares a prefix must NOT be cleared"
-        );
-        assert!(
-            session
-                .index_cache
-                .for_dataset(sibling)
-                .get_with_key(&TestKey("idx/1"))
-                .await
-                .is_some(),
-            "sibling index entry must NOT be cleared"
-        );
     }
 }
