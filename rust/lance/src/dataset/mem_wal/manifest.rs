@@ -432,13 +432,13 @@ impl ShardManifestStore {
             // resurrect a shard being dropped. Sophon's reconcile keys on
             // the "sealed" marker in this message to tell it apart from an
             // ordinary epoch fence.
-            if let Some(m) = &current {
-                if m.status == ShardStatus::Sealed {
-                    return Err(Error::invalid_input(format!(
-                        "shard {} is sealed; refusing claim (drop in flight)",
-                        self.shard_id
-                    )));
-                }
+            if let Some(m) = &current
+                && m.status == ShardStatus::Sealed
+            {
+                return Err(Error::invalid_input(format!(
+                    "shard {} is sealed; refusing claim (drop in flight)",
+                    self.shard_id
+                )));
             }
 
             let (next_version, next_epoch, base_manifest) = match current {
