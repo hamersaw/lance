@@ -159,8 +159,8 @@ impl ShardStatus {
     /// Map to the protobuf enum discriminant (`pb::ShardStatus`).
     fn to_i32(self) -> i32 {
         match self {
-            ShardStatus::Active => 0,
-            ShardStatus::Sealed => 1,
+            Self::Active => 0,
+            Self::Sealed => 1,
         }
     }
 
@@ -168,8 +168,8 @@ impl ShardStatus {
     /// `Active` (forward-compatible default).
     fn from_i32(v: i32) -> Self {
         match v {
-            1 => ShardStatus::Sealed,
-            _ => ShardStatus::Active,
+            1 => Self::Sealed,
+            _ => Self::Active,
         }
     }
 }
