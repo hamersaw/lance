@@ -306,16 +306,15 @@ impl LsmVectorSearchPlanner {
                     } => (batch_store.clone(), index_store.clone()),
                     _ => unreachable!("is_active implies ActiveMemTable"),
                 };
-                let filtered: Arc<dyn ExecutionPlan> = Arc::new(
-                    super::exec::NewestPkFilterExec::new(
+                let filtered: Arc<dyn ExecutionPlan> =
+                    Arc::new(super::exec::NewestPkFilterExec::new(
                         knn,
                         self.pk_columns.clone(),
                         lance_core::ROW_ID,
                         index_store,
                         batch_store,
                         active_max_visible.expect("active arm returns its max_visible snapshot"),
-                    ),
-                );
+                    ));
                 // Cross-generation supersession: a frozen (older) in-memory
                 // generation can be superseded by a newer generation's write or
                 // tombstone. The recency filter above is within-generation only;
@@ -900,14 +899,13 @@ mod tests {
         let active = make_gen(1, [9.0, 9.0, 9.0, 9.0], 2);
 
         let shard_id = uuid::Uuid::new_v4();
-        let collector = LsmDataSourceCollector::new(base_dataset, vec![])
-            .with_in_memory_memtables(
-                shard_id,
-                InMemoryMemTables {
-                    active,
-                    frozen: vec![frozen],
-                },
-            );
+        let collector = LsmDataSourceCollector::new(base_dataset, vec![]).with_in_memory_memtables(
+            shard_id,
+            InMemoryMemTables {
+                active,
+                frozen: vec![frozen],
+            },
+        );
 
         let planner = LsmVectorSearchPlanner::new(
             collector,

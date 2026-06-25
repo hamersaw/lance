@@ -193,11 +193,10 @@ impl LsmFtsSearchPlanner {
                 (source, blocked, fetch_k)
             })
             .collect();
-        let built =
-            futures::future::try_join_all(arm_inputs.iter().map(|(source, _, fetch_k)| {
-                Box::pin(self.build_source_plan(source, column, &query, *fetch_k, projection))
-            }))
-            .await?;
+        let built = futures::future::try_join_all(arm_inputs.iter().map(|(source, _, fetch_k)| {
+            Box::pin(self.build_source_plan(source, column, &query, *fetch_k, projection))
+        }))
+        .await?;
 
         let mut per_source_plans: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(sources.len());
         for ((_source, blocked, _), plan) in arm_inputs.iter().zip(built) {
@@ -863,7 +862,9 @@ mod tests {
         frozen_idx.add_fts("text_fts".to_string(), 1, "text".to_string());
         let fb = make_batch(&schema, &[1, 2], &["alpha lance", "alpha foo"]);
         let (bp, off, _) = frozen_store.append(fb.clone()).unwrap();
-        frozen_idx.insert_with_batch_position(&fb, off, Some(bp)).unwrap();
+        frozen_idx
+            .insert_with_batch_position(&fb, off, Some(bp))
+            .unwrap();
 
         // Active gen=2: pk=1 updated to "beta lance" (no longer matches "alpha").
         let active_store = Arc::new(BatchStore::with_capacity(16));
@@ -872,7 +873,9 @@ mod tests {
         active_idx.add_fts("text_fts".to_string(), 1, "text".to_string());
         let ab = make_batch(&schema, &[1], &["beta lance"]);
         let (bp, off, _) = active_store.append(ab.clone()).unwrap();
-        active_idx.insert_with_batch_position(&ab, off, Some(bp)).unwrap();
+        active_idx
+            .insert_with_batch_position(&ab, off, Some(bp))
+            .unwrap();
 
         let tmp = tempfile::tempdir().unwrap();
         let base_uri = format!("{}/base", tmp.path().to_str().unwrap());
