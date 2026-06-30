@@ -51,6 +51,39 @@ pub fn box_error(e: impl std::error::Error + Send + Sync + 'static) -> BoxedErro
     Box::new(e)
 }
 
+/// Why a writer is fenced — i.e. why it must stop accepting writes.
+///
+/// Both reasons are terminal for the affected writer, but the recovery
+/// differs, so callers (and downstream HTTP layers) need to tell them apart
+/// rather than parsing an error string:
+///
+/// - [`FenceReason::PeerClaimedEpoch`]: another writer legitimately took
+///   ownership of the shard by claiming a higher epoch. This writer lost the
+///   race and should give up for good.
+/// - [`FenceReason::PersistenceFailure`]: this writer's own WAL persistence
+///   failed (after retries), so its in-memory state may have advanced past the
+///   durable WAL. Continuing would corrupt reads and partial-row updates that
+///   rely on prior values. The writer must be reopened so WAL replay can
+///   re-synchronize memory with durable storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FenceReason {
+    /// A successor writer claimed a higher epoch.
+    PeerClaimedEpoch,
+    /// Our own WAL persistence failed; in-memory state may diverge from the WAL.
+    PersistenceFailure,
+}
+
+impl std::fmt::Display for FenceReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Stable strings — surfaced in error messages and may be matched.
+        let s = match self {
+            Self::PeerClaimedEpoch => "peer claimed epoch",
+            Self::PersistenceFailure => "persistence failure",
+        };
+        f.write_str(s)
+    }
+}
+
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
 pub enum Error {
@@ -248,6 +281,17 @@ pub enum Error {
         #[snafu(implicit)]
         location: Location,
     },
+    /// A writer has been fenced and must stop. See [`FenceReason`] for the
+    /// distinction between a peer takeover and a local persistence failure.
+    /// The message retains the `Writer fenced` prefix so legacy string-based
+    /// consumers keep working; new code should match on [`Error::fence_reason`].
+    #[snafu(display("Writer fenced ({reason}): {message}, {location}"))]
+    Fenced {
+        reason: FenceReason,
+        message: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 }
 
 impl Error {
@@ -269,6 +313,37 @@ impl Error {
     #[track_caller]
     pub fn io(message: impl Into<String>) -> Self {
         IOSnafu.into_error(message.into().into())
+    }
+
+    /// A successor writer claimed a higher epoch; this writer lost ownership.
+    #[track_caller]
+    pub fn fenced_by_peer(message: impl Into<String>) -> Self {
+        FencedSnafu {
+            reason: FenceReason::PeerClaimedEpoch,
+            message: message.into(),
+        }
+        .build()
+    }
+
+    /// This writer's WAL persistence failed, so its in-memory state may have
+    /// diverged from the durable WAL. The writer must be reopened (replay).
+    #[track_caller]
+    pub fn writer_poisoned(message: impl Into<String>) -> Self {
+        FencedSnafu {
+            reason: FenceReason::PersistenceFailure,
+            message: message.into(),
+        }
+        .build()
+    }
+
+    /// The [`FenceReason`] if this is a [`Error::Fenced`], else `None`. Prefer
+    /// this over matching on the error message when deciding how to react to a
+    /// fence (e.g. retry vs. reopen, or HTTP status mapping).
+    pub fn fence_reason(&self) -> Option<FenceReason> {
+        match self {
+            Self::Fenced { reason, .. } => Some(*reason),
+            _ => None,
+        }
     }
 
     #[track_caller]

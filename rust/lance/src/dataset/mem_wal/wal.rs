@@ -12,13 +12,15 @@ use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use std::time::Duration;
+
 use arrow_array::RecordBatch;
 use arrow_ipc::reader::StreamReader;
 use arrow_ipc::writer::StreamWriter;
 use arrow_schema::Schema as ArrowSchema;
 use bytes::Bytes;
 use futures::StreamExt;
-use lance_core::{Error, Result};
+use lance_core::{Error, FenceReason, Result};
 use lance_io::object_store::ObjectStore;
 use object_store::ObjectStoreExt;
 use object_store::path::Path;
@@ -43,11 +45,50 @@ pub const WRITER_EPOCH_KEY: &str = "writer_epoch";
 /// replay skips sentinels via their empty batch list).
 pub const FENCE_SENTINEL_KEY: &str = "fence_sentinel";
 
-/// True if `error` is the terminal fence emitted by `ManifestStore::check_fenced`
-/// (a successor claimed a higher epoch). Matches the message it formats, since
-/// fences surface as a plain `Error::io` rather than a typed variant.
+/// True if `error` is a peer fence (a successor claimed a higher epoch). This
+/// is the legitimate-takeover case, distinct from a local persistence failure.
+#[cfg(test)]
 fn is_fence_error(error: &Error) -> bool {
-    error.to_string().contains("Writer fenced")
+    error.fence_reason() == Some(FenceReason::PeerClaimedEpoch)
+}
+
+/// True if `error` is terminal for the writer — either kind of fence. A
+/// terminal failure means the WAL will never advance for this writer, so
+/// durability waiters must be woken with the error instead of blocking, and
+/// subsequent writes must be rejected.
+fn is_terminal_failure(error: &Error) -> bool {
+    error.fence_reason().is_some()
+}
+
+/// Cloneable carrier for a terminal flush failure, used to pass the error
+/// across the async boundaries (`WalFlusher::terminal_error` and the per-flush
+/// `done` cell) where `lance_core::Error` cannot travel because it is not
+/// `Clone`. Preserves the [`FenceReason`] so the typed [`Error::Fenced`] can be
+/// rebuilt for the caller rather than collapsing to a string.
+#[derive(Clone, Debug)]
+pub struct WalFlushFailure {
+    /// The fence reason when this failure is terminal (peer or persistence).
+    /// `None` for a non-terminal flush error that is merely reported back.
+    pub fence_reason: Option<FenceReason>,
+    pub message: String,
+}
+
+impl WalFlushFailure {
+    pub(crate) fn from_error(error: &Error) -> Self {
+        Self {
+            fence_reason: error.fence_reason(),
+            message: error.to_string(),
+        }
+    }
+
+    /// Rebuild a typed `Error`, restoring the fence reason when present.
+    pub(crate) fn into_error(self) -> Error {
+        match self.fence_reason {
+            Some(FenceReason::PeerClaimedEpoch) => Error::fenced_by_peer(self.message),
+            Some(FenceReason::PersistenceFailure) => Error::writer_poisoned(self.message),
+            None => Error::io(self.message),
+        }
+    }
 }
 
 /// Watcher for batch durability using watermark-based tracking.
@@ -60,10 +101,11 @@ pub struct BatchDurableWatcher {
     rx: watch::Receiver<usize>,
     /// Target batch ID to wait for.
     target_batch_position: usize,
-    /// Terminal flush failure (e.g. a fence) shared with the flusher. When
-    /// set, the watermark will never advance to the target, so `wait`
-    /// returns this error instead of blocking forever.
-    terminal_error: Arc<StdMutex<Option<String>>>,
+    /// Terminal flush failure (a peer fence or a persistence-failure self-fence)
+    /// shared with the flusher. When set, the watermark will never advance to
+    /// the target, so `wait` returns this (typed) error instead of blocking
+    /// forever.
+    terminal_error: Arc<StdMutex<Option<WalFlushFailure>>>,
 }
 
 impl BatchDurableWatcher {
@@ -71,7 +113,7 @@ impl BatchDurableWatcher {
     pub fn new(
         rx: watch::Receiver<usize>,
         target_batch_position: usize,
-        terminal_error: Arc<StdMutex<Option<String>>>,
+        terminal_error: Arc<StdMutex<Option<WalFlushFailure>>>,
     ) -> Self {
         Self {
             rx,
@@ -87,8 +129,8 @@ impl BatchDurableWatcher {
     /// never reach the target.
     pub async fn wait(&mut self) -> Result<()> {
         loop {
-            if let Some(msg) = self.terminal_error.lock().unwrap().clone() {
-                return Err(Error::io(msg));
+            if let Some(failure) = self.terminal_error.lock().unwrap().clone() {
+                return Err(failure.into_error());
             }
             let current = *self.rx.borrow();
             if current >= self.target_batch_position {
@@ -186,8 +228,10 @@ pub struct TriggerWalFlush {
     /// this flush. Use `usize::MAX` to flush all pending batches.
     pub end_batch_position: usize,
     /// Optional cell to write completion result.
-    /// Uses Result<WalFlushResult, String> since Error doesn't implement Clone.
-    pub done: Option<WatchableOnceCell<std::result::Result<WalFlushResult, String>>>,
+    /// Uses `WalFlushFailure` (not `Error`) since `Error` doesn't implement
+    /// `Clone`; the carrier preserves the fence reason so callers waiting on
+    /// this cell still get a typed error.
+    pub done: Option<WatchableOnceCell<std::result::Result<WalFlushResult, WalFlushFailure>>>,
 }
 
 impl std::fmt::Debug for TriggerWalFlush {
@@ -338,11 +382,12 @@ pub struct WalFlusher {
     /// Created at construction and recreated after each flush.
     /// Used by backpressure to wait for WAL flushes.
     wal_flush_cell: std::sync::Mutex<Option<WatchableOnceCell<super::write::DurabilityResult>>>,
-    /// First terminal flush failure (a fence). Shared with every
-    /// `BatchDurableWatcher` so a fenced flush — which never advances the
-    /// watermark — wakes durability waiters with the error instead of
-    /// hanging them forever.
-    terminal_error: Arc<StdMutex<Option<String>>>,
+    /// First terminal flush failure — a peer fence or a persistence-failure
+    /// self-fence. Shared with every `BatchDurableWatcher` so a terminally
+    /// failed flush — which never advances the watermark — wakes durability
+    /// waiters with the typed error instead of hanging them forever, and read
+    /// by `check_poisoned` so the write path fails fast.
+    terminal_error: Arc<StdMutex<Option<WalFlushFailure>>>,
 }
 
 impl WalFlusher {
@@ -392,20 +437,33 @@ impl WalFlusher {
         )
     }
 
-    /// Record a terminal flush failure (a fence) and wake every pending
-    /// durability waiter. A fence is permanent — the watermark will never
-    /// advance — so waiters must observe the error rather than block forever.
-    /// Idempotent: only the first failure is retained.
+    /// Record a terminal flush failure (a peer fence or a persistence-failure
+    /// self-fence) and wake every pending durability waiter. A terminal failure
+    /// is permanent — the watermark will never advance — so waiters must observe
+    /// the error rather than block forever. Idempotent: only the first failure
+    /// is retained.
     fn mark_terminal_failure(&self, error: &Error) {
         {
             let mut slot = self.terminal_error.lock().unwrap();
             if slot.is_none() {
-                *slot = Some(error.to_string());
+                *slot = Some(WalFlushFailure::from_error(error));
             }
         }
         // Wake `wait`ers without advancing the watermark; each re-checks
         // `terminal_error` and returns the error.
         self.durable_watermark_tx.send_modify(|_| {});
+    }
+
+    /// Fail fast if this writer has been fenced — by a peer or by its own WAL
+    /// persistence failing. Once terminally failed, the in-memory state may no
+    /// longer match the durable WAL, so the write path calls this before
+    /// touching the memtable to reject writes with the typed error instead of
+    /// silently diverging. Recovery is to reopen the shard (replay the WAL).
+    pub fn check_poisoned(&self) -> Result<()> {
+        if let Some(failure) = self.terminal_error.lock().unwrap().clone() {
+            return Err(failure.into_error());
+        }
+        Ok(())
     }
 
     /// Get the current durable watermark.
@@ -452,7 +510,7 @@ impl WalFlusher {
         &self,
         source: WalFlushSource,
         end_batch_position: usize,
-        done: Option<WatchableOnceCell<std::result::Result<WalFlushResult, String>>>,
+        done: Option<WatchableOnceCell<std::result::Result<WalFlushResult, WalFlushFailure>>>,
     ) -> Result<()> {
         if let Some(tx) = &self.flush_tx {
             tx.send(TriggerWalFlush {
@@ -488,11 +546,13 @@ impl WalFlusher {
             }
             WalFlushSource::WalOnly { state } => self.flush_from_wal_only(state).await,
         };
-        // A fence is terminal: the append will never succeed, so the
-        // durability watermark can never advance. Wake any waiter (e.g. a
-        // `durable_write` put) with the fence error instead of hanging it.
+        // A terminal failure (peer fence or persistence-failure self-fence)
+        // means the append will never succeed, so the durability watermark can
+        // never advance. Wake any waiter (e.g. a `durable_write` put) with the
+        // typed error instead of hanging it, and latch the poison so later
+        // writes fail fast via `check_poisoned`.
         if let Err(e) = &result
-            && is_fence_error(e)
+            && is_terminal_failure(e)
         {
             self.mark_terminal_failure(e);
         }
@@ -734,6 +794,43 @@ const MAX_APPEND_CREATE_CONFLICTS: usize = 1024;
 const APPEND_CONFLICT_REFRESH_INTERVAL: usize = 16;
 const MAX_CURSOR_PROBE: u64 = 4096;
 
+/// Retry policy for transient WAL persistence failures before the writer
+/// self-fences.
+///
+/// On a non-conflict object-store error, the appender retries the *same* WAL
+/// position up to `max_retries` more times with exponential backoff starting at
+/// `base_delay`. Retrying the same position (rather than advancing) keeps the
+/// WAL free of duplicate entries: if the failed PUT had actually landed (a lost
+/// acknowledgement), the retry observes our own entry and treats it as success.
+/// Exhausting the budget poisons the writer with [`Error::writer_poisoned`].
+#[derive(Debug, Clone, Copy)]
+pub struct WalRetryConfig {
+    pub max_retries: usize,
+    pub base_delay: Duration,
+}
+
+impl Default for WalRetryConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: 3,
+            base_delay: Duration::from_millis(50),
+        }
+    }
+}
+
+impl WalRetryConfig {
+    /// Backoff before retry `attempt` (1-based), capped so a wedged store can't
+    /// block the flush task indefinitely.
+    fn backoff(&self, attempt: usize) -> Duration {
+        const MAX_BACKOFF: Duration = Duration::from_secs(5);
+        let shift = attempt.saturating_sub(1).min(16) as u32;
+        self.base_delay
+            .checked_mul(1u32 << shift)
+            .unwrap_or(MAX_BACKOFF)
+            .min(MAX_BACKOFF)
+    }
+}
+
 /// Result of appending a WAL entry.
 #[derive(Debug, Clone)]
 pub struct WalAppendResult {
@@ -772,6 +869,17 @@ pub struct WalAppender {
     /// so reopened shards report the post-recovery cursor immediately;
     /// updated after each successful append.
     next_entry_position_hint: AtomicU64,
+    /// Retry budget for transient persistence failures before self-fencing.
+    retry: WalRetryConfig,
+}
+
+/// Result of attempting to persist a WAL entry at a single position.
+enum SlotOutcome {
+    /// The entry was created by this writer (or a lost-ack retry confirmed our
+    /// own entry already landed at this position).
+    Written,
+    /// The position is occupied by another writer; the caller advances.
+    Conflict,
 }
 
 impl WalAppender {
@@ -800,6 +908,7 @@ impl WalAppender {
             manifest_store,
             writer_epoch,
             position_hint,
+            WalRetryConfig::default(),
         ))
     }
 
@@ -821,6 +930,7 @@ impl WalAppender {
         manifest_store: Arc<ShardManifestStore>,
         writer_epoch: u64,
         next_entry_position_hint_seed: u64,
+        retry: WalRetryConfig,
     ) -> Self {
         Self {
             object_store,
@@ -830,6 +940,7 @@ impl WalAppender {
             writer_epoch,
             next_entry_position: Mutex::new(None),
             next_entry_position_hint: AtomicU64::new(next_entry_position_hint_seed),
+            retry,
         }
     }
 
@@ -890,15 +1001,8 @@ impl WalAppender {
                     self.shard_id
                 ))
             })?;
-            match atomic_put(
-                self.object_store.as_ref(),
-                &self.wal_dir,
-                &wal_entry_filename(pos),
-                wal_data.clone(),
-            )
-            .await
-            {
-                Ok(()) => {
+            match self.put_at_position(pos, &wal_data).await? {
+                SlotOutcome::Written => {
                     let next = pos.checked_add(1).ok_or_else(|| {
                         Error::io(format!("WAL position overflow for shard {}", self.shard_id))
                     })?;
@@ -912,7 +1016,7 @@ impl WalAppender {
                         wal_bytes,
                     });
                 }
-                Err(AtomicPutError::AlreadyExists) => {
+                SlotOutcome::Conflict => {
                     self.check_fenced().await?;
                     conflicts += 1;
                     if conflicts >= MAX_APPEND_CREATE_CONFLICTS {
@@ -929,12 +1033,90 @@ impl WalAppender {
                         })?);
                     }
                 }
+            }
+        }
+    }
+
+    /// Persist `wal_data` at exactly `pos`, retrying transient object-store
+    /// failures at the *same* position per [`WalRetryConfig`].
+    ///
+    /// Retrying the same position (rather than advancing on every error) is what
+    /// keeps the WAL free of duplicates under ambiguous failures: if a PUT that
+    /// reported an error had actually landed (a lost acknowledgement), the retry
+    /// sees `AlreadyExists` and confirms our own entry via its writer epoch
+    /// instead of rewriting the data at a new position.
+    ///
+    /// Returns `Conflict` when the slot belongs to another writer (the caller
+    /// advances), `Err(fenced_by_peer)` if a successor fenced us, or
+    /// `Err(writer_poisoned)` once the retry budget is exhausted — at which
+    /// point the writer must be reopened so WAL replay can re-synchronize the
+    /// in-memory state with durable storage.
+    async fn put_at_position(&self, pos: u64, wal_data: &Bytes) -> Result<SlotOutcome> {
+        let mut io_attempts = 0;
+        loop {
+            match atomic_put(
+                self.object_store.as_ref(),
+                &self.wal_dir,
+                &wal_entry_filename(pos),
+                wal_data.clone(),
+            )
+            .await
+            {
+                Ok(()) => return Ok(SlotOutcome::Written),
+                Err(AtomicPutError::AlreadyExists) => {
+                    // A first-attempt conflict is a genuine race for the slot.
+                    // After a transient error, the slot may instead hold our own
+                    // PUT that actually landed — confirm via the entry's writer
+                    // epoch before treating it as someone else's.
+                    if io_attempts == 0 {
+                        return Ok(SlotOutcome::Conflict);
+                    }
+                    return match self.entry_writer_epoch(pos).await? {
+                        Some(epoch) if epoch == self.writer_epoch => Ok(SlotOutcome::Written),
+                        _ => Ok(SlotOutcome::Conflict),
+                    };
+                }
                 Err(AtomicPutError::Other(error)) => {
+                    // A successor fence is terminal — don't waste the retry budget.
                     self.check_fenced().await?;
-                    return Err(error);
+                    if io_attempts >= self.retry.max_retries {
+                        return Err(Error::writer_poisoned(format!(
+                            "WAL persistence failed for shard {} at position {} after {} retries; \
+                             in-memory state may diverge from the durable WAL, reopen to replay: {}",
+                            self.shard_id, pos, self.retry.max_retries, error
+                        )));
+                    }
+                    io_attempts += 1;
+                    tokio::time::sleep(self.retry.backoff(io_attempts)).await;
                 }
             }
         }
+    }
+
+    /// Read just the writer epoch recorded in the WAL entry at `pos`, or `None`
+    /// if no entry exists. Used by [`Self::put_at_position`] to detect a
+    /// lost-ack: an `AlreadyExists` after a transient PUT failure may be our own
+    /// entry that actually landed.
+    async fn entry_writer_epoch(&self, pos: u64) -> Result<Option<u64>> {
+        let path = self.wal_dir.clone().join(wal_entry_filename(pos));
+        let data = match self.object_store.inner.get(&path).await {
+            Ok(d) => d,
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(e) => {
+                return Err(Error::io(format!(
+                    "failed to read WAL entry {} for shard {}: {}",
+                    pos, self.shard_id, e
+                )));
+            }
+        };
+        let bytes = data.bytes().await.map_err(|e| {
+            Error::io(format!(
+                "failed to read WAL entry bytes at {} for shard {}: {}",
+                pos, self.shard_id, e
+            ))
+        })?;
+        let (writer_epoch, _batches) = deserialize_appender_batches(bytes)?;
+        Ok(Some(writer_epoch))
     }
 
     /// Check that this writer's epoch has not been fenced.
@@ -1430,6 +1612,7 @@ mod tests {
             writer_epoch,
             // Tests start with no entries, so seed the hint at 0.
             0,
+            WalRetryConfig::default(),
         ));
         WalFlusher::new(appender)
     }
