@@ -873,15 +873,6 @@ pub struct WalAppender {
     retry: WalRetryConfig,
 }
 
-/// Result of attempting to persist a WAL entry at a single position.
-enum SlotOutcome {
-    /// The entry was created by this writer (or a lost-ack retry confirmed our
-    /// own entry already landed at this position).
-    Written,
-    /// The position is occupied by another writer; the caller advances.
-    Conflict,
-}
-
 impl WalAppender {
     /// Open a WAL appender and claim a new writer epoch.
     pub async fn open(
@@ -993,7 +984,13 @@ impl WalAppender {
             *next_pos = Some(self.discover_next_position().await?);
         }
 
+        // `conflicts` counts position races across the whole append (advancing
+        // past slots others hold). `io_attempts` is the per-position retry
+        // budget for transient PUT failures; it only ever grows while we sit on
+        // one position, since the only path that advances resets it implicitly
+        // by living in the `io_attempts == 0` branch.
         let mut conflicts = 0;
+        let mut io_attempts = 0;
         loop {
             let pos = next_pos.ok_or_else(|| {
                 Error::internal(format!(
@@ -1001,8 +998,15 @@ impl WalAppender {
                     self.shard_id
                 ))
             })?;
-            match self.put_at_position(pos, &wal_data).await? {
-                SlotOutcome::Written => {
+            match atomic_put(
+                self.object_store.as_ref(),
+                &self.wal_dir,
+                &wal_entry_filename(pos),
+                wal_data.clone(),
+            )
+            .await
+            {
+                Ok(()) => {
                     let next = pos.checked_add(1).ok_or_else(|| {
                         Error::io(format!("WAL position overflow for shard {}", self.shard_id))
                     })?;
@@ -1016,8 +1020,26 @@ impl WalAppender {
                         wal_bytes,
                     });
                 }
-                SlotOutcome::Conflict => {
+                Err(AtomicPutError::AlreadyExists) => {
                     self.check_fenced().await?;
+                    // If we had already failed to PUT this exact slot, its now
+                    // being occupied is ambiguous: our own lost acknowledgement
+                    // (the PUT landed but errored) or a peer that grabbed the
+                    // slot. We can neither advance-and-rewrite (that would
+                    // duplicate the entry) nor blindly accept it, so we poison
+                    // the writer — reopening replays the WAL and reconciles the
+                    // in-memory state with durable storage before writes resume.
+                    // `check_fenced` above already surfaced the peer case as a
+                    // typed peer fence.
+                    if io_attempts > 0 {
+                        return Err(Error::writer_poisoned(format!(
+                            "WAL position {} for shard {} was taken after a failed PUT; \
+                             in-memory state may diverge from the durable WAL, reopen to replay",
+                            pos, self.shard_id
+                        )));
+                    }
+                    // First touch of this slot: an ordinary position conflict
+                    // (stale cursor, our own earlier entries, or contention).
                     conflicts += 1;
                     if conflicts >= MAX_APPEND_CREATE_CONFLICTS {
                         return Err(Error::io(format!(
@@ -1033,49 +1055,6 @@ impl WalAppender {
                         })?);
                     }
                 }
-            }
-        }
-    }
-
-    /// Persist `wal_data` at exactly `pos`, retrying transient object-store
-    /// failures at the *same* position per [`WalRetryConfig`].
-    ///
-    /// Retrying the same position (rather than advancing on every error) is what
-    /// keeps the WAL free of duplicates under ambiguous failures: if a PUT that
-    /// reported an error had actually landed (a lost acknowledgement), the retry
-    /// sees `AlreadyExists` and confirms our own entry via its writer epoch
-    /// instead of rewriting the data at a new position.
-    ///
-    /// Returns `Conflict` when the slot belongs to another writer (the caller
-    /// advances), `Err(fenced_by_peer)` if a successor fenced us, or
-    /// `Err(writer_poisoned)` once the retry budget is exhausted — at which
-    /// point the writer must be reopened so WAL replay can re-synchronize the
-    /// in-memory state with durable storage.
-    async fn put_at_position(&self, pos: u64, wal_data: &Bytes) -> Result<SlotOutcome> {
-        let mut io_attempts = 0;
-        loop {
-            match atomic_put(
-                self.object_store.as_ref(),
-                &self.wal_dir,
-                &wal_entry_filename(pos),
-                wal_data.clone(),
-            )
-            .await
-            {
-                Ok(()) => return Ok(SlotOutcome::Written),
-                Err(AtomicPutError::AlreadyExists) => {
-                    // A first-attempt conflict is a genuine race for the slot.
-                    // After a transient error, the slot may instead hold our own
-                    // PUT that actually landed — confirm via the entry's writer
-                    // epoch before treating it as someone else's.
-                    if io_attempts == 0 {
-                        return Ok(SlotOutcome::Conflict);
-                    }
-                    return match self.entry_writer_epoch(pos).await? {
-                        Some(epoch) if epoch == self.writer_epoch => Ok(SlotOutcome::Written),
-                        _ => Ok(SlotOutcome::Conflict),
-                    };
-                }
                 Err(AtomicPutError::Other(error)) => {
                     // A successor fence is terminal — don't waste the retry budget.
                     self.check_fenced().await?;
@@ -1088,35 +1067,10 @@ impl WalAppender {
                     }
                     io_attempts += 1;
                     tokio::time::sleep(self.retry.backoff(io_attempts)).await;
+                    // Retry the same position (next_pos unchanged).
                 }
             }
         }
-    }
-
-    /// Read just the writer epoch recorded in the WAL entry at `pos`, or `None`
-    /// if no entry exists. Used by [`Self::put_at_position`] to detect a
-    /// lost-ack: an `AlreadyExists` after a transient PUT failure may be our own
-    /// entry that actually landed.
-    async fn entry_writer_epoch(&self, pos: u64) -> Result<Option<u64>> {
-        let path = self.wal_dir.clone().join(wal_entry_filename(pos));
-        let data = match self.object_store.inner.get(&path).await {
-            Ok(d) => d,
-            Err(object_store::Error::NotFound { .. }) => return Ok(None),
-            Err(e) => {
-                return Err(Error::io(format!(
-                    "failed to read WAL entry {} for shard {}: {}",
-                    pos, self.shard_id, e
-                )));
-            }
-        };
-        let bytes = data.bytes().await.map_err(|e| {
-            Error::io(format!(
-                "failed to read WAL entry bytes at {} for shard {}: {}",
-                pos, self.shard_id, e
-            ))
-        })?;
-        let (writer_epoch, _batches) = deserialize_appender_batches(bytes)?;
-        Ok(Some(writer_epoch))
     }
 
     /// Check that this writer's epoch has not been fenced.
