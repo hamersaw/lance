@@ -5092,6 +5092,15 @@ mod tests {
         let Err(err) = result else {
             panic!("expected open to fail with fence error during replay");
         };
+        // Assert the *typed* fence reason, not just the message: a regression
+        // reverting this to `Error::io` would still carry a message containing
+        // "fenced" and slip past a string check, but must not report a
+        // `FenceReason`.
+        assert_eq!(
+            err.fence_reason(),
+            Some(FenceReason::PeerClaimedEpoch),
+            "replay must abort with a typed peer-fence error, got: {err}"
+        );
         let msg = err.to_string();
         assert!(
             msg.contains("WAL replay aborted") && msg.contains("fenced"),

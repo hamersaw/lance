@@ -65,6 +65,7 @@ fn is_terminal_failure(error: &Error) -> bool {
 pub struct WalFlushFailure {
     /// The fence reason if terminal; `None` for an ordinary flush error.
     pub fence_reason: Option<FenceReason>,
+    /// The error message carrying details about the flush failure.
     pub message: String,
 }
 
@@ -787,7 +788,10 @@ const MAX_CURSOR_PROBE: u64 = 4096;
 /// ([`Error::writer_poisoned`]).
 #[derive(Debug, Clone, Copy)]
 pub struct WalRetryConfig {
+    /// Maximum number of retries for a transient WAL write failure before the
+    /// writer self-fences.
     pub max_retries: usize,
+    /// Base duration for exponential backoff between retry attempts.
     pub base_delay: Duration,
 }
 
