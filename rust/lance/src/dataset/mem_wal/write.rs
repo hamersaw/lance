@@ -109,14 +109,10 @@ pub struct ShardWriterConfig {
     /// Default: 100ms
     pub max_wal_flush_interval: Option<Duration>,
 
-    /// Number of times a failed WAL persistence PUT is retried (at the same
-    /// position, with exponential backoff) before the writer self-fences.
-    ///
-    /// A persistence failure means the in-memory state may have advanced past
-    /// the durable WAL, so once the budget is exhausted the writer is poisoned
-    /// (`Error::writer_poisoned`) and must be reopened to replay. Retries absorb
-    /// transient object-store errors that `object_store`'s own retry layer does
-    /// not. Default: 3.
+    /// Times a failed WAL PUT is retried (same position, exponential backoff)
+    /// before the writer self-fences. On exhaustion the writer is poisoned
+    /// (`Error::writer_poisoned`) and must be reopened to replay. Absorbs
+    /// transient errors beyond `object_store`'s own retries. Default: 3.
     pub max_wal_persist_retries: usize,
 
     /// Base backoff before the first WAL persistence retry; subsequent retries
@@ -1831,9 +1827,8 @@ impl ShardWriter {
         writer_state: &Arc<SharedWriterState>,
         backpressure: &BackpressureController,
     ) -> Result<(WriteResult, Option<BatchDurableWatcher>)> {
-        // Reject writes on a fenced writer (peer takeover or a persistence
-        // failure that poisoned us) before mutating the memtable — continuing
-        // would let in-memory state drift further from the durable WAL.
+        // Reject writes on a fenced writer before mutating the memtable, so a
+        // poisoned writer can't drift further from the durable WAL.
         self.wal_flusher.check_poisoned()?;
 
         // Apply backpressure if needed (before acquiring main lock)
@@ -1907,8 +1902,8 @@ impl ShardWriter {
         trigger: &StdRwLock<WalOnlyTriggerState>,
         backpressure: &BackpressureController,
     ) -> Result<WriteResult> {
-        // Reject writes on a fenced writer (peer takeover or persistence-failure
-        // self-fence) before enqueuing — see `put_memtable_no_wait`.
+        // Reject writes on a fenced writer before enqueuing — see
+        // `put_memtable_no_wait`.
         self.wal_flusher.check_poisoned()?;
 
         // Apply backpressure against the pending queue before pushing. The
@@ -3053,8 +3048,10 @@ pub fn new_shared_stats() -> SharedWriteStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dataset::mem_wal::test_util::failing_memory_store;
     use arrow_array::{Int32Array, StringArray};
     use arrow_schema::{DataType, Field};
+    use lance_core::FenceReason;
     use tempfile::TempDir;
 
     async fn create_local_store() -> (Arc<ObjectStore>, Path, String, TempDir) {
@@ -4779,6 +4776,60 @@ mod tests {
             id_field,
             Field::new("name", DataType::Utf8, true),
         ]))
+    }
+
+    // A durable write whose WAL PUT keeps failing poisons the writer with a
+    // typed persistence failure; the next write fails fast with the same reason;
+    // and once storage heals, reopening replays the WAL and writes resume.
+    #[tokio::test]
+    async fn test_writer_poisons_on_persistence_failure_and_recovers_on_reopen() {
+        let (store, base_path, controls) = failing_memory_store().await;
+        let base_uri = "memory:///";
+        let shard_id = Uuid::new_v4();
+        let schema = schema_with_pk();
+        controls.fail_wal_puts(usize::MAX);
+
+        let config = ShardWriterConfig {
+            max_wal_persist_retries: 1,
+            wal_persist_retry_base_delay: Duration::from_millis(1),
+            ..memtable_config_with_pk(shard_id)
+        };
+
+        let writer = ShardWriter::open(
+            store.clone(),
+            base_path.clone(),
+            base_uri,
+            config.clone(),
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        // The durable put waits on the flush, which poisons after its retries.
+        let err = writer
+            .put(vec![create_test_batch(&schema, 0, 1)])
+            .await
+            .unwrap_err();
+        assert_eq!(err.fence_reason(), Some(FenceReason::PersistenceFailure));
+
+        // A poisoned writer rejects further writes fast, same typed reason.
+        let err = writer
+            .put(vec![create_test_batch(&schema, 1, 1)])
+            .await
+            .unwrap_err();
+        assert_eq!(err.fence_reason(), Some(FenceReason::PersistenceFailure));
+        drop(writer);
+
+        // Storage heals: reopening replays the WAL and accepts writes again.
+        controls.recover();
+        let writer = ShardWriter::open(store, base_path, base_uri, config, schema.clone(), vec![])
+            .await
+            .unwrap();
+        writer
+            .put(vec![create_test_batch(&schema, 2, 1)])
+            .await
+            .unwrap();
     }
 
     /// Replay-on-open recovers durable WAL entries that were never flushed

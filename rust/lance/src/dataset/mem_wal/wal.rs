@@ -45,30 +45,25 @@ pub const WRITER_EPOCH_KEY: &str = "writer_epoch";
 /// replay skips sentinels via their empty batch list).
 pub const FENCE_SENTINEL_KEY: &str = "fence_sentinel";
 
-/// True if `error` is a peer fence (a successor claimed a higher epoch). This
-/// is the legitimate-takeover case, distinct from a local persistence failure.
+/// True if `error` is a peer fence (a successor claimed a higher epoch).
 #[cfg(test)]
 fn is_fence_error(error: &Error) -> bool {
     error.fence_reason() == Some(FenceReason::PeerClaimedEpoch)
 }
 
-/// True if `error` is terminal for the writer — either kind of fence. A
-/// terminal failure means the WAL will never advance for this writer, so
-/// durability waiters must be woken with the error instead of blocking, and
-/// subsequent writes must be rejected.
+/// True if `error` is terminal for the writer (either fence kind): the WAL will
+/// never advance, so durability waiters must be woken and later writes rejected.
 fn is_terminal_failure(error: &Error) -> bool {
     error.fence_reason().is_some()
 }
 
-/// Cloneable carrier for a terminal flush failure, used to pass the error
-/// across the async boundaries (`WalFlusher::terminal_error` and the per-flush
-/// `done` cell) where `lance_core::Error` cannot travel because it is not
-/// `Clone`. Preserves the [`FenceReason`] so the typed [`Error::Fenced`] can be
-/// rebuilt for the caller rather than collapsing to a string.
+/// Cloneable carrier that ferries a flush error across the async completion
+/// channels (`WalFlusher::terminal_error` and the per-flush `done` cell), since
+/// `lance_core::Error` is not `Clone`. Preserves the [`FenceReason`] so the typed
+/// [`Error::Fenced`] can be rebuilt rather than flattened to a string.
 #[derive(Clone, Debug)]
 pub struct WalFlushFailure {
-    /// The fence reason when this failure is terminal (peer or persistence).
-    /// `None` for a non-terminal flush error that is merely reported back.
+    /// The fence reason if terminal; `None` for an ordinary flush error.
     pub fence_reason: Option<FenceReason>,
     pub message: String,
 }
@@ -101,10 +96,9 @@ pub struct BatchDurableWatcher {
     rx: watch::Receiver<usize>,
     /// Target batch ID to wait for.
     target_batch_position: usize,
-    /// Terminal flush failure (a peer fence or a persistence-failure self-fence)
-    /// shared with the flusher. When set, the watermark will never advance to
-    /// the target, so `wait` returns this (typed) error instead of blocking
-    /// forever.
+    /// Terminal flush failure shared with the flusher. When set, the watermark
+    /// can never reach the target, so `wait` returns this typed error instead of
+    /// blocking forever.
     terminal_error: Arc<StdMutex<Option<WalFlushFailure>>>,
 }
 
@@ -382,11 +376,9 @@ pub struct WalFlusher {
     /// Created at construction and recreated after each flush.
     /// Used by backpressure to wait for WAL flushes.
     wal_flush_cell: std::sync::Mutex<Option<WatchableOnceCell<super::write::DurabilityResult>>>,
-    /// First terminal flush failure — a peer fence or a persistence-failure
-    /// self-fence. Shared with every `BatchDurableWatcher` so a terminally
-    /// failed flush — which never advances the watermark — wakes durability
-    /// waiters with the typed error instead of hanging them forever, and read
-    /// by `check_poisoned` so the write path fails fast.
+    /// First terminal flush failure, shared with every `BatchDurableWatcher`. It
+    /// wakes durability waiters (the watermark never advances) and is read by
+    /// `check_poisoned` so the write path fails fast.
     terminal_error: Arc<StdMutex<Option<WalFlushFailure>>>,
 }
 
@@ -437,11 +429,9 @@ impl WalFlusher {
         )
     }
 
-    /// Record a terminal flush failure (a peer fence or a persistence-failure
-    /// self-fence) and wake every pending durability waiter. A terminal failure
-    /// is permanent — the watermark will never advance — so waiters must observe
-    /// the error rather than block forever. Idempotent: only the first failure
-    /// is retained.
+    /// Latch a terminal flush failure and wake every durability waiter (the
+    /// watermark never advances, so they must observe the error, not block).
+    /// Idempotent: only the first failure is retained.
     fn mark_terminal_failure(&self, error: &Error) {
         {
             let mut slot = self.terminal_error.lock().unwrap();
@@ -454,11 +444,10 @@ impl WalFlusher {
         self.durable_watermark_tx.send_modify(|_| {});
     }
 
-    /// Fail fast if this writer has been fenced — by a peer or by its own WAL
-    /// persistence failing. Once terminally failed, the in-memory state may no
-    /// longer match the durable WAL, so the write path calls this before
-    /// touching the memtable to reject writes with the typed error instead of
-    /// silently diverging. Recovery is to reopen the shard (replay the WAL).
+    /// Fail fast with the typed error if this writer has been fenced (by a peer
+    /// or its own persistence failure). The write path calls this before touching
+    /// the memtable so a poisoned writer can't diverge further. Recovery is to
+    /// reopen the shard (replay the WAL).
     pub fn check_poisoned(&self) -> Result<()> {
         if let Some(failure) = self.terminal_error.lock().unwrap().clone() {
             return Err(failure.into_error());
@@ -546,11 +535,8 @@ impl WalFlusher {
             }
             WalFlushSource::WalOnly { state } => self.flush_from_wal_only(state).await,
         };
-        // A terminal failure (peer fence or persistence-failure self-fence)
-        // means the append will never succeed, so the durability watermark can
-        // never advance. Wake any waiter (e.g. a `durable_write` put) with the
-        // typed error instead of hanging it, and latch the poison so later
-        // writes fail fast via `check_poisoned`.
+        // A terminal failure means the watermark can never advance; latch the
+        // poison so waiters wake with the typed error and later writes fail fast.
         if let Err(e) = &result
             && is_terminal_failure(e)
         {
@@ -795,14 +781,10 @@ const APPEND_CONFLICT_REFRESH_INTERVAL: usize = 16;
 const MAX_CURSOR_PROBE: u64 = 4096;
 
 /// Retry policy for transient WAL persistence failures before the writer
-/// self-fences.
-///
-/// On a non-conflict object-store error, the appender retries the *same* WAL
-/// position up to `max_retries` more times with exponential backoff starting at
-/// `base_delay`. Retrying the same position (rather than advancing) keeps the
-/// WAL free of duplicate entries: if the failed PUT had actually landed (a lost
-/// acknowledgement), the retry observes our own entry and treats it as success.
-/// Exhausting the budget poisons the writer with [`Error::writer_poisoned`].
+/// self-fences. On a non-conflict object-store error the appender retries the
+/// *same* WAL position up to `max_retries` times with exponential backoff from
+/// `base_delay`; exhausting the budget poisons the writer
+/// ([`Error::writer_poisoned`]).
 #[derive(Debug, Clone, Copy)]
 pub struct WalRetryConfig {
     pub max_retries: usize,
@@ -984,11 +966,10 @@ impl WalAppender {
             *next_pos = Some(self.discover_next_position().await?);
         }
 
-        // `conflicts` counts position races across the whole append (advancing
-        // past slots others hold). `io_attempts` is the per-position retry
-        // budget for transient PUT failures; it only ever grows while we sit on
-        // one position, since the only path that advances resets it implicitly
-        // by living in the `io_attempts == 0` branch.
+        // `conflicts` counts position races across the append; `io_attempts` is
+        // the per-position retry budget for transient PUT failures. The latter
+        // only grows while we sit on one position — the sole advancing branch is
+        // `io_attempts == 0`, so it never carries across positions.
         let mut conflicts = 0;
         let mut io_attempts = 0;
         loop {
@@ -1021,16 +1002,11 @@ impl WalAppender {
                     });
                 }
                 Err(AtomicPutError::AlreadyExists) => {
-                    self.check_fenced().await?;
-                    // If we had already failed to PUT this exact slot, its now
-                    // being occupied is ambiguous: our own lost acknowledgement
-                    // (the PUT landed but errored) or a peer that grabbed the
-                    // slot. We can neither advance-and-rewrite (that would
-                    // duplicate the entry) nor blindly accept it, so we poison
-                    // the writer — reopening replays the WAL and reconciles the
-                    // in-memory state with durable storage before writes resume.
-                    // `check_fenced` above already surfaced the peer case as a
-                    // typed peer fence.
+                    self.check_fenced().await?; // surfaces a peer takeover as a typed fence
+                    // A slot we already failed to PUT is now occupied — ambiguous
+                    // (our lost-ack, or a peer). We can't advance-and-rewrite (would
+                    // duplicate) nor blindly accept it, so poison and let replay
+                    // reconcile on reopen.
                     if io_attempts > 0 {
                         return Err(Error::writer_poisoned(format!(
                             "WAL position {} for shard {} was taken after a failed PUT; \
@@ -1514,6 +1490,7 @@ async fn best_effort_cursor_update(manifest_store: &ShardManifestStore, entry_po
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dataset::mem_wal::test_util::failing_memory_store;
     use arrow_array::{Int32Array, StringArray};
     use arrow_schema::{DataType, Field, Schema};
     use std::sync::Arc;
@@ -1835,18 +1812,13 @@ mod tests {
         second.append(vec![batch.clone()]).await.unwrap();
 
         let err = first.check_fenced().await.unwrap_err();
-        assert!(
-            err.to_string().contains("Writer fenced"),
-            "expected fence error, got: {err}"
-        );
+        // A peer takeover is a typed peer fence, distinct from a self-poison.
+        assert_eq!(err.fence_reason(), Some(FenceReason::PeerClaimedEpoch));
 
         // Fenced writer's cached next_pos still points at 2; the conflict path
         // must surface the fence error rather than silently advance.
         let err = first.append(vec![batch]).await.unwrap_err();
-        assert!(
-            err.to_string().contains("Writer fenced"),
-            "expected fence error from append, got: {err}"
-        );
+        assert_eq!(err.fence_reason(), Some(FenceReason::PeerClaimedEpoch));
     }
 
     #[tokio::test]
@@ -2004,5 +1976,138 @@ mod tests {
         // next_position must still resolve to one past the last appended entry.
         // Three entries from a fresh shard land at 1, 2, 3, so next is 4.
         assert_eq!(tailer.next_position().await.unwrap(), 4);
+    }
+
+    // A transient PUT failure is retried at the same position and then succeeds.
+    #[tokio::test]
+    async fn test_append_retries_transient_failure_then_succeeds() {
+        let (store, base, controls) = failing_memory_store().await;
+        let shard_id = Uuid::new_v4();
+        controls.fail_wal_puts(2); // 2 failures, under the default budget of 3
+        let appender = WalAppender::open(store, base, shard_id, 0).await.unwrap();
+
+        let schema = create_test_schema();
+        let res = appender
+            .append(vec![create_test_batch(&schema, 1)])
+            .await
+            .unwrap();
+        assert_eq!(res.entry_position, FIRST_WAL_ENTRY_POSITION);
+        assert_eq!(controls.attempts(), 3); // 2 failed + 1 succeeded
+    }
+
+    // Exhausting the retry budget poisons the writer with a typed persistence
+    // failure (distinct from a peer fence).
+    #[tokio::test]
+    async fn test_append_poisons_after_exhausting_retries() {
+        let (store, base, controls) = failing_memory_store().await;
+        let shard_id = Uuid::new_v4();
+        controls.fail_wal_puts(usize::MAX);
+        let manifest_store = Arc::new(ShardManifestStore::new(store.clone(), &base, shard_id, 2));
+        let (epoch, _) = manifest_store.claim_epoch(0).await.unwrap();
+        let appender = WalAppender::with_claimed_epoch(
+            store,
+            base,
+            shard_id,
+            manifest_store,
+            epoch,
+            0,
+            WalRetryConfig {
+                max_retries: 2,
+                base_delay: Duration::from_millis(1),
+            },
+        );
+
+        let schema = create_test_schema();
+        let err = appender
+            .append(vec![create_test_batch(&schema, 1)])
+            .await
+            .unwrap_err();
+        assert_eq!(err.fence_reason(), Some(FenceReason::PersistenceFailure));
+        assert_eq!(controls.attempts(), 3); // io_attempts 0,1,2 then poison
+    }
+
+    // A lost acknowledgement (PUT errored but landed) poisons the writer without
+    // ever writing a duplicate entry at the next position.
+    #[tokio::test]
+    async fn test_append_lost_ack_poisons_without_duplicate() {
+        let (store, base, controls) = failing_memory_store().await;
+        let shard_id = Uuid::new_v4();
+        controls.set_lost_ack(true);
+        controls.fail_wal_puts(1);
+        let appender = WalAppender::open(store.clone(), base.clone(), shard_id, 0)
+            .await
+            .unwrap();
+
+        let schema = create_test_schema();
+        let err = appender
+            .append(vec![create_test_batch(&schema, 1)])
+            .await
+            .unwrap_err();
+        assert_eq!(err.fence_reason(), Some(FenceReason::PersistenceFailure));
+
+        // The entry landed exactly once; the next slot stays empty.
+        let tailer = WalTailer::new(store, base, shard_id);
+        assert!(
+            tailer
+                .read_entry(FIRST_WAL_ENTRY_POSITION)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            tailer
+                .read_entry(FIRST_WAL_ENTRY_POSITION + 1)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    // A persistence failure during flush latches the poison: the flush result,
+    // `check_poisoned`, and the durability watcher all report the typed error
+    // (rather than the watcher hanging on a watermark that never advances).
+    #[tokio::test]
+    async fn test_flush_persistence_failure_poisons_and_wakes_waiter() {
+        let (store, base, controls) = failing_memory_store().await;
+        let shard_id = Uuid::new_v4();
+        controls.fail_wal_puts(usize::MAX);
+        let manifest_store = Arc::new(ShardManifestStore::new(store.clone(), &base, shard_id, 2));
+        let (epoch, _) = manifest_store.claim_epoch(0).await.unwrap();
+        let appender = Arc::new(WalAppender::with_claimed_epoch(
+            store,
+            base,
+            shard_id,
+            manifest_store,
+            epoch,
+            0,
+            WalRetryConfig {
+                max_retries: 1,
+                base_delay: Duration::from_millis(1),
+            },
+        ));
+        let flusher = WalFlusher::new(appender);
+
+        let schema = create_test_schema();
+        let batch_store = Arc::new(BatchStore::with_capacity(10));
+        batch_store.append(create_test_batch(&schema, 1)).unwrap();
+        let mut watcher = flusher.track_batch(0);
+
+        let source = batch_store_source(&batch_store);
+        let flush_err = flusher.flush(&source, batch_store.len()).await.unwrap_err();
+        assert_eq!(
+            flush_err.fence_reason(),
+            Some(FenceReason::PersistenceFailure)
+        );
+
+        assert_eq!(
+            flusher.check_poisoned().unwrap_err().fence_reason(),
+            Some(FenceReason::PersistenceFailure)
+        );
+
+        let waited = tokio::time::timeout(Duration::from_secs(5), watcher.wait())
+            .await
+            .expect("watcher hung after a poisoning flush")
+            .expect_err("watcher must surface the poison");
+        assert_eq!(waited.fence_reason(), Some(FenceReason::PersistenceFailure));
     }
 }
