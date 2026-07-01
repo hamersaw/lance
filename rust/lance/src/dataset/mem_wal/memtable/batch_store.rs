@@ -75,11 +75,24 @@ impl StoredBatch {
     }
 
     /// Estimate the memory size of a RecordBatch.
+    ///
+    /// Uses Arrow's slice-aware [`ArrayData::get_slice_memory_size`] so a batch
+    /// that is a zero-copy slice of a larger parent reports only its own window
+    /// instead of the whole shared buffer. `get_array_memory_size` counts every
+    /// buffer's full `capacity()` regardless of the array's offset/length, so N
+    /// slices tiling one parent would each report the parent's size and inflate
+    /// the memtable estimate by ~N× — tripping the flush threshold far below the
+    /// configured size. The fallback keeps the old (over-counting but safe)
+    /// behavior for the rare types where the slice-aware call errors.
     fn estimate_batch_size(batch: &RecordBatch) -> usize {
         batch
             .columns()
             .iter()
-            .map(|col| col.get_array_memory_size())
+            .map(|col| {
+                col.to_data()
+                    .get_slice_memory_size()
+                    .unwrap_or_else(|_| col.get_array_memory_size())
+            })
             .sum::<usize>()
             + std::mem::size_of::<RecordBatch>()
     }
@@ -970,6 +983,58 @@ mod tests {
         // Very small memtable should get minimum capacity
         let cap = BatchStore::recommended_capacity(1024);
         assert_eq!(cap, 16); // minimum
+    }
+
+    #[test]
+    fn test_estimated_size_is_slice_aware() {
+        // A batch that is a zero-copy slice of a larger parent must contribute
+        // only its own window to the estimate, not the whole shared buffer.
+        // `get_array_memory_size` counts every buffer's full capacity regardless
+        // of offset/length, so N slices tiling one parent each report the
+        // parent's size and inflate the memtable estimate ~N×, tripping the
+        // flush threshold far below the configured size.
+        let chunk = 1_000;
+        let num_slices = 100;
+        let parent = create_test_batch(chunk * num_slices);
+
+        // One window vs an equivalently-sized owned batch should track each
+        // other; the buggy per-slice estimate would be ~num_slices× larger.
+        let slice_est = StoredBatch::estimate_batch_size(&parent.slice(0, chunk));
+        let owned_est = StoredBatch::estimate_batch_size(&create_test_batch(chunk));
+        assert!(
+            slice_est <= owned_est * 2,
+            "slice estimate {slice_est} should track its own window (~{owned_est}), not the parent"
+        );
+
+        // End-to-end: tiling the parent with zero-copy slices must not multiply
+        // the store's running estimate. Track what the old full-buffer behavior
+        // would have summed to for contrast.
+        let store = BatchStore::with_capacity(num_slices);
+        let mut over_counting_sum = 0usize;
+        for k in 0..num_slices {
+            let s = parent.slice(k * chunk, chunk);
+            over_counting_sum += s
+                .columns()
+                .iter()
+                .map(|col| col.get_array_memory_size())
+                .sum::<usize>()
+                + std::mem::size_of::<RecordBatch>();
+            store.append(s).unwrap();
+        }
+
+        // Two non-nullable Int32 columns → exactly 4 bytes/row/col of payload.
+        let payload_bytes = num_slices * chunk * 2 * std::mem::size_of::<i32>();
+        let estimated = store.estimated_bytes();
+        assert!(
+            estimated >= payload_bytes,
+            "estimate {estimated} should cover the actual payload {payload_bytes}"
+        );
+        // The old behavior over-counts by ~num_slices×; the fix must be far
+        // below it (generous 10× margin against struct/alignment overhead).
+        assert!(
+            estimated * 10 < over_counting_sum,
+            "estimate {estimated} should be far below the over-counting sum {over_counting_sum}"
+        );
     }
 
     #[test]
