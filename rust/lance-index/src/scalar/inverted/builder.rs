@@ -1200,7 +1200,12 @@ impl InnerBuilder {
         let batch = docs.to_batch()?;
         let mut writer = store.new_index_file(path, batch.schema()).await?;
         writer.write_record_batch(batch).await?;
-        writer.finish().await
+        writer
+            .finish_with_metadata(HashMap::from([(
+                super::documents::TOTAL_TOKENS_KEY.to_owned(),
+                docs.total_tokens_num().to_string(),
+            )]))
+            .await
     }
 }
 
@@ -3565,8 +3570,9 @@ mod tests {
             .await?;
 
         let index = InvertedIndex::load(store, None, &LanceCache::no_cache()).await?;
-        let (total_tokens, num_docs, token_docs) =
-            index.bm25_stats_for_terms(&["hello".to_string()]).await?;
+        let (total_tokens, num_docs, token_docs) = index
+            .bm25_stats_for_terms(&["hello".to_string()], None)
+            .await?;
         assert_eq!(total_tokens, 1);
         assert_eq!(num_docs, 1);
         assert_eq!(token_docs, vec![1]);

@@ -87,7 +87,7 @@ use crate::dataset::overlay::{
     collect_overlay_stale_frags, collect_overlay_stale_rows_for_segment, overlaid_fragments,
 };
 use crate::dataset::row_offsets_to_row_addresses;
-use crate::dataset::rowids::translate_addr_treemap_to_row_ids;
+use crate::dataset::rowids::{live_row_addrs_to_row_ids, translate_addr_treemap_to_row_ids};
 use crate::dataset::utils::SchemaAdapter;
 use crate::index::DatasetIndexInternalExt;
 use crate::index::scalar::inverted::{load_segment_details, load_segments};
@@ -99,7 +99,8 @@ use crate::io::exec::filtered_read::{
     FilteredReadExec, FilteredReadOptions, FilteredReadThreadingMode,
 };
 use crate::io::exec::fts::{
-    BoostQueryExec, FlatMatchFilterExec, FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec,
+    BoostQueryExec, CompoundQueryExec, FlatMatchFilterExec, FlatMatchQueryExec, MatchQueryExec,
+    PhraseQueryExec,
 };
 use crate::io::exec::knn::MultivectorScoringExec;
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
@@ -128,6 +129,129 @@ use lance_datafusion::substrait::parse_substrait;
 /// Rows per output batch when neither the scan options nor
 /// `LANCE_DEFAULT_BATCH_SIZE` specify one.
 pub const BATCH_SIZE_FALLBACK: usize = 8192;
+
+fn collect_all_fts_columns(query: &FtsQuery, columns: &mut HashSet<String>) {
+    match query {
+        FtsQuery::Match(query) => {
+            if let Some(column) = &query.column {
+                columns.insert(column.clone());
+            }
+        }
+        FtsQuery::Phrase(query) => {
+            if let Some(column) = &query.column {
+                columns.insert(column.clone());
+            }
+        }
+        FtsQuery::Boost(query) => {
+            collect_all_fts_columns(&query.positive, columns);
+            collect_all_fts_columns(&query.negative, columns);
+        }
+        FtsQuery::MultiMatch(query) => {
+            for match_query in &query.match_queries {
+                if let Some(column) = &match_query.column {
+                    columns.insert(column.clone());
+                }
+            }
+        }
+        FtsQuery::Boolean(query) => {
+            for child in query
+                .should
+                .iter()
+                .chain(&query.must)
+                .chain(&query.must_not)
+            {
+                collect_all_fts_columns(child, columns);
+            }
+        }
+    }
+}
+
+fn supports_compound_scorer(query: &FtsQuery) -> bool {
+    fn supports_shape(query: &FtsQuery) -> bool {
+        match query {
+            FtsQuery::Match(_) | FtsQuery::Phrase(_) | FtsQuery::MultiMatch(_) => true,
+            FtsQuery::Boolean(query) => {
+                (!query.should.is_empty() || !query.must.is_empty())
+                    && query
+                        .should
+                        .iter()
+                        .chain(&query.must)
+                        .chain(&query.must_not)
+                        .all(supports_shape)
+            }
+            FtsQuery::Boost(query) => {
+                supports_shape(&query.positive) && supports_shape(&query.negative)
+            }
+        }
+    }
+
+    if matches!(query, FtsQuery::Match(_) | FtsQuery::Phrase(_)) || !supports_shape(query) {
+        return false;
+    }
+    let mut columns = HashSet::new();
+    collect_all_fts_columns(query, &mut columns);
+    columns.len() == 1
+}
+
+fn contains_phrase_query(query: &FtsQuery) -> bool {
+    match query {
+        FtsQuery::Phrase(_) => true,
+        FtsQuery::Match(_) | FtsQuery::MultiMatch(_) => false,
+        FtsQuery::Boost(query) => {
+            contains_phrase_query(&query.positive) || contains_phrase_query(&query.negative)
+        }
+        FtsQuery::Boolean(query) => query
+            .should
+            .iter()
+            .chain(&query.must)
+            .chain(&query.must_not)
+            .any(contains_phrase_query),
+    }
+}
+
+fn validate_fts_query_contract(query: &FtsQuery) -> Result<()> {
+    fn validate_multiplier(name: &str, value: f32) -> Result<()> {
+        if value.is_finite() && value >= 0.0 {
+            Ok(())
+        } else {
+            Err(Error::invalid_input(format!(
+                "{name} must be finite and non-negative, got {value}"
+            )))
+        }
+    }
+
+    match query {
+        FtsQuery::Match(query) => validate_multiplier("MatchQuery boost", query.boost),
+        FtsQuery::Phrase(_) => Ok(()),
+        FtsQuery::Boost(query) => {
+            validate_multiplier("BoostQuery negative_boost", query.negative_boost)?;
+            validate_fts_query_contract(&query.positive)?;
+            validate_fts_query_contract(&query.negative)
+        }
+        FtsQuery::MultiMatch(query) => {
+            for match_query in &query.match_queries {
+                validate_multiplier("MultiMatchQuery boost", match_query.boost)?;
+            }
+            Ok(())
+        }
+        FtsQuery::Boolean(query) => {
+            if query.should.is_empty() && query.must.is_empty() {
+                return Err(Error::invalid_input(
+                    "boolean query must have at least one should/must query",
+                ));
+            }
+            for child in query
+                .should
+                .iter()
+                .chain(&query.must)
+                .chain(&query.must_not)
+            {
+                validate_fts_query_contract(child)?;
+            }
+            Ok(())
+        }
+    }
+}
 
 /// Parse an environment variable as a specific type, logging a warning on parse failure.
 fn parse_env_var<T: std::str::FromStr>(env_var_name: &str, default_val: &str) -> Option<T>
@@ -755,7 +879,8 @@ pub struct Scanner {
     batch_size: Option<usize>,
 
     /// If set, the scanner will produce batches whose total size in bytes
-    /// is approximately this value, overriding the row-based `batch_size`.
+    /// is approximately this value. When both limits are set, the scanner uses
+    /// the smaller row count selected by either limit.
     batch_size_bytes: Option<u64>,
 
     /// Number of batches to prefetch
@@ -1323,9 +1448,9 @@ impl Scanner {
 
     /// Set the maximum number of rows per batch.
     ///
-    /// Note: this can be overridden by [`Self::batch_size_bytes`] or by a dataset-level
-    /// `batch_size_bytes` set via [`ReadParams::file_reader_options`](crate::dataset::ReadParams::file_reader_options).  When a byte-based
-    /// batch size is active, the row-based batch size is used only as an initial estimate.
+    /// When a byte limit is also configured through [`Self::batch_size_bytes`] or
+    /// [`ReadParams::file_reader_options`](crate::dataset::ReadParams::file_reader_options),
+    /// both limits apply and the one reached first determines the batch size.
     pub fn batch_size(&mut self, batch_size: usize) -> &mut Self {
         self.batch_size = Some(batch_size);
         self
@@ -1334,7 +1459,10 @@ impl Scanner {
     /// Set the target batch size in bytes.
     ///
     /// When set, the scanner will produce batches whose total size in bytes
-    /// is approximately this value, overriding the row-based `batch_size`.
+    /// is approximately this value. When a row-based `batch_size` is also set,
+    /// both limits apply and the one reached first determines the batch size.
+    /// This cannot be combined with [`Self::strict_batch_size`] because strict
+    /// row batching can merge batches beyond the byte limit.
     ///
     /// This can also be configured at the dataset level via
     /// [`ReadParams::file_reader_options`](crate::dataset::ReadParams::file_reader_options).  A scanner-level setting takes
@@ -1442,6 +1570,10 @@ impl Scanner {
     /// By default, this is False and output batches are allowed to have fewer than `batch_size` rows
     /// Setting this to True will require us to merge batches, incurring a data copy, for a minor performance
     /// penalty.
+    ///
+    /// This cannot be enabled when a byte limit is configured through
+    /// [`Self::batch_size_bytes`] or
+    /// [`ReadParams::file_reader_options`](crate::dataset::ReadParams::file_reader_options).
     pub fn strict_batch_size(&mut self, strict_batch_size: bool) -> &mut Self {
         self.strict_batch_size = strict_batch_size;
         self
@@ -2417,6 +2549,19 @@ impl Scanner {
             ));
         }
 
+        if self.strict_batch_size
+            && let Some(batch_size_bytes) = self
+                .resolved_file_reader_options()
+                .and_then(|options| options.batch_size_bytes)
+        {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "strict_batch_size=true cannot be combined with batch_size_bytes={batch_size_bytes}; strict row batching can merge batches beyond the byte limit"
+                )
+                .into(),
+            ));
+        }
+
         if self.include_deleted_rows && !self.projection_plan.physical_projection.with_row_id {
             return Err(Error::invalid_input_source(
                 "include_deleted_rows is set but with_row_id is false".into(),
@@ -3058,10 +3203,9 @@ impl Scanner {
         }
     }
 
-    fn u64s_as_take_input(&self, u64s: Vec<u64>) -> Result<Arc<dyn ExecutionPlan>> {
-        let row_addrs = RowAddrTreeMap::from_iter(u64s);
-        let row_addr_mask = RowAddrMask::from_allowed(row_addrs);
-        let index_result = IndexExprResult::exact(row_addr_mask);
+    fn row_ids_as_take_input(&self, row_ids: RowAddrTreeMap) -> Result<Arc<dyn ExecutionPlan>> {
+        let row_id_mask = RowAddrMask::from_allowed(row_ids);
+        let index_result = IndexExprResult::exact(row_id_mask);
         let fragments_covered = self.dataset.fragment_bitmap.as_ref().clone();
         let format = self.index_expr_result_format();
         let batch = index_result.serialize(&fragments_covered, format)?;
@@ -3071,19 +3215,27 @@ impl Scanner {
         Ok(Arc::new(OneShotExec::new(stream)))
     }
 
+    async fn row_addrs_as_take_input(&self, row_addrs: Vec<u64>) -> Result<Arc<dyn ExecutionPlan>> {
+        let row_ids =
+            live_row_addrs_to_row_ids(&self.dataset, row_addrs.into_iter().map(Some)).await?;
+        self.row_ids_as_take_input(RowAddrTreeMap::from_iter(row_ids.into_iter().flatten()))
+    }
+
     async fn take_source(&self, take_op: TakeOperation) -> Result<Arc<dyn ExecutionPlan>> {
         // We generally assume that late materialization does not make sense for take operations
         // so we can just use the physical projection
         let projection = self.projection_plan.physical_projection.clone();
 
         let input = match take_op {
-            TakeOperation::RowIds(ids) => self.u64s_as_take_input(ids),
-            TakeOperation::RowAddrs(addrs) => self.u64s_as_take_input(addrs),
+            TakeOperation::RowIds(ids) => {
+                self.row_ids_as_take_input(RowAddrTreeMap::from_iter(ids))
+            }
+            TakeOperation::RowAddrs(addrs) => self.row_addrs_as_take_input(addrs).await,
             TakeOperation::RowOffsets(offsets) => {
                 let mut addrs =
                     row_offsets_to_row_addresses(&self.dataset.get_fragments(), &offsets).await?;
                 addrs.retain(|addr| *addr != RowAddress::TOMBSTONE_ROW);
-                self.u64s_as_take_input(addrs)
+                self.row_addrs_as_take_input(addrs).await
             }
         }?;
 
@@ -3370,6 +3522,7 @@ impl Scanner {
         } else {
             query.query.clone()
         };
+        validate_fts_query_contract(&query)?;
 
         // TODO: Could maybe walk the query here to find all the indices that will be
         // involved in the query to calculate a more accuarate required_fragments than
@@ -3390,6 +3543,71 @@ impl Scanner {
         Ok(fts_exec)
     }
 
+    async fn plan_compound_scorer(
+        &self,
+        query: &FtsQuery,
+        params: &FtsSearchParams,
+        prefilter_source: &PreFilterSource,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        let mut columns = HashSet::new();
+        collect_all_fts_columns(query, &mut columns);
+        let Some(column) = columns.into_iter().next() else {
+            return Ok(None);
+        };
+
+        let index = self
+            .dataset
+            .load_scalar_index(IndexCriteria::default().for_column(&column).supports_fts())
+            .await?;
+        let Some(index) = index else {
+            return Ok(None);
+        };
+        let target_fragments = self
+            .fragments
+            .clone()
+            .unwrap_or_else(|| self.dataset.fragments().to_vec());
+        if !self
+            .retain_target_fragments(self.dataset.unindexed_fragments(&index.name).await?)
+            .is_empty()
+        {
+            // Flat and posting-backed leaves do not share a document domain.
+            // Preserve the exact DataFusion fallback until flat leaves expose
+            // the same candidate protocol.
+            return Ok(None);
+        }
+        let (stale_fragments, fresh_segments) = self
+            .fts_stale_frags_and_fresh_segments(&column, &target_fragments)
+            .await?;
+        if !stale_fragments.is_empty() {
+            return Ok(None);
+        }
+
+        let segments = match fresh_segments {
+            Some(segments) => segments,
+            None => load_segments(&self.dataset, &column)
+                .await?
+                .ok_or_else(|| {
+                    Error::invalid_input(format!("No Inverted index found for column {column}"))
+                })?,
+        };
+        if contains_phrase_query(query) {
+            let details = load_segment_details(&self.dataset, &column, &segments).await?;
+            if !details.with_position {
+                return Err(Error::invalid_input(
+                    "position is not found but required for phrase queries, try recreating the index with position"
+                        .to_string(),
+                ));
+            }
+        }
+        Ok(Some(Arc::new(CompoundQueryExec::new_with_segments(
+            self.dataset.clone(),
+            query.clone(),
+            params.clone(),
+            prefilter_source.clone(),
+            segments,
+        ))))
+    }
+
     async fn plan_fts(
         &self,
         query: &FtsQuery,
@@ -3397,6 +3615,17 @@ impl Scanner {
         filter_plan: &ExprFilterPlan,
         prefilter_source: &PreFilterSource,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        if supports_compound_scorer(query)
+            && let Some(plan) = self
+                .plan_compound_scorer(query, params, prefilter_source)
+                .await?
+        {
+            return Ok(plan);
+        }
+
+        // Cross-column, flat, and overlay-backed compound queries retain the
+        // exact DataFusion fallback because their leaves do not share one
+        // posting document domain.
         let plan: Arc<dyn ExecutionPlan> = match query {
             FtsQuery::Match(query) => {
                 self.plan_match_query(query, params, filter_plan, prefilter_source)
@@ -3471,18 +3700,26 @@ impl Scanner {
                     fts_node,
                     schema,
                 )?);
-                let sort_expr = PhysicalSortExpr {
-                    expr: expressions::col(SCORE_COL, fts_node.schema().as_ref())?,
-                    options: SortOptions {
-                        descending: true,
-                        nulls_first: false,
+                let sort_exprs = [
+                    PhysicalSortExpr {
+                        expr: expressions::col(SCORE_COL, fts_node.schema().as_ref())?,
+                        options: SortOptions {
+                            descending: true,
+                            nulls_first: false,
+                        },
                     },
-                };
+                    PhysicalSortExpr {
+                        expr: expressions::col(ROW_ID, fts_node.schema().as_ref())?,
+                        options: SortOptions {
+                            descending: false,
+                            nulls_first: false,
+                        },
+                    },
+                ];
 
-                Arc::new(
-                    SortExec::new([sort_expr].into(), fts_node)
-                        .with_fetch(self.limit.map(|l| l as usize)),
-                )
+                // `params.limit` is the recursive planning contract. Compound
+                // parents pass `None` when they require every candidate.
+                Arc::new(SortExec::new(sort_exprs.into(), fts_node).with_fetch(params.limit))
             }
             FtsQuery::Boolean(query) => {
                 // TODO: rewrite the query for better performance
@@ -3583,12 +3820,12 @@ impl Scanner {
         // phrase queries already do not search — overlaid fragments are simply dropped from the
         // phrase result; new phrase matches there surface once compaction folds the overlay into
         // the base. This removes stale hits without introducing wrong ones.
-        let target_fragments = self
+        let target_fragments: &[Fragment] = self
             .fragments
-            .clone()
-            .unwrap_or_else(|| self.dataset.fragments().to_vec());
+            .as_deref()
+            .unwrap_or_else(|| self.dataset.fragments());
         let (_flat_frag_ids, fresh_segments) = self
-            .fts_stale_frags_and_fresh_segments(&column, &target_fragments)
+            .fts_stale_frags_and_fresh_segments(&column, target_fragments)
             .await?;
 
         let exec: Arc<dyn ExecutionPlan> = match fresh_segments {
@@ -3633,10 +3870,10 @@ impl Scanner {
             .await?;
 
         // Get target fragments
-        let target_fragments = self
+        let target_fragments: &[Fragment] = self
             .fragments
-            .clone()
-            .unwrap_or_else(|| self.dataset.fragments().to_vec());
+            .as_deref()
+            .unwrap_or_else(|| self.dataset.fragments());
 
         let (match_plan, flat_match_plan) = match &index {
             Some(index) => {
@@ -3647,7 +3884,7 @@ impl Scanner {
                 // Fragments whose FTS index entries may be stale due to a newer data overlay.
                 // These are excluded from the indexed path and re-evaluated on the flat path.
                 let (stale_flat_frag_ids, fresh_segments) = self
-                    .fts_stale_frags_and_fresh_segments(&column, &target_fragments)
+                    .fts_stale_frags_and_fresh_segments(&column, target_fragments)
                     .await?;
 
                 // Fragments that need flat evaluation: unindexed + stale (deduplicated).
@@ -3710,7 +3947,7 @@ impl Scanner {
                 }
                 // No index: flat search all target fragments
                 let flat_match_plan = self
-                    .plan_flat_match_query(target_fragments.clone(), query, params, filter_plan)
+                    .plan_flat_match_query(target_fragments.to_vec(), query, params, filter_plan)
                     .await?;
                 (None, Some(flat_match_plan))
             }
@@ -4501,11 +4738,7 @@ impl Scanner {
         projection: Projection,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let take_id_map = self.stale_rows_in_id_domain(stale_rows).await?;
-        let take_ids: Vec<u64> = take_id_map
-            .row_addrs()
-            .map(|it| it.map(u64::from).collect())
-            .unwrap_or_default();
-        let index_input = self.u64s_as_take_input(take_ids)?;
+        let index_input = self.row_ids_as_take_input(take_id_map)?;
         let mut read_options = FilteredReadOptions::new(projection);
         if let Some(fragments) = self.fragments.as_ref() {
             read_options = read_options.with_fragments(Arc::new(fragments.clone()));
@@ -5816,7 +6049,9 @@ mod test {
     };
     use lance_file::version::LanceFileVersion;
     use lance_index::optimize::OptimizeOptions;
-    use lance_index::scalar::inverted::query::{MatchQuery, PhraseQuery};
+    use lance_index::scalar::inverted::query::{
+        BooleanQuery, BoostQuery, FtsQuery, MatchQuery, Occur, PhraseQuery,
+    };
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::pq::PQBuildParams;
@@ -5832,13 +6067,35 @@ mod test {
 
     use super::*;
     use crate::dataset::WriteMode;
-    use crate::dataset::WriteParams;
     use crate::dataset::optimize::{CompactionOptions, compact_files};
     use crate::dataset::scanner::test_dataset::TestVectorDataset;
+    use crate::dataset::{NewColumnTransform, WriteParams};
     use crate::index::vector::{StageParams, VectorIndexParams};
     use crate::utils::test::{
         DatagenExt, FragmentCount, FragmentRowCount, ThrottledStoreWrapper, assert_plan_node_equals,
     };
+
+    #[test]
+    fn test_fts_query_contract_rejects_invalid_values() {
+        let negative_match = FtsQuery::Match(MatchQuery::new("hello".to_string()).with_boost(-1.0));
+        let error = validate_fts_query_contract(&negative_match).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("finite and non-negative"));
+
+        let empty_boolean = FtsQuery::Boolean(BooleanQuery::new(Vec::<(Occur, FtsQuery)>::new()));
+        let error = validate_fts_query_contract(&empty_boolean).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("at least one should/must query"));
+
+        let infinite_boost = FtsQuery::Boost(BoostQuery::new(
+            MatchQuery::new("hello".to_string()).into(),
+            MatchQuery::new("world".to_string()).into(),
+            Some(f32::INFINITY),
+        ));
+        let error = validate_fts_query_contract(&infinite_boost).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("BoostQuery negative_boost"));
+    }
 
     #[test]
     fn test_env_var_parsing() {
@@ -6023,6 +6280,120 @@ mod test {
                 rows_read += next.num_rows();
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_batch_size_bytes_across_data_files() {
+        let num_rows = 300;
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from_iter_values(0..num_rows))],
+        )
+        .unwrap();
+        let test_dir = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            &test_dir,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                max_rows_per_file: num_rows as usize + 1,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let wide_value = "abcdefghij".repeat(6);
+        let wide_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "wide",
+            DataType::Utf8,
+            false,
+        )]));
+        let wide_batch = RecordBatch::try_new(
+            wide_schema.clone(),
+            vec![Arc::new(StringArray::from_iter_values(
+                (0..num_rows).map(|_| wide_value.as_str()),
+            ))],
+        )
+        .unwrap();
+        dataset
+            .add_columns(
+                NewColumnTransform::Reader(Box::new(RecordBatchIterator::new(
+                    [Ok(wide_batch)],
+                    wide_schema,
+                ))),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(dataset.get_fragment(0).unwrap().num_data_files(), 2);
+
+        let target_bytes = 8 * 1024;
+        let mut scan = dataset.scan();
+        scan.project(&["id", "wide"])
+            .unwrap()
+            .batch_size_bytes(target_bytes);
+        let batches = scan
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(
+            batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            num_rows as usize
+        );
+        for batch in &batches {
+            let wide = batch["wide"].as_string::<i32>();
+            let values_bytes = (*wide.value_offsets().last().unwrap()
+                - *wide.value_offsets().first().unwrap()) as usize;
+            let logical_bytes = batch.num_rows() * std::mem::size_of::<i64>()
+                + std::mem::size_of_val(wide.value_offsets())
+                + values_bytes;
+            assert!(
+                logical_bytes <= target_bytes as usize,
+                "batch has {logical_bytes} logical bytes, target is {target_bytes}"
+            );
+        }
+
+        let mut scan = dataset.scan();
+        scan.project(&["id", "wide"])
+            .unwrap()
+            .batch_size(10)
+            .batch_size_bytes(target_bytes);
+        let batches = scan
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert!(batches.iter().all(|batch| batch.num_rows() <= 10));
+
+        let mut scan = dataset.scan();
+        scan.project(&["id", "wide"])
+            .unwrap()
+            .batch_size(200)
+            .batch_size_bytes(target_bytes)
+            .strict_batch_size(true);
+        let error = scan
+            .try_into_stream()
+            .await
+            .err()
+            .expect("strict row and byte batch limits should be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("strict_batch_size=true cannot be combined with batch_size_bytes=8192"),
+            "unexpected error: {error}"
+        );
     }
 
     #[tokio::test]
@@ -11975,15 +12346,11 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
-      BoostQuery: negative_boost=1
-        MatchQuery: column=s, query=[hello]
-        MatchQuery: column=s, query=[world]"#
+      CompoundFtsScorer: query=Boosting(positive=Match(MatchQuery { column: Some("s"), terms: "hello", ... }), negative=Match(MatchQuery { column: Some("s"), terms: "world", ... }), negative_boost=1)"#
         } else {
             r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   LanceRead: uri=..., projection=[s], source=stream(_rowid)
-    BoostQuery: negative_boost=1
-      MatchQuery: column=s, query=[hello]
-      MatchQuery: column=s, query=[world]"#
+    CompoundFtsScorer: query=Boosting(positive=Match(MatchQuery { column: Some("s"), terms: "hello", ... }), negative=Match(MatchQuery { column: Some("s"), terms: "world", ... }), negative_boost=1)"#
         };
         assert_plan_equals(
             &dataset.dataset,
@@ -12948,6 +13315,111 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             &[2, 3],
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn test_filter_to_take_with_stable_row_ids() {
+        let ds = lance_datagen::gen_batch()
+            .col("idx", array::step::<Int32Type>())
+            .into_ram_dataset_with_params(
+                FragmentCount::from(3),
+                FragmentRowCount::from(4),
+                Some(WriteParams {
+                    max_rows_per_file: 4,
+                    enable_stable_row_ids: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+
+        let row_addrs = [
+            (u64::from(RowAddress::new_from_parts(0, 1)), 1),
+            (u64::from(RowAddress::new_from_parts(1, 1)), 5),
+            (u64::from(RowAddress::new_from_parts(2, 1)), 9),
+        ];
+        for (row_addr, expected_idx) in row_addrs {
+            let batch = ds
+                .scan()
+                .filter(&format!("{ROW_ADDR} = {row_addr}"))
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            assert_eq!(
+                batch["idx"].as_primitive::<Int32Type>().values(),
+                &[expected_idx]
+            );
+        }
+
+        let batch = ds
+            .scan()
+            .filter(&format!(
+                "{ROW_ADDR} IN ({}, {})",
+                row_addrs[1].0, row_addrs[2].0
+            ))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(batch["idx"].as_primitive::<Int32Type>().values(), &[5, 9]);
+
+        let batch = ds
+            .scan()
+            .filter(&format!("{ROW_ADDR} = 5"))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(batch.num_rows(), 0);
+
+        let batch = ds
+            .scan()
+            .filter(&format!("{ROW_OFFSET} IN (5, 9)"))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(batch["idx"].as_primitive::<Int32Type>().values(), &[5, 9]);
+    }
+
+    #[tokio::test]
+    async fn test_stale_row_address_does_not_follow_stable_id_after_update() {
+        let ds = lance_datagen::gen_batch()
+            .col("idx", array::step::<Int32Type>())
+            .into_ram_dataset_with_params(
+                FragmentCount::from(2),
+                FragmentRowCount::from(3),
+                Some(WriteParams {
+                    max_rows_per_file: 3,
+                    enable_stable_row_ids: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+
+        let old_row_addr = u64::from(RowAddress::new_from_parts(0, 1));
+        let ds = crate::dataset::UpdateBuilder::new(Arc::new(ds))
+            .update_where("idx = 1")
+            .unwrap()
+            .set("idx", "101")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset;
+
+        let batch = ds
+            .scan()
+            .filter(&format!("{ROW_ADDR} = {old_row_addr}"))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(batch.num_rows(), 0);
     }
 
     #[tokio::test]

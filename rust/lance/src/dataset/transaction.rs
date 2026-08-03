@@ -14,7 +14,9 @@
 
 use super::ManifestWriteConfig;
 use super::write::merge_insert::inserted_rows::KeyExistenceFilter;
+use crate::dataset::overlay::collect_overlay_stale_frags;
 use crate::dataset::transaction::UpdateMode::{RewriteColumns, RewriteRows};
+use crate::index::index_results_are_row_addrs;
 use crate::index::mem_wal::update_mem_wal_index_compacted_sstables;
 use crate::utils::temporal::timestamp_to_nanos;
 use lance_core::datatypes::{
@@ -23,7 +25,10 @@ use lance_core::datatypes::{
 };
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result, datatypes::Schema};
-use lance_file::{datatypes::Fields, version::LanceFileVersion};
+use lance_file::{
+    datatypes::Fields,
+    version::{ConcreteFileVersion, LanceFileVersion},
+};
 use lance_index::mem_wal::CompactedSsTable;
 use lance_index::{frag_reuse::FRAG_REUSE_INDEX_NAME, is_system_index};
 use lance_io::object_store::ObjectStore;
@@ -1741,7 +1746,7 @@ impl Transaction {
         if let Some(file_version) = Fragment::try_infer_version(fragments)? {
             // Ensure user-requested matches data files
             if let Some(user_requested) = user_requested
-                && user_requested != file_version
+                && ConcreteFileVersion::from(user_requested) != file_version
             {
                 return Err(Error::invalid_input(format!(
                     "User requested data storage version ({}) does not match version in data files ({})",
@@ -1752,6 +1757,7 @@ impl Transaction {
         } else {
             // If no files use user-requested or default
             Ok(user_requested
+                .map(ConcreteFileVersion::from)
                 .map(DataStorageFormat::new)
                 .unwrap_or_default())
         }
@@ -2044,12 +2050,22 @@ impl Transaction {
                         .copied()
                         .collect();
 
+                    // The original fragments that carried an overlay: their moved rows may have a
+                    // stale index entry (see `register_pure_rewrite_rows_update_frags_in_indices`).
+                    let original_overlaid_frags: HashMap<u32, &Fragment> = existing_fragments
+                        .iter()
+                        .filter(|f| original_fragment_ids.contains(&f.id) && !f.overlays.is_empty())
+                        .map(|f| (f.id as u32, f))
+                        .collect();
+
                     Self::register_pure_rewrite_rows_update_frags_in_indices(
                         &mut final_indices,
                         &pure_updated_frag_ids,
                         &original_fragment_ids,
                         fields_for_preserving_frag_bitmap,
-                    );
+                        &original_overlaid_frags,
+                        &schema,
+                    )?;
                 }
 
                 if let Some(next_row_id) = &mut next_row_id {
@@ -2107,9 +2123,21 @@ impl Transaction {
                     // We can re-use indices, but need to rewrite the fragment bitmaps
                     debug_assert!(rewritten_indices.is_empty());
                     for index in final_indices.iter_mut() {
+                        let results_are_row_addrs = index_results_are_row_addrs(index);
                         if let Some(fragment_bitmap) = &mut index.fragment_bitmap {
-                            *fragment_bitmap =
-                                Self::recalculate_fragment_bitmap(fragment_bitmap, groups)?;
+                            *fragment_bitmap = if results_are_row_addrs {
+                                // Stable row ids survive a rewrite, so a row-id-domain index
+                                // can simply follow its data to the new fragments. An
+                                // address-domain index cannot: its stored addresses point into
+                                // the fragments the rewrite dropped. Claiming coverage of the
+                                // new fragments would make it answer queries with addresses
+                                // that no longer resolve, so drop the rewritten fragments from
+                                // its coverage instead and let the scanner fall back to a full
+                                // scan for them.
+                                Self::drop_rewritten_fragments(fragment_bitmap, groups)
+                            } else {
+                                Self::recalculate_fragment_bitmap(fragment_bitmap, groups)?
+                            };
                         }
                     }
                 } else {
@@ -2298,11 +2326,9 @@ impl Transaction {
                     // just add it to the final fragments. Push the DataFile as
                     // given so every field (including base_id) is preserved.
                     if columns_covered.is_disjoint(&new_file.fields.iter().collect()) {
-                        LanceFileVersion::try_from_major_minor(
-                            new_file.file_major_version,
-                            new_file.file_minor_version,
-                        )
-                        .expect("Expected valid file version");
+                        new_file
+                            .file_version()
+                            .expect("Expected valid file version");
                         new_frag.files.push(new_file.clone());
                     }
 
@@ -2447,7 +2473,8 @@ impl Transaction {
                 // If this is an overwrite operation and the user has requested a specific version
                 // then overwrite with that version.  Otherwise, if the user didn't request a specific
                 // version, then overwrite with whatever version we had before.
-                prev_manifest.data_storage_format = DataStorageFormat::new(user_requested_version);
+                prev_manifest.data_storage_format =
+                    DataStorageFormat::new(ConcreteFileVersion::from(user_requested_version));
             }
 
             prev_manifest
@@ -2669,9 +2696,11 @@ impl Transaction {
         pure_update_frag_ids: &[u64],
         original_fragment_ids: &[u64],
         fields_for_preserving_frag_bitmap: &[u32],
-    ) {
+        original_overlaid_frags: &HashMap<u32, &Fragment>,
+        schema: &Schema,
+    ) -> Result<()> {
         if pure_update_frag_ids.is_empty() {
-            return;
+            return Ok(());
         }
 
         let value_updated_field_set = fields_for_preserving_frag_bitmap
@@ -2679,33 +2708,58 @@ impl Transaction {
             .collect::<HashSet<_>>();
 
         for index in indices.iter_mut() {
+            // Physical row addresses cannot follow moved rows into a new fragment.
+            // Leave that fragment uncovered so the scanner reads it directly.
+            if index_results_are_row_addrs(index) {
+                continue;
+            }
             let index_covers_modified_field = index.fields.iter().any(|field_id| {
                 value_updated_field_set.contains(&u32::try_from(*field_id).unwrap())
             });
+            if index_covers_modified_field {
+                continue;
+            }
+            let Some(fragment_bitmap) = index.fragment_bitmap.as_ref() else {
+                continue;
+            };
 
-            if !index_covers_modified_field
-                && let Some(fragment_bitmap) = &mut index.fragment_bitmap
-            {
-                // check if all the original fragments contains the updating rows are covered
-                // by the index(index fragment bitmap contains these frag ids).
-                // if not, that means not all the updating rows are indexed, so we could not
-                // index them.
-                let index_covers_all_original_fragments = original_fragment_ids
-                    .iter()
-                    .all(|&fragment_id| fragment_bitmap.contains(fragment_id as u32));
+            // Check that all the original fragments containing the updated rows are covered by
+            // the index. If not, some updated rows were not indexed, so we cannot index them.
+            let index_covers_all_original_fragments = original_fragment_ids
+                .iter()
+                .all(|&fragment_id| fragment_bitmap.contains(fragment_id as u32));
+            if !index_covers_all_original_fragments {
+                continue;
+            }
 
-                if index_covers_all_original_fragments {
-                    for fragment_id in pure_update_frag_ids.iter().map(|f| *f as u32) {
-                        fragment_bitmap.insert(fragment_id);
-                    }
+            // A rewrite materializes overlays.  If any of those overlays touched the
+            // column being indexed then the rewrite will modify that column.  As a
+            // result, that index will no longer cover the fragment and it does not
+            // count as a pure rewrite and we must exclude it from the index's fragment
+            // bitmap.
+            let mut overlay_stale = RoaringBitmap::new();
+            collect_overlay_stale_frags(
+                index,
+                original_overlaid_frags,
+                &mut overlay_stale,
+                schema,
+            )?;
+            if !overlay_stale.is_empty() {
+                continue;
+            }
+
+            if let Some(fragment_bitmap) = index.fragment_bitmap.as_mut() {
+                for fragment_id in pure_update_frag_ids.iter().map(|f| *f as u32) {
+                    fragment_bitmap.insert(fragment_id);
                 }
             }
         }
+        Ok(())
     }
 
     /// If an operation modifies one or more fields in a fragment then we need to remove
     /// that fragment from any indices that cover one of the modified fields.
-    fn prune_updated_fields_from_indices(
+    pub(crate) fn prune_updated_fields_from_indices(
         indices: &mut [IndexMetadata],
         updated_fragments: &[Fragment],
         fields_modified: &[u32],
@@ -2985,6 +3039,18 @@ impl Transaction {
             }
         }
         Ok(new_bitmap)
+    }
+
+    /// Coverage of an index that a rewrite invalidates: the rewritten fragments are
+    /// removed and the fragments they became are *not* added.
+    fn drop_rewritten_fragments(old: &RoaringBitmap, groups: &[RewriteGroup]) -> RoaringBitmap {
+        let mut new_bitmap = old.clone();
+        for group in groups {
+            for old_fragment in &group.old_fragments {
+                new_bitmap.remove(old_fragment.id as u32);
+            }
+        }
+        new_bitmap
     }
 
     fn handle_rewrite_indices(
@@ -4091,7 +4157,7 @@ mod tests {
     use lance_core::utils::address::RowAddress;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_core::{ROW_ADDR, ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION};
-    use lance_file::version::LanceFileVersion;
+    use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
     use lance_io::utils::CachedFileSize;
     use lance_table::format::overlay::OverlayCoverage;
     use lance_table::format::{
@@ -4112,7 +4178,7 @@ mod tests {
         Manifest::new(
             LanceSchema::try_from(&schema).unwrap(),
             Arc::new(vec![Fragment::new(0)]),
-            DataStorageFormat::new(LanceFileVersion::V2_0),
+            DataStorageFormat::new(ConcreteFileVersion::V2_0),
             HashMap::new(),
         )
     }
@@ -4198,7 +4264,7 @@ mod tests {
         let manifest = Manifest::new(
             LanceSchema::try_from(&schema).unwrap(),
             Arc::new(original_fragments),
-            DataStorageFormat::new(LanceFileVersion::V2_0),
+            DataStorageFormat::new(ConcreteFileVersion::V2_0),
             HashMap::new(),
         );
 
@@ -5093,8 +5159,14 @@ mod tests {
         let row_ids = RowIdSequence::from([10u64, 11, 12, 13, 14].as_slice());
         let row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&row_ids)));
 
-        let (major, minor) = lance_file::version::LanceFileVersion::Stable.to_numbers();
-        let data_file = DataFile::new("data.lance", vec![0], vec![0], major, minor, None, None);
+        let data_file = DataFile::new(
+            "data.lance",
+            vec![0],
+            vec![0],
+            ConcreteFileVersion::from(LanceFileVersion::Stable),
+            None,
+            None,
+        );
 
         let fragment = Fragment {
             id: 1,
@@ -5351,7 +5423,7 @@ mod tests {
         let legacy_manifest = Manifest::new(
             schema.clone(),
             Arc::new(vec![Fragment::new(0)]),
-            DataStorageFormat::new(LanceFileVersion::Legacy),
+            DataStorageFormat::new(ConcreteFileVersion::V1),
             HashMap::new(),
         );
 
@@ -5363,8 +5435,7 @@ mod tests {
                 "data.lance",
                 vec![0, 1, 3, 4], // no field 2 (struct parent)
                 vec![0, 1, 2, 3],
-                lance_file::format::MAJOR_VERSION as u32,
-                lance_file::format::MINOR_VERSION as u32,
+                ConcreteFileVersion::V1,
                 None,
                 None,
             )],
@@ -5395,7 +5466,7 @@ mod tests {
         let mut manifest = Manifest::new(
             LanceSchema::try_from(&schema).unwrap(),
             Arc::new(fragments),
-            DataStorageFormat::new(LanceFileVersion::V2_0),
+            DataStorageFormat::new(ConcreteFileVersion::V2_0),
             HashMap::new(),
         );
         manifest.reader_feature_flags = FLAG_STABLE_ROW_IDS;
@@ -5449,8 +5520,16 @@ mod tests {
         use lance_file::version::LanceFileVersion;
         use lance_table::feature_flags::FLAG_STABLE_ROW_IDS;
 
-        let (major, minor) = LanceFileVersion::Stable.to_numbers();
-        let mk_file = |path: &str| DataFile::new(path, vec![0], vec![0], major, minor, None, None);
+        let mk_file = |path: &str| {
+            DataFile::new(
+                path,
+                vec![0],
+                vec![0],
+                ConcreteFileVersion::from(LanceFileVersion::Stable),
+                None,
+                None,
+            )
+        };
 
         let arrow_schema = ArrowSchema::new(vec![ArrowField::new("id", DataType::Int32, false)]);
         let lance_schema = LanceSchema::try_from(&arrow_schema).unwrap();
@@ -5472,7 +5551,7 @@ mod tests {
         let mut manifest = Manifest::new(
             lance_schema.clone(),
             Arc::new(vec![prev_fragment.clone()]),
-            DataStorageFormat::new(LanceFileVersion::V2_0),
+            DataStorageFormat::new(ConcreteFileVersion::V2_0),
             HashMap::new(),
         );
         manifest.reader_feature_flags |= FLAG_STABLE_ROW_IDS;
@@ -5519,8 +5598,14 @@ mod tests {
         use lance_table::feature_flags::FLAG_STABLE_ROW_IDS;
         use lance_table::rowids::version::{RowDatasetVersionMeta, RowDatasetVersionSequence};
 
-        let (major, minor) = LanceFileVersion::Stable.to_numbers();
-        let data_file = DataFile::new("same.lance", vec![0], vec![0], major, minor, None, None);
+        let data_file = DataFile::new(
+            "same.lance",
+            vec![0],
+            vec![0],
+            ConcreteFileVersion::from(LanceFileVersion::Stable),
+            None,
+            None,
+        );
 
         let arrow_schema = ArrowSchema::new(vec![ArrowField::new("id", DataType::Int32, false)]);
         let lance_schema = LanceSchema::try_from(&arrow_schema).unwrap();
@@ -5545,7 +5630,7 @@ mod tests {
         let mut manifest = Manifest::new(
             lance_schema.clone(),
             Arc::new(vec![prev_fragment]),
-            DataStorageFormat::new(LanceFileVersion::V2_0),
+            DataStorageFormat::new(ConcreteFileVersion::V2_0),
             HashMap::new(),
         );
         manifest.reader_feature_flags |= FLAG_STABLE_ROW_IDS;
@@ -5595,8 +5680,16 @@ mod tests {
         use lance_file::version::LanceFileVersion;
         use lance_table::feature_flags::FLAG_STABLE_ROW_IDS;
 
-        let (major, minor) = LanceFileVersion::Stable.to_numbers();
-        let mk_file = |path: &str| DataFile::new(path, vec![0], vec![0], major, minor, None, None);
+        let mk_file = |path: &str| {
+            DataFile::new(
+                path,
+                vec![0],
+                vec![0],
+                ConcreteFileVersion::from(LanceFileVersion::Stable),
+                None,
+                None,
+            )
+        };
 
         let arrow_schema = ArrowSchema::new(vec![ArrowField::new("id", DataType::Int32, false)]);
         let lance_schema = LanceSchema::try_from(&arrow_schema).unwrap();
@@ -5615,7 +5708,7 @@ mod tests {
         let manifest = Manifest::new(
             lance_schema.clone(),
             Arc::new(vec![prev_fragment.clone()]),
-            DataStorageFormat::new(LanceFileVersion::V2_0),
+            DataStorageFormat::new(ConcreteFileVersion::V2_0),
             HashMap::new(),
         );
         assert_eq!(
@@ -5658,8 +5751,16 @@ mod tests {
         use lance_file::version::LanceFileVersion;
         use lance_table::feature_flags::FLAG_STABLE_ROW_IDS;
 
-        let (major, minor) = LanceFileVersion::Stable.to_numbers();
-        let mk_file = |path: &str| DataFile::new(path, vec![0], vec![0], major, minor, None, None);
+        let mk_file = |path: &str| {
+            DataFile::new(
+                path,
+                vec![0],
+                vec![0],
+                ConcreteFileVersion::from(LanceFileVersion::Stable),
+                None,
+                None,
+            )
+        };
 
         let arrow_schema = ArrowSchema::new(vec![ArrowField::new("id", DataType::Int32, false)]);
         let lance_schema = LanceSchema::try_from(&arrow_schema).unwrap();
@@ -5680,7 +5781,7 @@ mod tests {
         let mut manifest = Manifest::new(
             lance_schema.clone(),
             Arc::new(vec![existing_fragment.clone()]),
-            DataStorageFormat::new(LanceFileVersion::V2_0),
+            DataStorageFormat::new(ConcreteFileVersion::V2_0),
             HashMap::new(),
         );
         manifest.reader_feature_flags |= FLAG_STABLE_ROW_IDS;
@@ -6532,7 +6633,7 @@ mod tests {
         let mut manifest = Manifest::new(
             LanceSchema::try_from(&schema).unwrap(),
             Arc::new(vec![frag0, frag1, frag2]),
-            lance_table::format::DataStorageFormat::new(LanceFileVersion::V2_0),
+            lance_table::format::DataStorageFormat::new(ConcreteFileVersion::V2_0),
             HashMap::new(),
         );
         // The pre-existing overlays were committed at v3, so the current
@@ -6618,7 +6719,7 @@ mod tests {
         let manifest = Manifest::new(
             LanceSchema::try_from(&schema).unwrap(),
             Arc::new(vec![fragment]),
-            lance_table::format::DataStorageFormat::new(LanceFileVersion::V2_0),
+            lance_table::format::DataStorageFormat::new(ConcreteFileVersion::V2_0),
             HashMap::new(),
         );
 

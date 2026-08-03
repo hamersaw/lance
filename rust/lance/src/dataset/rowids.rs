@@ -5,7 +5,7 @@ use super::Dataset;
 use crate::session::caches::{RowIdIndexKey, RowIdSequenceKey};
 use crate::{Error, Result};
 use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt};
-use lance_core::utils::deletion::DeletionVector;
+use lance_core::utils::{address::RowAddress, deletion::DeletionVector};
 use lance_select::{RowAddrSelection, RowAddrTreeMap};
 use lance_table::{
     format::{Fragment, RowIdMeta},
@@ -90,24 +90,26 @@ pub async fn get_row_id_index(
 
 /// Map a set of physical row addresses to their stable row ids
 ///
-/// For each fragment present in `addrs`, the live rows in physical order carry
-/// the stable ids yielded by the fragment's [`RowIdSequence`] in the same
-/// order. Zipping the two (skipping deleted physical offsets) gives the
-/// `physical offset -> stable id` mapping. Addresses that point at deleted rows
-/// have no live counterpart and are dropped, which is correct: those rows are
-/// not part of the answer.
+/// A fragment's [`RowIdSequence`] holds one id per physical row in offset order;
+/// deletions are tracked by the deletion vector and do not compact the sequence,
+/// so a physical offset indexes the sequence directly (see [`RowIdIndex`], which
+/// maps ids to `start_address + position` and filters deletions separately).
+/// Addresses that no longer have a live counterpart are dropped, which is correct:
+/// those rows are not part of the answer. That covers both a deleted row and a
+/// whole fragment that a maintenance operation replaced — an address-domain index
+/// is not remapped by compaction or `update` (neither the zone map nor the bloom
+/// filter index supports remap), so its results outlive the fragments they address.
+/// The replacement fragments are absent from the index's fragment bitmap, so the
+/// scanner routes them to a full scan and no match is lost.
 pub(crate) async fn translate_addr_treemap_to_row_ids(
     dataset: &Dataset,
     addrs: &RowAddrTreeMap,
 ) -> Result<RowAddrTreeMap> {
     let mut row_ids = RowAddrTreeMap::new();
     for (fragment_id, selection) in addrs.iter() {
-        let file_fragment = dataset.get_fragment(*fragment_id as usize).ok_or_else(|| {
-            Error::internal(format!(
-                "fragment {fragment_id} referenced by an address-domain index result \
-                 was not found in the dataset"
-            ))
-        })?;
+        let Some(file_fragment) = dataset.get_fragment(*fragment_id as usize) else {
+            continue;
+        };
         let sequence = load_row_id_sequence(dataset, file_fragment.metadata()).await?;
 
         match selection {
@@ -116,55 +118,30 @@ pub(crate) async fn translate_addr_treemap_to_row_ids(
                 row_ids |= RowAddrTreeMap::from(sequence.as_ref());
             }
             RowAddrSelection::Partial(offsets) => {
-                let Some(max_offset) = offsets.max() else {
-                    continue;
-                };
-                let (deletion_vector, num_physical_rows) = futures::try_join!(
-                    file_fragment.get_deletion_vector(),
-                    file_fragment.physical_rows()
-                )?;
-                let num_physical_rows = u32::try_from(num_physical_rows).map_err(|_| {
-                    Error::internal(format!(
-                        "fragment_id={fragment_id} has num_physical_rows={num_physical_rows}, \
-                         which exceeds the maximum representable physical offset"
-                    ))
-                })?;
-                if max_offset >= num_physical_rows {
-                    return Err(Error::internal(format!(
-                        "fragment_id={fragment_id} selection has max_offset={max_offset}, \
-                         but num_physical_rows={num_physical_rows}"
-                    )));
-                }
-                let mut ids = sequence.iter();
-                for physical_offset in 0..num_physical_rows {
-                    if physical_offset > max_offset {
-                        break;
-                    }
+                let deletion_vector = file_fragment.get_deletion_vector().await?;
+                for physical_offset in offsets.iter() {
+                    // A deletion does not compact the row id sequence; the deleted row keeps
+                    // its slot (the deletion vector tracks it separately). So a physical offset
+                    // is a direct index into the sequence, regardless of any deletions below it.
+                    // A stale offset that points at a deleted row has no live counterpart and is
+                    // not part of any answer, so it contributes no id to the block/take set.
                     let deleted = deletion_vector
                         .as_ref()
                         .is_some_and(|dv| dv.contains(physical_offset));
                     if deleted {
                         continue;
                     }
-                    match ids.next() {
-                        Some(id) => {
-                            if offsets.contains(physical_offset) {
-                                row_ids.insert(id);
-                            }
-                        }
-                        // The sequence yields one id per live row, so it can only
-                        // run dry before `max_offset` if it holds fewer ids than the
-                        // fragment has live rows. Breaking would silently drop the
-                        // remaining selected offsets and let stale index results
-                        // escape masking, so treat the mismatch as corruption.
-                        None => {
-                            return Err(Error::internal(format!(
-                                "fragment_id={fragment_id} row-id sequence exhausted at \
-                                 physical_offset={physical_offset} before reaching \
-                                 max_offset={max_offset} (num_physical_rows={num_physical_rows})"
-                            )));
-                        }
-                    }
+                    // A selected offset with no sequence entry points past the fragment's rows.
+                    // Silently dropping it would let a stale index result escape masking, so
+                    // treat the mismatch as corruption.
+                    let id = sequence.get(physical_offset as usize).ok_or_else(|| {
+                        Error::internal(format!(
+                            "fragment_id={fragment_id} row-id sequence has no entry at \
+                             physical_offset={physical_offset} (sequence len={})",
+                            sequence.len()
+                        ))
+                    })?;
+                    row_ids.insert(id);
                 }
             }
         }
@@ -184,6 +161,33 @@ pub async fn row_addrs_to_row_ids(
     dataset: &Dataset,
     addrs: impl IntoIterator<Item = Option<u64>>,
 ) -> Result<Vec<Option<u64>>> {
+    row_addrs_to_row_ids_impl(dataset, addrs, DeletedRowBehavior::Include).await
+}
+
+/// Resolve physical row addresses to stable row ids only for live physical slots.
+///
+/// When stable row ids are enabled, missing fragments, out-of-range offsets,
+/// deleted physical slots, and `None` inputs yield `None`. This prevents a
+/// deleted slot's stable id from selecting a replacement row written by an
+/// update. Without stable row ids, the input is returned unchanged.
+pub(crate) async fn live_row_addrs_to_row_ids(
+    dataset: &Dataset,
+    addrs: impl IntoIterator<Item = Option<u64>>,
+) -> Result<Vec<Option<u64>>> {
+    row_addrs_to_row_ids_impl(dataset, addrs, DeletedRowBehavior::Exclude).await
+}
+
+#[derive(Clone, Copy)]
+enum DeletedRowBehavior {
+    Include,
+    Exclude,
+}
+
+async fn row_addrs_to_row_ids_impl(
+    dataset: &Dataset,
+    addrs: impl IntoIterator<Item = Option<u64>>,
+    deleted_row_behavior: DeletedRowBehavior,
+) -> Result<Vec<Option<u64>>> {
     let addrs: Vec<Option<u64>> = addrs.into_iter().collect();
     if !dataset.manifest.uses_stable_row_ids() {
         return Ok(addrs);
@@ -194,7 +198,7 @@ pub async fn row_addrs_to_row_ids(
     for (position, addr) in addrs.iter().enumerate() {
         if let Some(addr) = addr {
             positions_by_fragment
-                .entry((addr >> 32) as u32)
+                .entry(RowAddress::from(*addr).fragment_id())
                 .or_default()
                 .push(position);
         }
@@ -206,8 +210,18 @@ pub async fn row_addrs_to_row_ids(
             continue;
         };
         let sequence = load_row_id_sequence(dataset, fragment.metadata()).await?;
+        let deletion_vector = match deleted_row_behavior {
+            DeletedRowBehavior::Include => None,
+            DeletedRowBehavior::Exclude => fragment.get_deletion_vector().await?,
+        };
         for position in positions {
-            let offset = addrs[position].expect("grouped from Some") as u32;
+            let offset = RowAddress::from(addrs[position].expect("grouped from Some")).row_offset();
+            if deletion_vector
+                .as_ref()
+                .is_some_and(|deletions| deletions.contains(offset))
+            {
+                continue;
+            }
             ids[position] = sequence.get(offset as usize);
         }
     }
