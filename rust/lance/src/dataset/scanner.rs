@@ -1548,7 +1548,7 @@ impl Scanner {
     /// select *part* of a nested field — `meta` narrowed to just its `a` child.
     /// Expressions cannot express that, so a nested projection must come
     /// through here.
-    pub fn project_with_schema(
+    pub(crate) fn project_with_schema(
         &mut self,
         projection: &lance_core::datatypes::Schema,
     ) -> Result<&mut Self> {
