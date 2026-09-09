@@ -59,7 +59,10 @@ fn is_auto_managed(col: &str) -> bool {
 /// merges sibling leaves of one parent into a single field (`meta.a` +
 /// `meta.c` -> `meta: Struct<a, c>`). Fields come back in first-mention order
 /// of their top-level column.
-fn resolve_data_fields(data_names: &[String], base_schema: &SchemaRef) -> Result<Vec<Arc<Field>>> {
+pub(super) fn resolve_data_fields(
+    data_names: &[String],
+    base_schema: &SchemaRef,
+) -> Result<Vec<Arc<Field>>> {
     if data_names.is_empty() {
         return Ok(Vec::new());
     }
@@ -70,7 +73,7 @@ fn resolve_data_fields(data_names: &[String], base_schema: &SchemaRef) -> Result
 }
 
 /// Top-level column a (possibly dotted) projection name addresses.
-fn top_level_of(name: &str) -> Result<String> {
+pub(super) fn top_level_of(name: &str) -> Result<String> {
     parse_field_path(name)?
         .into_iter()
         .next()

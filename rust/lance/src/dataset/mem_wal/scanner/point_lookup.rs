@@ -22,6 +22,7 @@ use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::prelude::{Expr, SessionContext};
 use futures::TryStreamExt;
+use lance_arrow::RecordBatchExt;
 use lance_core::utils::bloomfilter::sbbf::Sbbf;
 use lance_core::{Result, is_system_column};
 use lance_datafusion::exec::OneShotExec;
@@ -989,6 +990,11 @@ fn resolve_position(
 /// Gather `rows` from `batch_store`'s batch `batch_idx` into the `target`
 /// schema. A single row is a zero-copy `slice` (the common point-lookup case);
 /// multiple rows use one vectorized `take` per column.
+///
+/// Columns are stored whole, so a nested projection (`meta.a` -> `meta:
+/// Struct<a>`) leaves the gathered array wider than `target`. Those columns are
+/// narrowed with one `project_by_schema` pass; a projection that selects only
+/// whole columns matches the stored types and skips it.
 fn gather_rows(
     batch_store: &BatchStore,
     batch_idx: usize,
@@ -1003,28 +1009,35 @@ fn gather_rows(
     // shared schema `Arc`, and under concurrency that refcount cache line
     // ping-pongs across cores. `schema_ref()` borrows it.
     let stored_schema = stored.data.schema_ref();
-    let cols: Vec<Arc<dyn Array>> = target
-        .fields()
-        .iter()
-        .map(|f| {
-            let idx = stored_schema.index_of(f.name()).map_err(|_| {
-                lance_core::Error::invalid_input(format!(
-                    "point-lookup projection column '{}' not found in memtable batch",
-                    f.name()
-                ))
-            })?;
-            let col = stored.data.column(idx);
-            // Single row: zero-copy `slice` (the common point-lookup case, and
-            // measurably faster than `take` — copying regressed single-thread
-            // ~30% with no N-thread gain). Multiple rows: one vectorized `take`.
-            match &indices {
-                None => Ok(col.slice(rows[0] as usize, 1)),
-                Some(idxs) => arrow_select::take::take(col.as_ref(), idxs, None)
-                    .map_err(lance_core::Error::from),
-            }
-        })
-        .collect::<Result<Vec<_>>>()?;
-    Ok(RecordBatch::try_new(target.clone(), cols)?)
+    let mut cols: Vec<Arc<dyn Array>> = Vec::with_capacity(target.fields().len());
+    let mut stored_fields: Vec<Arc<Field>> = Vec::with_capacity(target.fields().len());
+    let mut needs_narrowing = false;
+    for f in target.fields() {
+        let idx = stored_schema.index_of(f.name()).map_err(|_| {
+            lance_core::Error::invalid_input(format!(
+                "point-lookup projection column '{}' not found in memtable batch",
+                f.name()
+            ))
+        })?;
+        let stored_field = &stored_schema.fields()[idx];
+        needs_narrowing |= stored_field.data_type() != f.data_type();
+        stored_fields.push(stored_field.clone());
+        let col = stored.data.column(idx);
+        // Single row: zero-copy `slice` (the common point-lookup case, and
+        // measurably faster than `take` — copying regressed single-thread
+        // ~30% with no N-thread gain). Multiple rows: one vectorized `take`.
+        cols.push(match &indices {
+            None => col.slice(rows[0] as usize, 1),
+            Some(idxs) => arrow_select::take::take(col.as_ref(), idxs, None)?,
+        });
+    }
+    if !needs_narrowing {
+        return Ok(RecordBatch::try_new(target.clone(), cols)?);
+    }
+    // `needs_narrowing` implies at least one field, so the row count is
+    // recoverable from the columns.
+    let gathered = RecordBatch::try_new(Arc::new(Schema::new(stored_fields)), cols)?;
+    Ok(gathered.project_by_schema(target)?)
 }
 
 /// Probe one in-memory memtable for a single key and materialize the newest
@@ -1061,6 +1074,7 @@ fn probe_memtable(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_array::cast::AsArray;
     use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use datafusion::physical_plan::displayable;
@@ -1930,6 +1944,161 @@ mod tests {
         assert_eq!(names, vec!["name", "id"]);
         assert_eq!(name_at(&row), "v_20");
         assert_eq!(id_at(&row), 20);
+    }
+
+    /// `id` (PK) + `meta: Struct<a: Int64, b: Utf8>`, one row per id.
+    fn create_nested_schema() -> Arc<ArrowSchema> {
+        let mut id_metadata = HashMap::new();
+        id_metadata.insert(
+            "lance-schema:unenforced-primary-key".to_string(),
+            "true".to_string(),
+        );
+        Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(id_metadata),
+            Field::new("meta", DataType::Struct(nested_meta_fields()), true),
+        ]))
+    }
+
+    fn nested_meta_fields() -> arrow_schema::Fields {
+        arrow_schema::Fields::from(vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("b", DataType::Utf8, true),
+        ])
+    }
+
+    fn create_nested_batch(schema: &Arc<ArrowSchema>, ids: &[i32]) -> RecordBatch {
+        let a: Vec<i64> = ids.iter().map(|id| *id as i64 * 10).collect();
+        let b: Vec<String> = ids.iter().map(|id| format!("b_{}", id)).collect();
+        let meta = arrow_array::StructArray::new(
+            nested_meta_fields(),
+            vec![
+                Arc::new(arrow_array::Int64Array::from(a)) as Arc<dyn Array>,
+                Arc::new(StringArray::from(b)) as Arc<dyn Array>,
+            ],
+            None,
+        );
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(ids.to_vec())), Arc::new(meta)],
+        )
+        .unwrap()
+    }
+
+    fn nested_planner(schema: &Arc<ArrowSchema>, ids: &[i32]) -> LsmPointLookupPlanner {
+        use crate::dataset::mem_wal::scanner::collector::InMemoryMemTables;
+        let temp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp.path().to_str().unwrap());
+        let active = active_memtable_ref(schema, &[create_nested_batch(schema, ids)], 1);
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![])
+            .with_in_memory_memtables(
+                Uuid::new_v4(),
+                InMemoryMemTables {
+                    active,
+                    frozen: vec![],
+                },
+            );
+        LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema.clone()).unwrap()
+    }
+
+    /// The children `meta` carries in `batch`, in order.
+    fn meta_children(batch: &RecordBatch) -> Vec<String> {
+        let arrow_schema::DataType::Struct(fields) = batch
+            .schema()
+            .field_with_name("meta")
+            .unwrap()
+            .data_type()
+            .clone()
+        else {
+            panic!("meta is not a struct");
+        };
+        fields.iter().map(|f| f.name().clone()).collect()
+    }
+
+    /// A nested projection narrows the canonical schema to `meta: Struct<a>`,
+    /// but the memtable stores `meta` whole. The fast-path gather has to narrow
+    /// the stored column to match — handing the whole `Struct<a, b>` to
+    /// `RecordBatch::try_new` against a `Struct<a>` schema is a type error.
+    #[tokio::test]
+    async fn test_lookup_nested_projection_narrows_struct() {
+        let schema = create_nested_schema();
+        let planner = nested_planner(&schema, &[1, 2]);
+
+        let row = planner
+            .lookup(
+                &[ScalarValue::Int32(Some(1))],
+                Some(&["meta.a".to_string()]),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let row_schema = row.schema();
+        let names: Vec<&str> = row_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert_eq!(names, vec!["meta", "id"]);
+        assert_eq!(meta_children(&row), vec!["a"]);
+        assert_eq!(id_at(&row), 1);
+        let meta = row.column_by_name("meta").unwrap().as_struct();
+        assert_eq!(
+            meta.column_by_name("a")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow_array::Int64Array>()
+                .unwrap()
+                .value(0),
+            10
+        );
+    }
+
+    /// `lookup_many` reaches the same gather through the batched
+    /// group-by-source path, so it narrows identically.
+    #[tokio::test]
+    async fn test_lookup_many_nested_projection_narrows_struct() {
+        let schema = create_nested_schema();
+        let planner = nested_planner(&schema, &[1, 2]);
+
+        let batch = planner
+            .lookup_many(
+                &[ScalarValue::Int32(Some(1)), ScalarValue::Int32(Some(2))],
+                Some(&["meta.a".to_string()]),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(meta_children(&batch), vec!["a"]);
+        let a = batch
+            .column_by_name("meta")
+            .unwrap()
+            .as_struct()
+            .column_by_name("a")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .unwrap()
+            .clone();
+        let mut values: Vec<i64> = (0..batch.num_rows()).map(|i| a.value(i)).collect();
+        values.sort();
+        assert_eq!(values, vec![10, 20]);
+    }
+
+    /// Control for the two tests above: projecting the whole struct leaves the
+    /// stored column untouched, so the narrowing pass must stay skipped.
+    #[tokio::test]
+    async fn test_lookup_whole_struct_projection_passes_through() {
+        let schema = create_nested_schema();
+        let planner = nested_planner(&schema, &[1]);
+
+        let row = planner
+            .lookup(&[ScalarValue::Int32(Some(1))], Some(&["meta".to_string()]))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(meta_children(&row), vec!["a", "b"]);
     }
 
     #[tokio::test]
