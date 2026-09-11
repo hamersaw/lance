@@ -317,7 +317,7 @@ The manifest contains:
 - **WAL pointers**: `replay_after_wal_entry_position` and `wal_entry_position_last_seen`.
 - **SSTable generation state**: `current_generation` and `sstables`.
 - **Lifecycle state**: `status`, either `ACTIVE` or `SEALED`.
-- **Row id reservation**: `row_id_reservation`, present only on a shard that
+- **Row id reservations**: `row_id_reservations`, non-empty only on a shard that
   assigns stable row ids.
 
 `shard_field_entries` stores computed shard field values as raw Arrow scalar bytes keyed by `ShardingField.field_id`.
@@ -333,19 +333,25 @@ Recovery must still probe or list WAL files to find the actual tail.
 
 `current_generation` is the generation number to assign to the next SSTable created by flushing the MemTable.
 Each entry in `sstables` records a published SSTable's `generation` and `path`.
+On a shard that assigns stable row ids each entry also records `max_row_id`, the highest id held by any row of that generation, which is what lets a successor place a reserved range without reading the generation back.
+It is absent on a generation flushed before the field existed and on one holding nothing but tombstones, which carry no id.
 
 `status = SEALED` marks a reversible in-flight drop-table operation.
 Sealed shards refuse new writer claims.
 
-`row_id_reservation` records the half-open range of stable row ids the shard
-holds exclusively, taken with an `Operation::ReserveRowIds` commit against the
-base table and written here before any id is issued from it.
-A crash between the two leaks the chunk, which is harmless: ids need not be
-contiguous, and the base table's `next_row_id` has already moved past them.
+`row_id_reservations` records the half-open ranges of stable row ids the shard holds exclusively, each taken with an `Operation::ReserveRowIds` commit against the base table and written here before any id is issued from it.
+There is more than one because a shard reserves its next range in the background while still drawing from the current one.
+A crash between the two commits leaks that chunk, which is harmless: ids need not be contiguous, and the base table's `next_row_id` has already moved past them.
 
-The range is bound to the `writer_epoch` that took it.
-A successor must reserve a fresh range rather than resume one it finds on disk:
-two writers drawing from one range would assign duplicate ids.
+How far into a range the shard got is deliberately not recorded, because writing it would mean a manifest commit on every write.
+A successor derives the position instead, as the highest id inside any recorded range it can find across three places: the memtables its WAL replay rebuilt, the `max_row_id` of every generation in `sstables`, and the base fragments whose row ids overlap a range.
+The third is not redundant. A generation that compacted and then aged out of the retention window is in neither of the first two, and its ids are live in the base table.
+
+A shard draws from its oldest range and gives up that range's remainder as soon as a request outgrows it, so at most one range is ever partly consumed.
+That is what makes a single derived id sufficient: the range holding it resumes one past it, ranges below it are spent, and ranges above it were never drawn from.
+
+A successor that cannot read one of the three sources must abandon every range and reserve fresh, rather than resume a range whose position is uncertain.
+Abandoning costs ids, which are plentiful; two writers drawing from one range assign duplicate ids, which no later operation detects.
 
 The manifest is serialized as the `ShardManifest` protobuf message.
 
