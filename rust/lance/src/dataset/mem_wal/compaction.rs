@@ -31,7 +31,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
-use lance_core::utils::address::RowAddress;
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::{Error, Result};
 use lance_index::mem_wal::CompactedSsTable;
@@ -269,7 +268,6 @@ async fn validate_ids(
         let Some(address) = index.get(*id)? else {
             continue;
         };
-        let address = RowAddress::from(address);
         if !superseded.contains(u64::from(address)) {
             return Err(Error::invalid_input(format!(
                 "row id {id} is live in the base table at {address} and this commit does \
