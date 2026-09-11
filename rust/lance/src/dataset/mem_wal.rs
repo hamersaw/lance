@@ -33,6 +33,7 @@
 //! monotonically increasing writer epochs in the shard manifest.
 
 mod api;
+pub mod compaction;
 mod hnsw;
 pub mod index;
 mod manifest;
@@ -179,6 +180,7 @@ fn append_field_if_absent(
 }
 
 pub use api::{DatasetMemWalExt, InitializeMemWalBuilder, validate_maintained_indexes};
+pub use compaction::{PreAssignedRows, commit_preassigned_rows};
 pub use index::{MemIndexKind, MemTableVisibility};
 pub use manifest::ShardManifestStore;
 pub use memtable::scanner::MemTableScanner;
