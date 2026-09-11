@@ -210,6 +210,7 @@ impl ShardManifestStore {
             current_generation: 1,
             sstables: vec![],
             status: ShardStatus::Active,
+            row_id_reservation: None,
         };
 
         match self.write(&manifest).await {
@@ -513,6 +514,7 @@ impl ShardManifestStore {
                     wal_entry_position_last_seen: 0,
                     current_generation: 1,
                     sstables: vec![],
+                    row_id_reservation: None,
                     status: ShardStatus::Active,
                 }
             };
@@ -708,6 +710,7 @@ mod tests {
             current_generation: 1,
             sstables: vec![],
             status: ShardStatus::Active,
+            row_id_reservation: None,
         }
     }
 

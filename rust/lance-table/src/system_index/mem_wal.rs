@@ -225,6 +225,64 @@ impl ShardStatus {
     }
 }
 
+/// A half-open range of stable row ids a shard holds exclusively.
+///
+/// Taken with an [`crate::transaction::Operation::ReserveRowIds`] commit
+/// against the base dataset and persisted in the shard manifest *before* any id
+/// is issued from it, so a crash leaks the chunk rather than reissuing it.
+///
+/// `writer_epoch` binds the range to the writer that took it. A successor must
+/// re-reserve rather than resume a range it finds on disk: two writers drawing
+/// from one range mint duplicate ids, which is silent corruption.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
+pub struct RowIdReservation {
+    /// First id in the range that has not been issued yet.
+    pub next: u64,
+    /// One past the last id in the range; `next == end` means exhausted.
+    pub end: u64,
+    /// The writer epoch that committed the reservation.
+    pub writer_epoch: u64,
+}
+
+impl RowIdReservation {
+    /// Ids still available in this range.
+    pub fn remaining(&self) -> u64 {
+        self.end.saturating_sub(self.next)
+    }
+
+    /// Take `count` ids, returning the half-open range and advancing `next`.
+    /// `None` when the range cannot cover the request -- the caller reserves a
+    /// fresh chunk instead of splitting across two.
+    pub fn take(&mut self, count: u64) -> Option<std::ops::Range<u64>> {
+        if self.remaining() < count {
+            return None;
+        }
+        let start = self.next;
+        self.next += count;
+        Some(start..self.next)
+    }
+}
+
+impl From<&RowIdReservation> for pb::RowIdReservation {
+    fn from(r: &RowIdReservation) -> Self {
+        Self {
+            next: r.next,
+            end: r.end,
+            writer_epoch: r.writer_epoch,
+        }
+    }
+}
+
+impl From<pb::RowIdReservation> for RowIdReservation {
+    fn from(r: pb::RowIdReservation) -> Self {
+        Self {
+            next: r.next,
+            end: r.end,
+            writer_epoch: r.writer_epoch,
+        }
+    }
+}
+
 /// Shard manifest containing epoch-based fencing and WAL state.
 /// Each shard has exactly one active writer at any time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -253,6 +311,9 @@ pub struct ShardManifest {
     /// Lifecycle status (drop-table 2PC). Defaults to `Active`; preserved
     /// across claims via `..base` so only fresh constructions set it.
     pub status: ShardStatus,
+    /// Stable row ids this shard reserved and may still issue. `None` when the
+    /// shard has never reserved, or when stable row ids are off.
+    pub row_id_reservation: Option<RowIdReservation>,
 }
 
 impl ShardManifest {
@@ -270,6 +331,7 @@ impl DeepSizeOf for ShardManifest {
     fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.shard_field_values.deep_size_of_children(context)
             + self.sstables.deep_size_of_children(context)
+            + self.row_id_reservation.deep_size_of_children(context)
     }
 }
 
@@ -293,6 +355,7 @@ impl From<&ShardManifest> for pb::ShardManifest {
             current_generation: rm.current_generation,
             sstables: rm.sstables.iter().map(|sstable| sstable.into()).collect(),
             status: rm.status.to_i32(),
+            row_id_reservation: rm.row_id_reservation.as_ref().map(Into::into),
         }
     }
 }
@@ -322,6 +385,7 @@ impl TryFrom<pb::ShardManifest> for ShardManifest {
             current_generation: rm.current_generation,
             sstables: rm.sstables.into_iter().map(SsTable::from).collect(),
             status: ShardStatus::from_i32(rm.status),
+            row_id_reservation: rm.row_id_reservation.map(RowIdReservation::from),
         })
     }
 }

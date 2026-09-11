@@ -748,6 +748,31 @@ message ShardManifest {
    * (drop-table 2PC). A SEALED manifest refuses claims at claim_epoch.
    */
   ShardStatus status = 15;
+
+  /* Stable row ids this shard has reserved from the base dataset and may
+   * still hand out. Absent when the shard has never reserved, or when the
+   * feature is off.
+   */
+  optional RowIdReservation row_id_reservation = 16;
+}
+
+/* A half-open range of stable row ids a shard holds exclusively, taken with an
+ * Operation::ReserveRowIds commit against the base dataset and persisted here
+ * before any id is issued from it.
+ *
+ * Bound to the writer epoch that took it: a new epoch must re-reserve rather
+ * than resume a range it finds on disk, because two writers drawing from one
+ * range would mint duplicate ids.
+ */
+message RowIdReservation {
+  // First id in the range that has not been issued yet.
+  uint64 next = 1;
+
+  // One past the last id in the range. `next == end` means exhausted.
+  uint64 end = 2;
+
+  // The writer epoch that committed the reservation.
+  uint64 writer_epoch = 3;
 }
 
 // A shard field value stored as raw Arrow scalar bytes.
