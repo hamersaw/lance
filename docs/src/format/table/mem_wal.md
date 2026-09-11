@@ -204,6 +204,30 @@ Tombstone rows follow the same forward row ordering and deletion-vector rules as
 If the newest row for a primary key is a tombstone, the deletion vector keeps that tombstone row and hides older rows for the key.
 Read planning then filters `_tombstone = false`, so the key is absent from query results.
 
+### Stable Row Id Rows
+
+A shard opened with `enable_row_ids` carries an internal `__wal_row_id` column
+alongside `_tombstone`, holding the stable row id of the row.
+
+The id is resolved on the write path and injected before the WAL append, so the
+log entry carries it and a replay reproduces it unchanged.
+Nothing downstream assigns one: the MemTable, the flush, the SSTable and
+compaction all carry it through.
+Compaction writes the surviving rows as a fragment whose `row_id_meta` already
+holds these ids, so the table's own row-id assignment skips them.
+
+The column is nullable because a tombstone carries no id.
+A delete marker exists only to shadow a primary key, and compaction resolves the
+base row it supersedes by key rather than by id.
+Read planning surfaces the column as `_rowid` when a query projects it, and
+strips it otherwise; the `_tombstone = false` filter has already removed every
+row that can hold a null there.
+
+A shard must be drained of SSTables before the feature is enabled on it.
+SSTables written before the column existed are not supported: a query projecting
+`_rowid` over one is refused rather than answered with nulls, because a null
+there is indistinguishable from a row that legitimately has no id.
+
 ### SSTable Primary-Key Sidecars
 
 Primary-key MemTables maintain an implicit BTree for primary-key deduplication, independent of `maintained_indexes`.
@@ -293,6 +317,8 @@ The manifest contains:
 - **WAL pointers**: `replay_after_wal_entry_position` and `wal_entry_position_last_seen`.
 - **SSTable generation state**: `current_generation` and `sstables`.
 - **Lifecycle state**: `status`, either `ACTIVE` or `SEALED`.
+- **Row id reservation**: `row_id_reservation`, present only on a shard that
+  assigns stable row ids.
 
 `shard_field_entries` stores computed shard field values as raw Arrow scalar bytes keyed by `ShardingField.field_id`.
 The matching `ShardingField.result_type` determines how to decode each value.
@@ -310,6 +336,16 @@ Each entry in `sstables` records a published SSTable's `generation` and `path`.
 
 `status = SEALED` marks a reversible in-flight drop-table operation.
 Sealed shards refuse new writer claims.
+
+`row_id_reservation` records the half-open range of stable row ids the shard
+holds exclusively, taken with an `Operation::ReserveRowIds` commit against the
+base table and written here before any id is issued from it.
+A crash between the two leaks the chunk, which is harmless: ids need not be
+contiguous, and the base table's `next_row_id` has already moved past them.
+
+The range is bound to the `writer_epoch` that took it.
+A successor must reserve a fresh range rather than resume one it finds on disk:
+two writers drawing from one range would assign duplicate ids.
 
 The manifest is serialized as the `ShardManifest` protobuf message.
 
