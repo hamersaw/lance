@@ -494,10 +494,10 @@ impl LsmFtsSearchPlanner {
     ///
     /// # Arguments
     ///
-    /// * `column` — text column to search.
     /// * `query` — the FTS query (match / phrase / boolean / fuzzy for
     ///   base/SSTable Lance sources; the active memtable currently
-    ///   supports `MatchQuery`).
+    ///   supports `MatchQuery`). It names the columns to search; bind them
+    ///   with [`FullTextSearchQuery::with_columns`] if they arrive separately.
     /// * `limit` — optional global top-k to return.
     /// * `projection` — user columns to project. PK columns are
     ///   auto-included; `_score` is always appended.
@@ -505,22 +505,34 @@ impl LsmFtsSearchPlanner {
     /// Each source is scored independently (local BM25), normalized to a
     /// canonical schema, unioned, and merged by `_score` DESC. When a finite
     /// limit is supplied, top-k caps are pushed into each partition.
-    #[instrument(
-        name = "lsm_fts_search",
-        level = "info",
-        skip_all,
-        fields(column = %column, limit)
-    )]
+    #[instrument(name = "lsm_fts_search", level = "info", skip_all, fields(limit))]
     pub async fn plan_search(
         &self,
-        column: &str,
         query: FullTextSearchQuery,
         limit: Option<usize>,
         projection: Option<&[String]>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        // The query is the only source of the columns to search. Unlike the base
+        // scanner, this planner cannot fill them in from the dataset's indexes:
+        // the fresh tier may carry no base table at all, and a memtable's
+        // inverted indexes are built on demand rather than declared up front, so
+        // there is no authoritative set to enumerate.
+        if query.query.is_missing_column() {
+            return Err(Error::invalid_input(
+                "LSM full-text search requires the query to name the columns to search; \
+                 bind them with `FullTextSearchQuery::with_columns` before planning"
+                    .to_string(),
+            ));
+        }
+
         let Some(per_column) = cross_column_targets(&query.query)? else {
+            // `cross_column_targets` returns `None` only for a query naming at
+            // most one column, and the guard above rules out naming none.
+            let column = query.columns().into_iter().next().ok_or_else(|| {
+                Error::internal("full-text query names no column after the bound check".to_string())
+            })?;
             return self
-                .plan_single_column_search(column, query, limit, projection)
+                .plan_single_column_search(&column, query, limit, projection)
                 .await;
         };
 
@@ -1182,8 +1194,9 @@ mod tests {
         let projection = vec!["missing".to_string()];
         let err = planner
             .plan_search(
-                "text",
-                FullTextSearchQuery::new("lance".to_string()),
+                FullTextSearchQuery::new("lance".to_string())
+                    .with_column("text".to_string())
+                    .unwrap(),
                 Some(1),
                 Some(&projection),
             )
@@ -1264,7 +1277,11 @@ mod tests {
         ));
 
         let error = planner
-            .plan_search("text", query, Some(1), None)
+            .plan_search(
+                query.with_column("text".to_string()).unwrap(),
+                Some(1),
+                None,
+            )
             .await
             .unwrap_err();
         assert!(error.to_string().contains("has no List layer"), "{error}");
@@ -1337,10 +1354,11 @@ mod tests {
         let projection = vec!["id".to_string()];
         let plan = planner
             .plan_search(
-                "tags",
                 FullTextSearchQuery::new_query(IndexFtsQuery::Match(MatchQuery::new(
                     "beta".to_string(),
-                ))),
+                )))
+                .with_column("tags".to_string())
+                .unwrap(),
                 Some(10),
                 Some(&projection),
             )
@@ -1468,10 +1486,11 @@ mod tests {
         let projection = vec!["id".to_string()];
         let plan = planner
             .plan_search(
-                "tags",
                 FullTextSearchQuery::new_query(IndexFtsQuery::Match(MatchQuery::new(
                     "beta".to_string(),
-                ))),
+                )))
+                .with_column("tags".to_string())
+                .unwrap(),
                 Some(10),
                 Some(&projection),
             )
@@ -1575,8 +1594,9 @@ mod tests {
         let planner = LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], schema);
         let plan = planner
             .plan_search(
-                "text",
-                FullTextSearchQuery::new("lance".to_string()),
+                FullTextSearchQuery::new("lance".to_string())
+                    .with_column("text".to_string())
+                    .unwrap(),
                 Some(10),
                 None,
             )
@@ -1683,8 +1703,9 @@ mod tests {
             .with_filter(Some(col("id").gt_eq(lit(2i32))));
         let plan = planner
             .plan_search(
-                "text",
-                FullTextSearchQuery::new("lance".to_string()),
+                FullTextSearchQuery::new("lance".to_string())
+                    .with_column("text".to_string())
+                    .unwrap(),
                 Some(10),
                 None,
             )
@@ -1782,8 +1803,9 @@ mod tests {
             .with_overfetch_factor(2.0);
         let plan = planner
             .plan_search(
-                "text",
-                FullTextSearchQuery::new("lance".to_string()),
+                FullTextSearchQuery::new("lance".to_string())
+                    .with_column("text".to_string())
+                    .unwrap(),
                 Some(1),
                 None,
             )
@@ -1868,8 +1890,9 @@ mod tests {
 
         let plan = planner
             .plan_search(
-                "text",
-                FullTextSearchQuery::new("lance".to_string()),
+                FullTextSearchQuery::new("lance".to_string())
+                    .with_column("text".to_string())
+                    .unwrap(),
                 Some(1),
                 None,
             )
@@ -1969,8 +1992,9 @@ mod tests {
 
         let plan = planner
             .plan_search(
-                "text",
-                FullTextSearchQuery::new("lance".to_string()),
+                FullTextSearchQuery::new("lance".to_string())
+                    .with_column("text".to_string())
+                    .unwrap(),
                 Some(10),
                 None,
             )
@@ -2040,8 +2064,9 @@ mod tests {
             .with_filter(Some(col("id").gt_eq(lit(1i32))));
         let plan = planner
             .plan_search(
-                "text",
-                FullTextSearchQuery::new("lance".to_string()),
+                FullTextSearchQuery::new("lance".to_string())
+                    .with_column("text".to_string())
+                    .unwrap(),
                 Some(2),
                 None,
             )
@@ -2113,7 +2138,11 @@ mod tests {
         ));
 
         let err = planner
-            .plan_search("text", query, Some(10), None)
+            .plan_search(
+                query.with_column("text".to_string()).unwrap(),
+                Some(10),
+                None,
+            )
             .await
             .expect_err("fuzzy AND should be rejected consistently");
         assert!(
@@ -2161,7 +2190,11 @@ mod tests {
             vec![(Occur::Must, MatchQuery::new("lance".to_string()).into())],
         )));
         let plan = planner
-            .plan_search("text", query, Some(10), Some(&["id".to_string()]))
+            .plan_search(
+                query.with_column("text".to_string()).unwrap(),
+                Some(10),
+                Some(&["id".to_string()]),
+            )
             .await
             .expect("base-only boolean query should be delegated to dataset scanner");
         let ctx = datafusion::prelude::SessionContext::new();
@@ -2247,7 +2280,11 @@ mod tests {
             vec![(Occur::Must, MatchQuery::new("lance".to_string()).into())],
         )));
         let plan = planner
-            .plan_search("text", query, Some(10), Some(&["id".to_string()]))
+            .plan_search(
+                query.with_column("text".to_string()).unwrap(),
+                Some(10),
+                Some(&["id".to_string()]),
+            )
             .await
             .expect("an unmaintained column must be indexed for the query, not skipped");
         let ctx = datafusion::prelude::SessionContext::new();
@@ -2342,7 +2379,11 @@ mod tests {
                 (Occur::MustNot, leaf("beta")),
             ])));
         let plan = planner
-            .plan_search("text", query, Some(10), Some(&["id".to_string()]))
+            .plan_search(
+                query.with_column("text".to_string()).unwrap(),
+                Some(10),
+                Some(&["id".to_string()]),
+            )
             .await
             .expect("an active memtable with an FTS index must serve a boolean query");
         let ctx = datafusion::prelude::SessionContext::new();
@@ -2435,7 +2476,11 @@ mod tests {
             "lance".to_string(),
         )));
         let plan = planner
-            .plan_search("text", query, Some(10), Some(&["id".to_string()]))
+            .plan_search(
+                query.with_column("text".to_string()).unwrap(),
+                Some(10),
+                Some(&["id".to_string()]),
+            )
             .await
             .unwrap();
         let ctx = datafusion::prelude::SessionContext::new();
@@ -2523,7 +2568,11 @@ mod tests {
             "lance rocks".to_string(),
         )));
         let plan = planner
-            .plan_search("text", query, Some(10), Some(&["id".to_string()]))
+            .plan_search(
+                query.with_column("text".to_string()).unwrap(),
+                Some(10),
+                Some(&["id".to_string()]),
+            )
             .await
             .unwrap();
         let ctx = datafusion::prelude::SessionContext::new();
@@ -2678,7 +2727,11 @@ mod tests {
                 .with_document_granularity(DocumentGranularity::ListElement),
         ));
         let plan = planner
-            .plan_search("tags", query, Some(10), Some(&["id".to_string()]))
+            .plan_search(
+                query.with_column("tags".to_string()).unwrap(),
+                Some(10),
+                Some(&["id".to_string()]),
+            )
             .await
             .unwrap();
         let ctx = datafusion::prelude::SessionContext::new();
@@ -2736,7 +2789,11 @@ mod tests {
             "lance".to_string(),
         )));
         let plan = planner
-            .plan_search("text", query, Some(10), Some(&["id".to_string()]))
+            .plan_search(
+                query.with_column("text".to_string()).unwrap(),
+                Some(10),
+                Some(&["id".to_string()]),
+            )
             .await
             .unwrap();
         let ctx = datafusion::prelude::SessionContext::new();
@@ -2798,7 +2855,7 @@ mod tests {
             .unwrap(),
         ));
         let plan = planner
-            .plan_search("title", query, Some(10), Some(&["id".to_string()]))
+            .plan_search(query, Some(10), Some(&["id".to_string()]))
             .await
             .expect("a cross-column multi-match must plan");
         let ctx = datafusion::prelude::SessionContext::new();
@@ -2885,7 +2942,7 @@ mod tests {
             .unwrap(),
         ));
         let plan = planner
-            .plan_search("title", query, Some(2), Some(&["id".to_string()]))
+            .plan_search(query, Some(2), Some(&["id".to_string()]))
             .await
             .unwrap();
         let ctx = datafusion::prelude::SessionContext::new();
@@ -2915,6 +2972,32 @@ mod tests {
         assert_eq!(distinct.len(), 2, "rows must be distinct, got {ids:?}");
     }
 
+    /// The query is the only source of the columns to search, so an unbound one
+    /// is a caller error rather than something to fill in from the sources: the
+    /// fresh tier may carry no base table, and a memtable's inverted indexes are
+    /// built on demand rather than declared up front.
+    #[tokio::test]
+    async fn unbound_query_columns_are_refused() {
+        let schema = fts_schema();
+        let tmp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![]);
+        let planner = LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], schema);
+
+        let err = planner
+            .plan_search(
+                FullTextSearchQuery::new("lance".to_string()),
+                Some(10),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("name the columns to search"),
+            "unexpected unbound-column error: {err}"
+        );
+    }
+
     /// Without a primary key there is no identity to collapse field hits by, so
     /// the query is refused rather than returning one row per matching field.
     #[tokio::test]
@@ -2934,7 +3017,7 @@ mod tests {
             .unwrap(),
         ));
         let err = planner
-            .plan_search("title", query, Some(10), Some(&["id".to_string()]))
+            .plan_search(query, Some(10), Some(&["id".to_string()]))
             .await
             .unwrap_err();
         assert!(
@@ -2966,7 +3049,7 @@ mod tests {
             .with_document_granularity(DocumentGranularity::ListElement);
         let query = FullTextSearchQuery::new_query(IndexFtsQuery::MultiMatch(multi));
         let err = planner
-            .plan_search("title", query, Some(10), Some(&["id".to_string()]))
+            .plan_search(query, Some(10), Some(&["id".to_string()]))
             .await
             .unwrap_err();
         assert!(
@@ -3065,7 +3148,7 @@ mod tests {
             .unwrap(),
         ));
         let err = planner
-            .plan_search("tags", query, Some(10), Some(&["id".to_string()]))
+            .plan_search(query, Some(10), Some(&["id".to_string()]))
             .await
             .unwrap_err();
         assert!(
@@ -3098,7 +3181,7 @@ mod tests {
                 (Occur::Must, leaf("beta", "body")),
             ])));
         let err = planner
-            .plan_search("title", query, Some(10), Some(&["id".to_string()]))
+            .plan_search(query, Some(10), Some(&["id".to_string()]))
             .await
             .unwrap_err();
         assert!(
@@ -3108,7 +3191,7 @@ mod tests {
     }
 
     /// The base arm must apply the filter as a true *prefilter*, not a
-    /// post-filter on the BM25 top-k.""""""""" With `k = 1` and the higher-scoring base
+    /// post-filter on the BM25 top-k. With `k = 1` and the higher-scoring base
     /// doc failing the predicate, a post-filter would return zero rows; a
     /// prefilter restricts BM25 to matching rows and returns the lower-scoring
     /// match. Regression for a missing `scanner.prefilter(true)` on the base arm.
@@ -3154,8 +3237,9 @@ mod tests {
             .with_filter(Some(col("id").gt_eq(lit(2i32))));
         let plan = planner
             .plan_search(
-                "text",
-                FullTextSearchQuery::new("lance".to_string()),
+                FullTextSearchQuery::new("lance".to_string())
+                    .with_column("text".to_string())
+                    .unwrap(),
                 Some(1),
                 None,
             )
@@ -3246,8 +3330,9 @@ mod tests {
             .with_filter(Some(col("status").eq(lit("active"))));
         let plan = planner
             .plan_search(
-                "text",
-                FullTextSearchQuery::new("lance".to_string()),
+                FullTextSearchQuery::new("lance".to_string())
+                    .with_column("text".to_string())
+                    .unwrap(),
                 Some(1),
                 None,
             )
@@ -3339,8 +3424,9 @@ mod tests {
             .with_filter(Some(col("status").eq(lit("active"))));
         let plan = planner
             .plan_search(
-                "text",
-                FullTextSearchQuery::new("lance".to_string()),
+                FullTextSearchQuery::new("lance".to_string())
+                    .with_column("text".to_string())
+                    .unwrap(),
                 Some(1),
                 None,
             )
@@ -3447,8 +3533,9 @@ mod tests {
             .with_filter(Some(col("status").eq(lit("active"))));
         let plan = planner
             .plan_search(
-                "text",
-                FullTextSearchQuery::new("lance".to_string()),
+                FullTextSearchQuery::new("lance".to_string())
+                    .with_column("text".to_string())
+                    .unwrap(),
                 Some(10),
                 None,
             )
@@ -3558,8 +3645,9 @@ mod tests {
             .with_filter(Some(col("status").eq(lit("active"))));
         let plan = planner
             .plan_search(
-                "text",
-                FullTextSearchQuery::new("lance".to_string()),
+                FullTextSearchQuery::new("lance".to_string())
+                    .with_column("text".to_string())
+                    .unwrap(),
                 Some(10),
                 None,
             )
@@ -3632,8 +3720,9 @@ mod tests {
         let planner = LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], schema);
         let plan = planner
             .plan_search(
-                "text",
-                FullTextSearchQuery::new("lance".to_string()),
+                FullTextSearchQuery::new("lance".to_string())
+                    .with_column("text".to_string())
+                    .unwrap(),
                 Some(10),
                 None,
             )
@@ -3719,7 +3808,7 @@ mod tests {
                 .with_column(Some("text".to_string())),
         ));
         let plan = planner
-            .plan_search("text", query, Some(10), None)
+            .plan_search(query, Some(10), None)
             .await
             .expect("planner should produce an active-only plan");
 
@@ -3794,8 +3883,9 @@ mod tests {
         let planner = LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], schema);
         let plan = planner
             .plan_search(
-                "text",
-                FullTextSearchQuery::new("lance".to_string()),
+                FullTextSearchQuery::new("lance".to_string())
+                    .with_column("text".to_string())
+                    .unwrap(),
                 Some(10),
                 None,
             )
@@ -3887,8 +3977,9 @@ mod tests {
         let planner = LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], schema);
         let plan = planner
             .plan_search(
-                "text",
-                FullTextSearchQuery::new("alpha".to_string()),
+                FullTextSearchQuery::new("alpha".to_string())
+                    .with_column("text".to_string())
+                    .unwrap(),
                 Some(10),
                 None,
             )
@@ -3979,8 +4070,9 @@ mod tests {
         let planner = LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], schema);
         let plan = planner
             .plan_search(
-                "text",
-                FullTextSearchQuery::new("alpha".to_string()),
+                FullTextSearchQuery::new("alpha".to_string())
+                    .with_column("text".to_string())
+                    .unwrap(),
                 Some(10),
                 None,
             )
