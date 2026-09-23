@@ -158,6 +158,9 @@ pub enum FtsQueryExpr {
         prefix_length: u32,
         /// Maximum number of terms to expand to.
         max_expansions: usize,
+        /// How the expanded terms combine: `Or` unions every expansion, `And`
+        /// requires a match from each query term's own expansions.
+        operator: Operator,
         /// Boost factor applied to the score (default 1.0).
         boost: f32,
     },
@@ -302,6 +305,7 @@ impl FtsQueryExpr {
             fuzziness: None,
             prefix_length: 0,
             max_expansions: DEFAULT_MAX_EXPANSIONS,
+            operator: Operator::Or,
             boost: 1.0,
         }
     }
@@ -313,6 +317,7 @@ impl FtsQueryExpr {
             fuzziness: Some(fuzziness),
             prefix_length: 0,
             max_expansions: DEFAULT_MAX_EXPANSIONS,
+            operator: Operator::Or,
             boost: 1.0,
         }
     }
@@ -329,6 +334,7 @@ impl FtsQueryExpr {
             fuzziness,
             prefix_length,
             max_expansions,
+            operator: Operator::Or,
             boost: 1.0,
         }
     }
@@ -350,6 +356,42 @@ impl FtsQueryExpr {
             positive: Box::new(positive),
             negative: Some(Box::new(negative)),
             negative_boost,
+        }
+    }
+
+    /// Set how a `Match` or `Fuzzy` leaf combines its terms; compound shapes
+    /// carry no operator and are returned unchanged.
+    pub fn with_operator(self, operator: Operator) -> Self {
+        match self {
+            Self::Match {
+                column,
+                query,
+                boost,
+                ..
+            } => Self::Match {
+                column,
+                query,
+                operator,
+                boost,
+            },
+            Self::Fuzzy {
+                column,
+                query,
+                fuzziness,
+                prefix_length,
+                max_expansions,
+                boost,
+                ..
+            } => Self::Fuzzy {
+                column,
+                query,
+                fuzziness,
+                prefix_length,
+                max_expansions,
+                operator,
+                boost,
+            },
+            other => other,
         }
     }
 
@@ -383,6 +425,7 @@ impl FtsQueryExpr {
                 fuzziness,
                 prefix_length,
                 max_expansions,
+                operator,
                 ..
             } => Self::Fuzzy {
                 column,
@@ -390,6 +433,7 @@ impl FtsQueryExpr {
                 fuzziness,
                 prefix_length,
                 max_expansions,
+                operator,
                 boost,
             },
             // Compound nodes don't carry a top-level boost field today.
@@ -427,6 +471,7 @@ impl FtsQueryExpr {
                 fuzziness,
                 prefix_length,
                 max_expansions,
+                operator,
                 boost,
                 ..
             } => Self::Fuzzy {
@@ -435,6 +480,7 @@ impl FtsQueryExpr {
                 fuzziness,
                 prefix_length,
                 max_expansions,
+                operator,
                 boost,
             },
             other @ (Self::Boolean { .. } | Self::Boost { .. } | Self::MultiMatch { .. }) => other,
@@ -2054,7 +2100,15 @@ impl FtsMemIndex {
     ) -> Vec<FtsEntry> {
         let st = self.state.load_full();
         let tokens = self.tokenize_for_search(query);
-        self.search_fuzzy_tokens(&st, &tokens, fuzziness, 0, max_expansions, true)
+        self.search_fuzzy_tokens(
+            &st,
+            &tokens,
+            Operator::Or,
+            fuzziness,
+            0,
+            max_expansions,
+            true,
+        )
     }
 
     /// BM25 OR-search over the query tokens, scored with one corpus-wide
@@ -2228,8 +2282,27 @@ impl FtsMemIndex {
         include_tail: bool,
         tail_skip: bool,
     ) -> Vec<FtsEntry> {
+        self.search_groups_and(
+            st,
+            query_position_groups(query_tokens),
+            limit,
+            include_tail,
+            tail_skip,
+        )
+    }
+
+    /// Conjunction over term groups: a document must match at least one term of
+    /// every group, and its score is the sum of the per-group OR scores.
+    fn search_groups_and(
+        &self,
+        st: &IndexState,
+        groups: Vec<Vec<String>>,
+        limit: Option<usize>,
+        include_tail: bool,
+        tail_skip: bool,
+    ) -> Vec<FtsEntry> {
         let mut result_map: Option<HashMap<DocumentKey, f32>> = None;
-        for group in query_position_groups(query_tokens) {
+        for group in groups {
             let group_results =
                 self.search_match_strings(st, &group, Operator::Or, None, include_tail, tail_skip);
             let group_map = group_results
@@ -2393,10 +2466,18 @@ impl FtsMemIndex {
         results
     }
 
+    /// Fuzzy search: each query token expands to the dictionary terms within
+    /// its edit distance, then the expansions combine per `operator`. `Or` is
+    /// one BM25 OR-search over every expansion. `And` treats each token's
+    /// expansions as one group and keeps the documents matched by every group,
+    /// summing the group scores exactly like [`Self::search_grouped_and`] does
+    /// for exact terms, so a fuzzy conjunction ranks the way a plain one does.
+    #[allow(clippy::too_many_arguments)]
     fn search_fuzzy_tokens(
         &self,
         st: &IndexState,
         tokens: &[String],
+        operator: Operator,
         fuzziness: Option<u32>,
         prefix_length: u32,
         max_expansions: usize,
@@ -2405,10 +2486,11 @@ impl FtsMemIndex {
         if tokens.is_empty() {
             return Vec::new();
         }
-        let mut expanded: Vec<String> = Vec::new();
-        let mut seen: HashSet<String> = HashSet::new();
+        let mut groups: Vec<Vec<String>> = Vec::with_capacity(tokens.len());
         for tok in tokens {
             let max_dist = fuzziness.unwrap_or_else(|| auto_fuzziness(tok));
+            let mut group: Vec<String> = Vec::new();
+            let mut seen: HashSet<String> = HashSet::new();
             for (matched, _) in self.expand_fuzzy_term(
                 st,
                 tok,
@@ -2418,14 +2500,31 @@ impl FtsMemIndex {
                 include_tail,
             ) {
                 if seen.insert(matched.clone()) {
-                    expanded.push(matched);
+                    group.push(matched);
                 }
             }
+            // A term nothing is within distance of can never be satisfied, so
+            // neither can a conjunction that requires it.
+            if group.is_empty() && operator == Operator::And {
+                return Vec::new();
+            }
+            groups.push(group);
         }
-        if expanded.is_empty() {
-            return Vec::new();
+        match operator {
+            Operator::And => self.search_groups_and(st, groups, None, include_tail, true),
+            Operator::Or => {
+                let mut seen: HashSet<String> = HashSet::new();
+                let expanded: Vec<String> = groups
+                    .into_iter()
+                    .flatten()
+                    .filter(|term| seen.insert(term.clone()))
+                    .collect();
+                if expanded.is_empty() {
+                    return Vec::new();
+                }
+                self.search_match_strings(st, &expanded, Operator::Or, None, include_tail, true)
+            }
         }
-        self.search_match_strings(st, &expanded, Operator::Or, None, include_tail, true)
     }
 
     /// Expand `term` against the term dictionaries of every partition (and the
@@ -2564,6 +2663,7 @@ impl FtsMemIndex {
                 fuzziness,
                 prefix_length,
                 max_expansions,
+                operator,
                 boost,
                 ..
             } => {
@@ -2571,6 +2671,7 @@ impl FtsMemIndex {
                 let mut results = self.search_fuzzy_tokens(
                     st,
                     &tokens,
+                    *operator,
                     *fuzziness,
                     *prefix_length,
                     *max_expansions,
@@ -6170,6 +6271,37 @@ mod tests {
 
         let entries = index.search_fuzzy("alpho", None, 50);
         assert!(!entries.is_empty());
+    }
+
+    /// `alpho beta` at distance 1: the first token expands to `alpha` and
+    /// `alpho`, the second to `beta` and `zeta`. AND keeps the rows that carry
+    /// one term from each group and drops the rows matching a single group.
+    #[test]
+    fn test_search_fuzzy_and_requires_every_term() {
+        let schema = create_test_schema();
+        let index = FtsMemIndex::new(1, "description".to_string());
+        index.insert(&create_fuzzy_test_batch(&schema), 0).unwrap();
+        let st = index.state.load_full();
+        let tokens = ["alpho".to_string(), "beta".to_string()];
+        let rows = |operator: Operator| {
+            let mut rows: Vec<RowPosition> = index
+                .search_fuzzy_tokens(&st, &tokens, operator, Some(1), 0, 50, true)
+                .into_iter()
+                .map(|entry| entry.row_position)
+                .collect();
+            rows.sort_unstable();
+            rows
+        };
+        assert_eq!(rows(Operator::And), vec![0, 1]);
+        assert_eq!(rows(Operator::Or), vec![0, 1, 2, 3]);
+
+        // A term that expands to nothing empties the conjunction.
+        let unmatched = ["alpho".to_string(), "xyz".to_string()];
+        assert!(
+            index
+                .search_fuzzy_tokens(&st, &unmatched, Operator::And, Some(1), 0, 50, true)
+                .is_empty()
+        );
     }
 
     #[test]

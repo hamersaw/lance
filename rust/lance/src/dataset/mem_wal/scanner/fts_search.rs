@@ -50,7 +50,7 @@ use datafusion::prelude::Expr;
 use lance_core::{Error, Result, is_system_column};
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::InvertedIndexParams;
-use lance_index::scalar::inverted::query::{FtsQuery as IndexFtsQuery, Operator};
+use lance_index::scalar::inverted::query::FtsQuery as IndexFtsQuery;
 use lance_index::scalar::inverted::{DOC_INDEX_COL, DOC_INDEX_FIELD, DocumentGranularity};
 use tracing::instrument;
 
@@ -220,14 +220,7 @@ fn validate_source_document_granularities(
 fn validate_lsm_fts_query(query: &FullTextSearchQuery) -> Result<()> {
     fn visit(query: &IndexFtsQuery) -> Result<()> {
         match query {
-            IndexFtsQuery::Match(m) => {
-                if m.fuzziness != Some(0) && m.operator != Operator::Or {
-                    return Err(Error::not_supported(
-                        "LSM fuzzy full-text search only supports OR match operators".to_string(),
-                    ));
-                }
-                Ok(())
-            }
+            IndexFtsQuery::Match(_) => Ok(()),
             IndexFtsQuery::Phrase(_) => Ok(()),
             IndexFtsQuery::Boost(b) => {
                 visit(&b.positive)?;
@@ -2264,8 +2257,11 @@ mod tests {
         );
     }
 
+    /// A fuzzy conjunction reaches the active memtable and requires every term:
+    /// `lanse memwal` at distance 1 keeps the row carrying both words and drops
+    /// the one carrying only `lance`.
     #[tokio::test]
-    async fn fuzzy_and_query_is_rejected_when_active_memtable_is_present() {
+    async fn fuzzy_and_query_is_served_by_the_active_memtable() {
         use lance_index::scalar::inverted::query::{
             FtsQuery as IndexFtsQuery, MatchQuery, Operator,
         };
@@ -2274,7 +2270,7 @@ mod tests {
         let batch_store = Arc::new(BatchStore::with_capacity(16));
         let mut indexes = IndexStore::new();
         indexes.add_fts("text_fts".to_string(), 1, "text".to_string());
-        let active_batch = make_batch(&schema, &[1], &["lance memwal"]);
+        let active_batch = make_batch(&schema, &[1, 2], &["lance memwal", "lance other"]);
         let (_, row_offset, batch_position) = batch_store.append(active_batch.clone()).unwrap();
         indexes
             .insert_with_batch_position(&active_batch, row_offset, Some(batch_position))
@@ -2298,22 +2294,39 @@ mod tests {
             );
         let planner = LsmFtsSearchPlanner::new(collector, vec![], schema);
         let query = FullTextSearchQuery::new_query(IndexFtsQuery::Match(
-            MatchQuery::new("lance memwal".to_string())
+            MatchQuery::new("lanse memwal".to_string())
                 .with_operator(Operator::And)
                 .with_fuzziness(Some(1)),
         ));
 
-        let err = planner
+        let plan = planner
             .plan_search(
                 query.with_column("text".to_string()).unwrap(),
                 Some(10),
                 None,
             )
             .await
-            .expect_err("fuzzy AND should be rejected consistently");
-        assert!(
-            err.to_string().contains("fuzzy full-text search"),
-            "unexpected error for fuzzy AND query: {err}"
+            .expect("fuzzy AND is served by the active memtable");
+        let stream = plan
+            .execute(0, datafusion::prelude::SessionContext::new().task_ctx())
+            .unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        let ids: Vec<i32> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            vec![1],
+            "only the row matching every fuzzy term survives"
         );
     }
 
