@@ -62,6 +62,7 @@ use super::projection::{project_to_canonical, validate_projection_names};
 use super::sstable_cache::{DatasetCache, SsTableWarmer, open_sstable};
 use crate::dataset::mem_wal::memtable::scanner::MemTableScanner;
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+use crate::dataset::scanner::apply_dataset_planner_auto_fuzziness_compatibility_gate;
 use crate::index::scalar::inverted::{
     indexed_fts_document_granularities, indexed_fts_index_params, resolve_fts_field,
 };
@@ -210,37 +211,6 @@ fn validate_source_document_granularities(
         }
     }
     Ok(())
-}
-
-/// Reject the query shapes the active memtable arm cannot evaluate.
-///
-/// Only one remains: a fuzzy Match cannot also require every term, because the
-/// fuzzy path expands each term independently and unions the expansions. A
-/// multi-match is checked leaf by leaf under the same rule.
-fn validate_lsm_fts_query(query: &FullTextSearchQuery) -> Result<()> {
-    fn visit(query: &IndexFtsQuery) -> Result<()> {
-        match query {
-            IndexFtsQuery::Match(_) => Ok(()),
-            IndexFtsQuery::Phrase(_) => Ok(()),
-            IndexFtsQuery::Boost(b) => {
-                visit(&b.positive)?;
-                visit(&b.negative)
-            }
-            IndexFtsQuery::Boolean(b) => {
-                for child in b.must.iter().chain(&b.should).chain(&b.must_not) {
-                    visit(child)?;
-                }
-                Ok(())
-            }
-            IndexFtsQuery::MultiMatch(m) => {
-                for leaf in &m.match_queries {
-                    visit(&IndexFtsQuery::Match(leaf.clone()))?;
-                }
-                Ok(())
-            }
-        }
-    }
-    visit(&query.query)
 }
 
 fn active_source_can_execute_fts(
@@ -783,13 +753,10 @@ impl LsmFtsSearchPlanner {
             resolve_fts_field(&schema, column, document_granularity)?;
         }
         set_query_document_granularity(&mut query.query, document_granularity);
-        if sources.iter().any(|source| {
-            columns
-                .iter()
-                .any(|column| active_source_can_execute_fts(source, column, document_granularity))
-        }) {
-            validate_lsm_fts_query(&query)?;
-        }
+        // The base and SSTable arms go through the dataset scanner, which runs
+        // AUTO fuzziness as exact. Rewrite it here so the memtable arm, which
+        // would otherwise expand it, evaluates the same query.
+        apply_dataset_planner_auto_fuzziness_compatibility_gate(&mut query.query);
         let allowed_system_columns: &[&str] = if document_granularity.is_list_element() {
             &[SCORE_COLUMN, DOC_INDEX_COL]
         } else {
@@ -1113,7 +1080,6 @@ impl LsmFtsSearchPlanner {
                         }
                     }
                 };
-                validate_lsm_fts_query(query)?;
                 let mut scanner =
                     MemTableScanner::new(batch_store.clone(), index_store, schema.clone());
                 let cols = self.fts_scanner_projection(projection);
@@ -2258,7 +2224,7 @@ mod tests {
     }
 
     /// A fuzzy conjunction reaches the active memtable and requires every term:
-    /// `lanse memwal` at distance 1 keeps the row carrying both words and drops
+    /// `lance memwel` at distance 1 keeps the row carrying both words and drops
     /// the one carrying only `lance`.
     #[tokio::test]
     async fn fuzzy_and_query_is_served_by_the_active_memtable() {
@@ -2294,7 +2260,7 @@ mod tests {
             );
         let planner = LsmFtsSearchPlanner::new(collector, vec![], schema);
         let query = FullTextSearchQuery::new_query(IndexFtsQuery::Match(
-            MatchQuery::new("lanse memwal".to_string())
+            MatchQuery::new("lance memwel".to_string())
                 .with_operator(Operator::And)
                 .with_fuzziness(Some(1)),
         ));
@@ -2328,6 +2294,101 @@ mod tests {
             vec![1],
             "only the row matching every fuzzy term survives"
         );
+    }
+
+    /// A fuzzy conjunction must match an indexed base row and an identical
+    /// active row alike: same AUTO handling, same explicit-fuzzy tokenization
+    /// (no stop-word filter) and one leaf-wide expansion budget.
+    #[rstest::rstest]
+    #[case::fuzzy_and_matches_both_tiers("alphb beta", Some(1), 50, vec![1, 2])]
+    #[case::auto_fuzziness_runs_exact("alphb beta", None, 50, vec![])]
+    #[case::explicit_fuzzy_keeps_stop_words("alpha the", Some(1), 50, vec![])]
+    #[case::expansion_budget_spans_the_leaf("alpha beta", Some(1), 1, vec![])]
+    #[tokio::test]
+    async fn fuzzy_and_matches_identically_on_base_and_active(
+        #[case] terms: &str,
+        #[case] fuzziness: Option<u32>,
+        #[case] max_expansions: usize,
+        #[case] expected_ids: Vec<i32>,
+    ) {
+        use crate::index::DatasetIndexExt;
+        use lance_index::IndexType;
+        use lance_index::scalar::inverted::query::Operator;
+        use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
+
+        let schema = fts_schema();
+        let tmp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let mut base_ds =
+            write_dataset(&base_uri, vec![make_batch(&schema, &[1], &["alpha beta"])]).await;
+        base_ds
+            .create_index(
+                &["text"],
+                IndexType::Inverted,
+                Some("text_fts".to_string()),
+                &InvertedIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        let base_ds = Arc::new(Dataset::open(&base_uri).await.unwrap());
+
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut indexes = IndexStore::new();
+        indexes.enable_pk_index(&[("id".to_string(), 0)]);
+        indexes.add_fts("text_fts".to_string(), 1, "text".to_string());
+        let active_batch = make_batch(&schema, &[2], &["alpha beta"]);
+        batch_store.append(active_batch.clone()).unwrap();
+        indexes
+            .insert_with_batch_position(&active_batch, 0, Some(0))
+            .unwrap();
+        let collector = LsmDataSourceCollector::new(base_ds, vec![]).with_in_memory_memtables(
+            uuid::Uuid::new_v4(),
+            InMemoryMemTables {
+                active: InMemoryMemTableRef {
+                    batch_store,
+                    index_store: Arc::new(indexes),
+                    schema: schema.clone(),
+                    generation: 1,
+                },
+                frozen: vec![],
+            },
+        );
+
+        let planner = LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], schema);
+        let query = FullTextSearchQuery::new_query(IndexFtsQuery::Match(
+            MatchQuery::new(terms.to_string())
+                .with_fuzziness(fuzziness)
+                .with_operator(Operator::And)
+                .with_max_expansions(max_expansions),
+        ));
+        let plan = planner
+            .plan_search(
+                query.with_column("text".to_string()).unwrap(),
+                Some(10),
+                None,
+            )
+            .await
+            .unwrap();
+        let batches: Vec<RecordBatch> = plan
+            .execute(0, datafusion::prelude::SessionContext::new().task_ctx())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut ids: Vec<i32> = batches
+            .iter()
+            .flat_map(|b| {
+                b["id"]
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, expected_ids);
     }
 
     #[tokio::test]

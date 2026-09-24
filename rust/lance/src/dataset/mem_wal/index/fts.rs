@@ -46,7 +46,7 @@
 //! inverted index.
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -61,7 +61,7 @@ use lance_index::scalar::InvertedIndexParams;
 use lance_index::scalar::inverted::query::{FtsQuery, Operator, Tokens};
 use lance_index::scalar::inverted::tokenizer::document_tokenizer::{DocType, LanceTokenizer};
 use lance_index::scalar::inverted::{DocSet, MemBM25Scorer, Scorer, TokenSet};
-use lance_tokenizer::TokenStream;
+use lance_tokenizer::{SimpleTokenizer, TextAnalyzer, TokenStream};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -2079,8 +2079,8 @@ impl FtsMemIndex {
     }
 
     /// Expand a term to fuzzy matches within the specified edit distance.
-    /// Returns `(matched_term, distance)` pairs sorted by distance, capped
-    /// at `max_expansions`.
+    /// Returns the `max_expansions` lexicographically smallest matches as
+    /// `(matched_term, distance)` pairs, in term order.
     pub fn expand_fuzzy(
         &self,
         term: &str,
@@ -2099,7 +2099,7 @@ impl FtsMemIndex {
         max_expansions: usize,
     ) -> Vec<FtsEntry> {
         let st = self.state.load_full();
-        let tokens = self.tokenize_for_search(query);
+        let tokens = self.tokenize_fuzzy_query(query, fuzziness);
         self.search_fuzzy_tokens(
             &st,
             &tokens,
@@ -2486,25 +2486,22 @@ impl FtsMemIndex {
         if tokens.is_empty() {
             return Vec::new();
         }
+        // One `max_expansions` budget for the whole leaf, spent in query-token
+        // order, as the committed index does (`expand_fuzzy_tokens`); a
+        // per-token budget would match rows the flushed copy cannot.
+        let mut remaining = max_expansions;
         let mut groups: Vec<Vec<String>> = Vec::with_capacity(tokens.len());
         for tok in tokens {
             let max_dist = fuzziness.unwrap_or_else(|| auto_fuzziness(tok));
-            let mut group: Vec<String> = Vec::new();
-            let mut seen: HashSet<String> = HashSet::new();
-            for (matched, _) in self.expand_fuzzy_term(
-                st,
-                tok,
-                max_dist,
-                prefix_length,
-                max_expansions,
-                include_tail,
-            ) {
-                if seen.insert(matched.clone()) {
-                    group.push(matched);
-                }
-            }
-            // A term nothing is within distance of can never be satisfied, so
-            // neither can a conjunction that requires it.
+            let group: Vec<String> = self
+                .expand_fuzzy_term(st, tok, max_dist, prefix_length, remaining, include_tail)
+                .into_iter()
+                .map(|(matched, _)| matched)
+                .collect();
+            remaining -= group.len();
+            // A term with no expansion, whether nothing is within distance or
+            // the budget ran out, can never be satisfied, so neither can a
+            // conjunction that requires it.
             if group.is_empty() && operator == Operator::And {
                 return Vec::new();
             }
@@ -2528,7 +2525,9 @@ impl FtsMemIndex {
     }
 
     /// Expand `term` against the term dictionaries of every partition (and the
-    /// visible tail, when `include_tail`).
+    /// visible tail, when `include_tail`), keeping the `max_expansions`
+    /// lexicographically smallest matches: the committed index's selection, so
+    /// a capped expansion picks the same terms before and after flush.
     fn expand_fuzzy_term(
         &self,
         st: &IndexState,
@@ -2554,8 +2553,7 @@ impl FtsMemIndex {
                 Vec::new()
             };
         }
-        let mut matches: Vec<(String, u32)> = Vec::new();
-        let mut seen: HashSet<String> = HashSet::new();
+        let mut matches: BTreeMap<String, u32> = BTreeMap::new();
         let prefix = char_prefix(term, prefix_length);
         for entry in st.tail.terms.iter() {
             if !include_tail || !has_visible_chunk(&entry.value().load(), tail_snap.visible_count) {
@@ -2566,8 +2564,8 @@ impl FtsMemIndex {
                 continue;
             }
             let dist = levenshtein_distance(term, key);
-            if dist <= max_distance && seen.insert(key.to_string()) {
-                matches.push((key.to_string(), dist));
+            if dist <= max_distance {
+                matches.insert(key.to_string(), dist);
             }
         }
         for p in st.partitions.iter() {
@@ -2576,14 +2574,12 @@ impl FtsMemIndex {
                     continue;
                 }
                 let dist = levenshtein_distance(term, key.as_ref());
-                if dist <= max_distance && seen.insert(key.to_string()) {
-                    matches.push((key.to_string(), dist));
+                if dist <= max_distance {
+                    matches.insert(key.to_string(), dist);
                 }
             }
         }
-        matches.sort_by_key(|(_, d)| *d);
-        matches.truncate(max_expansions);
-        matches
+        matches.into_iter().take(max_expansions).collect()
     }
 
     /// Execute a query expression and return matching documents with scores.
@@ -2667,7 +2663,7 @@ impl FtsMemIndex {
                 boost,
                 ..
             } => {
-                let tokens = self.tokenize_for_search(query);
+                let tokens = self.tokenize_fuzzy_query(query, *fuzziness);
                 let mut results = self.search_fuzzy_tokens(
                     st,
                     &tokens,
@@ -2753,6 +2749,23 @@ impl FtsMemIndex {
 
     fn tokenize_for_search(&self, text: &str) -> Vec<String> {
         query_tokens_to_vec(&self.analyze_for_search(text))
+    }
+
+    /// Tokenize a fuzzy query the way the committed index does
+    /// (`tokenizer_for_match_query`): an explicit positive distance splits with
+    /// a bare `SimpleTokenizer`, bypassing the index analyzer's stop words and
+    /// stemming; AUTO uses the index analyzer.
+    fn tokenize_fuzzy_query(&self, text: &str, fuzziness: Option<u32>) -> Vec<String> {
+        if !matches!(fuzziness, Some(distance) if distance > 0) {
+            return self.tokenize_for_search(text);
+        }
+        let mut analyzer = TextAnalyzer::from(SimpleTokenizer::default());
+        let mut stream = analyzer.token_stream(text);
+        let mut tokens = Vec::new();
+        while let Some(token) = stream.next() {
+            tokens.push(token.text.clone());
+        }
+        tokens
     }
 
     fn analyze_for_search(&self, text: &str) -> Tokens {
@@ -6295,6 +6308,13 @@ mod tests {
         assert_eq!(rows(Operator::And), vec![0, 1]);
         assert_eq!(rows(Operator::Or), vec![0, 1, 2, 3]);
 
+        // `alpho` spends the whole two-term budget, leaving `beta` none.
+        assert!(
+            index
+                .search_fuzzy_tokens(&st, &tokens, Operator::And, Some(1), 0, 2, true)
+                .is_empty()
+        );
+
         // A term that expands to nothing empties the conjunction.
         let unmatched = ["alpho".to_string(), "xyz".to_string()];
         assert!(
@@ -6362,7 +6382,13 @@ mod tests {
     #[test]
     fn test_search_query_fuzzy_prefix_length_uses_char_boundaries() {
         let schema = create_test_schema();
-        let index = FtsMemIndex::new(1, "description".to_string());
+        // Explicit fuzziness skips the index analyzer, so the stored term must
+        // keep its `é` for the query's raw `é` prefix to reach it.
+        let index = FtsMemIndex::with_params(
+            1,
+            "description".to_string(),
+            InvertedIndexParams::default().ascii_folding(false),
+        );
 
         let batch = RecordBatch::try_new(
             schema,
