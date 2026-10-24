@@ -12396,7 +12396,9 @@ mod test {
 
         let query = values[..DIM].to_vec();
         let mut exact: Vec<f32> = values
-            .chunks_exact(DIM)
+            .as_chunks::<DIM>()
+            .0
+            .iter()
             .map(|row| cosine_distance(&query, row))
             .collect();
         exact.sort_by(f32::total_cmp);
